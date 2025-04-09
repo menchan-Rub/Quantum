@@ -1,0 +1,27 @@
+name: quantum_browser
+version: 0.1.0
+description: "超軽量・超高速ブラウザエンジン「QuantumCore」のCrystal実装部分"
+
+authors:
+  - Quantum Browser Team
+
+targets:
+  quantum_browser:
+    main: src/quantum_browser.cr
+
+crystal: 1.9.1
+
+dependencies:
+  concave:
+    github: quantum/concave
+    version: ~> 0.1.0
+
+development_dependencies:
+  ameba:
+    github: crystal-ameba/ameba
+    version: ~> 1.4.0
+  spec2:
+    github: waterlink/spec2.cr
+    version: ~> 0.14.0
+
+license: MIT 
