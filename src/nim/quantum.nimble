@@ -21,4 +21,4 @@ task bench, "Run benchmarks":
   exec "nim c -d:release --opt:speed -r benchmarks/all_benchmarks"
 
 task docs, "Generate documentation":
-  exec "nim doc --project --index:on --git.url:https://github.com/quantum/browser src/quantum_browser.nim" 
+  exec "nim doc --project --index:on --git.url:https://github.com/menchan-Rub/Quantum src/quantum_browser.nim" 
