@@ -17,7 +17,9 @@ import std/[
   json,
   logging,
   asyncdispatch,
-  os
+  os,
+  httpclient,
+  asyncnet
 ]
 
 import ../../../privacy/privacy_types
@@ -258,6 +260,43 @@ proc removeCustomRule*(blocker: TrackerBlocker, index: int) =
     except:
       blocker.logger.error("設定の保存に失敗しました: " & getCurrentExceptionMsg())
 
+proc downloadAndProcessList(blocker: TrackerBlocker, url: string) {.async.} =
+  ## 指定された URL からブロックリストをダウンロードし、処理する (プレースホルダ)
+  var client = newAsyncHttpClient()
+  defer: client.close()
+  client.headers = newHttpHeaders({"User-Agent": "QuantumBrowser/0.1"}) # 適切なUAを設定
+
+  try:
+    blocker.logger.info(&"ブロックリストをダウンロード中: {url}")
+    let response = await client.getContent(url)
+    blocker.logger.info(&"ブロックリストダウンロード完了: {url} ({response.len} バイト)")
+    # TODO: ダウンロードしたリストの内容をパースし、トラッカー定義やルールに追加する
+    #       リストのフォーマット (EasyList など) に応じたパーサーが必要
+    # 例:
+    # let lines = response.splitLines()
+    # for line in lines:
+    #   if line.startsWith("||") and line.endsWith("^"):
+    #     # ドメインブロックルール
+    #     let domain = line[2 .. ^2]
+    #     blocker.logger.debug(&"リストからドメインルールを追加: {domain}")
+    #     # ここでドメインベースのルールを blocker.customRules や blocker.trackers に追加
+    #   elif line.startsWith("@@||"):
+    #     # 例外ルール
+    #     discard
+    #   # 他のルールタイプの処理...
+
+    # 最終更新日時を記録
+    blocker.lastUpdate = getTime()
+    # 必要であれば設定を保存
+    # discard blocker.saveConfiguration()
+
+  except HttpRequestError as e:
+    blocker.logger.error(&"ブロックリストのダウンロードに失敗 ({url}): {e.msg}")
+  except TimeoutError:
+     blocker.logger.error(&"ブロックリストのダウンロードがタイムアウトしました ({url})")
+  except Exception as e:
+    blocker.logger.error(&"ブロックリストの処理中にエラーが発生 ({url}): {e.msg}")
+
 proc addSubscription*(blocker: TrackerBlocker, url: string) =
   ## ブロックリスト購読を追加
   if url notin blocker.blockSubscriptions:
@@ -267,9 +306,10 @@ proc addSubscription*(blocker: TrackerBlocker, url: string) =
     # 設定を保存
     try:
       blocker.saveConfiguration()
-      # TODO: リストを実際にダウンロード
+      # リストを非同期でダウンロード・処理
+      asyncCheck downloadAndProcessList(blocker, url)
     except:
-      blocker.logger.error("設定の保存に失敗しました: " & getCurrentExceptionMsg())
+      blocker.logger.error("設定の保存またはリストダウンロードの開始に失敗: " & getCurrentExceptionMsg())
 
 proc removeSubscription*(blocker: TrackerBlocker, url: string) =
   ## ブロックリスト購読を削除

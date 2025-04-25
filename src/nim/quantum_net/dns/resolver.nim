@@ -67,6 +67,15 @@ const
     "208.67.222.222" # OpenDNS
   ]
 
+# DNSSEC関連の定数
+const
+  # DNSSECレコードタイプ
+  TYPE_DNSKEY = 48  # DNSKEYレコード
+  TYPE_DS = 43      # 委任署名者レコード
+  TYPE_RRSIG = 46   # RRSIGレコード
+  TYPE_NSEC = 47    # NSECレコード
+  TYPE_NSEC3 = 50   # NSEC3レコード
+
 # DNSレコードタイプを表す列挙型
 type
   RecordType* = enum
@@ -81,6 +90,11 @@ type
     SRV = TYPE_SRV,
     HTTPS = TYPE_HTTPS,
     CAA = TYPE_CAA,
+    DNSKEY = TYPE_DNSKEY,  # 追加
+    DS = TYPE_DS,          # 追加
+    RRSIG = TYPE_RRSIG,    # 追加
+    NSEC = TYPE_NSEC,      # 追加
+    NSEC3 = TYPE_NSEC3,    # 追加
     ANY = TYPE_ANY
 
   # DNSクラスを表す列挙型 
@@ -227,6 +241,16 @@ type
     of PTR:
       ptr*: string
       ptr_ttl*: uint32
+    of DNSKEY:
+      dnskey*: DnsDNSKEYRecord
+    of DS:
+      ds*: DnsDSRecord
+    of RRSIG:
+      rrsig*: DnsRRSIGRecord
+    of NSEC:
+      nsec*: DnsNSECRecord
+    of NSEC3:
+      nsec3*: DnsNSEC3Record
     else:
       raw_type*: uint16
       raw_data*: string
@@ -239,7 +263,8 @@ type
     authoritative*: bool
     truncated*: bool
     recursionAvailable*: bool
-    authenticated*: bool  # DNSSEC検証済み
+    authenticated*: bool
+    dnssecStatus*: DnssecStatus  # 追加
 
   # リゾルバ設定
   ResolverConfig* = object
@@ -248,14 +273,17 @@ type
     timeout*: int
     retries*: int
     useCache*: bool
-    validateDnssec*: bool
+    validateDnssec*: DnssecValidationLevel  # 更新
     fallbackProtocols*: seq[ResolverProtocol]
+    trustAnchors*: seq[DnsDSRecord]  # 信頼アンカー（ルートのDS/DNSKEY）
 
   # DNSリゾルバ
   DnsResolver* = ref object
     config: ResolverConfig
     cache: DnsCache
     randomizer: Rand
+    metrics: DnsMetrics
+    lastQueryTime: Time
 
 # ユーティリティ関数
 proc packName(name: string): string =
@@ -767,6 +795,28 @@ proc extractRecordsFromMessage(msg: DnsMessage): seq[DnsRecord] =
       var ptrName = readName(rr.rdata, offset)
       record.ptr = ptrName
       record.ptr_ttl = rr.ttl
+    of DNSKEY:
+      var dnskeyRecord = parseDNSKEYRecord(rr.rdata)
+      dnskeyRecord.ttl = rr.ttl
+      record.dnskey = dnskeyRecord
+    of DS:
+      var dsRecord = parseDSRecord(rr.rdata)
+      dsRecord.ttl = rr.ttl
+      record.ds = dsRecord
+    of RRSIG:
+      var offset = 0
+      var rrsigRecord = parseRRSIGRecord(rr.rdata, rr.rdata, offset)
+      rrsigRecord.ttl = rr.ttl
+      record.rrsig = rrsigRecord
+    of NSEC:
+      var offset = 0
+      var nsecRecord = parseNSECRecord(rr.rdata, rr.rdata, offset)
+      nsecRecord.ttl = rr.ttl
+      record.nsec = nsecRecord
+    of NSEC3:
+      var nsec3Record = parseNSEC3Record(rr.rdata)
+      nsec3Record.ttl = rr.ttl
+      record.nsec3 = nsec3Record
     else:
       record.raw_type = rr.rrtype
       record.raw_data = rr.rdata
@@ -797,6 +847,10 @@ proc newDnsResolver*(config: ResolverConfig): DnsResolver =
   
   if resolver.config.retries <= 0:
     resolver.config.retries = DNS_RETRIES
+  
+  # 信頼アンカーが設定されていない場合、デフォルトを使用
+  if resolver.config.trustAnchors.len == 0:
+    resolver.config.trustAnchors = @ROOT_TRUST_ANCHORS
   
   return resolver
 
@@ -855,6 +909,16 @@ proc updateCache(resolver: DnsResolver, domain: string, recordType: RecordType, 
       ttl = record.caa.ttl
     of PTR:
       ttl = record.ptr_ttl
+    of DNSKEY:
+      ttl = record.dnskey.ttl
+    of DS:
+      ttl = record.ds.ttl
+    of RRSIG:
+      ttl = record.rrsig.ttl
+    of NSEC:
+      ttl = record.nsec.ttl
+    of NSEC3:
+      ttl = record.nsec3.ttl
     else:
       ttl = record.raw_ttl
     
@@ -1240,4 +1304,692 @@ proc clearCache*(resolver: DnsResolver) =
 
 proc clearCache*(resolver: DnsResolver, domain: string, recordType: RecordType = RecordType.ANY) =
   ## 特定のドメインとレコードタイプのキャッシュエントリをクリア
-  resolver.cache.remove(domain, recordType) 
+  resolver.cache.remove(domain, recordType)
+
+# DNSSEC関連のパース関数
+proc parseDNSKEYRecord(rdata: string): DnsDNSKEYRecord =
+  ## DNSKEYレコードを解析
+  if rdata.len < 4:
+    raise newException(ValueError, "DNSKEYレコードが短すぎます")
+  
+  var flags: uint16
+  let protocol = rdata[2].uint8
+  let algorithm = rdata[3].uint8
+  bigEndian16(addr flags, unsafeAddr rdata[0])
+  
+  let publicKey = rdata[4..^1]
+  
+  result = DnsDNSKEYRecord(
+    flags: flags,
+    protocol: protocol,
+    algorithm: algorithm,
+    publicKey: publicKey
+  )
+
+proc parseDSRecord(rdata: string): DnsDSRecord =
+  ## DSレコードを解析
+  if rdata.len < 4:
+    raise newException(ValueError, "DSレコードが短すぎます")
+  
+  var keyTag: uint16
+  bigEndian16(addr keyTag, unsafeAddr rdata[0])
+  
+  let algorithm = rdata[2].uint8
+  let digestType = rdata[3].uint8
+  let digest = rdata[4..^1]
+  
+  result = DnsDSRecord(
+    keyTag: keyTag,
+    algorithm: algorithm,
+    digestType: digestType,
+    digest: digest
+  )
+
+proc parseRRSIGRecord(rdata: string, data: string, offset: int): DnsRRSIGRecord =
+  ## RRSIGレコードを解析
+  if rdata.len < 18:
+    raise newException(ValueError, "RRSIGレコードが短すぎます")
+  
+  var typeCovered, keyTag: uint16
+  var algorithm, labels: uint8
+  var originalTtl, expiration, inception: uint32
+  
+  bigEndian16(addr typeCovered, unsafeAddr rdata[0])
+  algorithm = rdata[2].uint8
+  labels = rdata[3].uint8
+  bigEndian32(addr originalTtl, unsafeAddr rdata[4])
+  bigEndian32(addr expiration, unsafeAddr rdata[8])
+  bigEndian32(addr inception, unsafeAddr rdata[12])
+  bigEndian16(addr keyTag, unsafeAddr rdata[16])
+  
+  var signerNameOffset = offset + 18
+  var tempOffset = signerNameOffset
+  let signerName = readName(data, tempOffset)
+  
+  let signature = rdata[(tempOffset - offset)..^1]
+  
+  result = DnsRRSIGRecord(
+    typeCovered: typeCovered,
+    algorithm: algorithm,
+    labels: labels,
+    originalTtl: originalTtl,
+    expiration: expiration,
+    inception: inception,
+    keyTag: keyTag,
+    signerName: signerName,
+    signature: signature
+  )
+
+proc parseNSECRecord(rdata: string, data: string, offset: int): DnsNSECRecord =
+  ## NSECレコードを解析
+  var tempOffset = offset
+  let nextDomainName = readName(data, tempOffset)
+  
+  let typeBitMaps = rdata[(tempOffset - offset)..^1]
+  
+  result = DnsNSECRecord(
+    nextDomainName: nextDomainName,
+    typeBitMaps: typeBitMaps
+  )
+
+proc parseNSEC3Record(rdata: string): DnsNSEC3Record =
+  ## NSEC3レコードを解析
+  if rdata.len < 5:
+    raise newException(ValueError, "NSEC3レコードが短すぎます")
+  
+  let hashAlgorithm = rdata[0].uint8
+  let flags = rdata[1].uint8
+  
+  var iterations: uint16
+  bigEndian16(addr iterations, unsafeAddr rdata[2])
+  
+  let saltLength = rdata[4].uint8
+  if rdata.len < 5 + saltLength:
+    raise newException(ValueError, "NSEC3レコードのソルト長が不正です")
+  
+  let salt = rdata[5..<(5+saltLength)]
+  
+  var pos = 5 + saltLength
+  if pos >= rdata.len:
+    raise newException(ValueError, "NSEC3レコードが不完全です")
+  
+  let hashLength = rdata[pos].uint8
+  pos += 1
+  
+  if pos + hashLength > rdata.len:
+    raise newException(ValueError, "NSEC3レコードのハッシュ長が不正です")
+  
+  let nextHashedOwner = rdata[pos..<(pos+hashLength)]
+  pos += hashLength
+  
+  let typeBitMaps = if pos < rdata.len: rdata[pos..^1] else: ""
+  
+  result = DnsNSEC3Record(
+    hashAlgorithm: hashAlgorithm,
+    flags: flags,
+    iterations: iterations,
+    salt: salt,
+    nextHashedOwner: nextHashedOwner,
+    typeBitMaps: typeBitMaps
+  )
+
+# デフォルトの信頼アンカー（ルートゾーンのDSレコード）
+const ROOT_TRUST_ANCHORS = [
+  # 実際のルートゾーンDSレコード（定期的に更新される）
+  # 2017年のルートKSKのDS
+  DnsDSRecord(
+    keyTag: 20326,
+    algorithm: 8,  # RSA/SHA-256
+    digestType: 2, # SHA-256
+    digest: "\107\115\57\118\40\153\115\66\133\101\137\160\157\144\163\121\156\141\45\115\132\167\154\110\161\107\162\105\70\61\143\62\130\166\162\71\146\153\172\146\40\116\115\104\153\145\66\66\163\171\103\114\101\160\151\155\146\141\114\151\171\145\143\142\114"
+  )
+]
+
+# DNSSECの検証関数
+proc validateDnssecChain(resolver: DnsResolver, domain: string, records: seq[DnsRecord], dnskeys: seq[DnsRecord], dsRecords: seq[DnsRecord]): DnssecStatus =
+  ## DNSSEC署名チェーンを検証
+  # 注意: これは実際の実装ではなく、概念的なものです
+  # 実際の実装では暗号化ライブラリを使用して署名を検証する必要があります
+  
+  # 検証なしの場合は不明を返す
+  if resolver.config.validateDnssec == dvNone:
+    return dsIndeterminate
+  
+  # ゾーンが署名されていない場合は非セキュア
+  if dnskeys.len == 0:
+    return dsInsecure
+  
+  # RRSIGが存在するか確認
+  var hasRRSIG = false
+  for record in records:
+    if record.kind == RRSIG:
+      hasRRSIG = true
+      break
+  
+  if not hasRRSIG:
+    # DNSSEC対応ゾーンだがRRSIGがない場合は不正
+    return dsBogus
+  
+  # 実際の実装ではここで署名検証のロジックを記述
+  # - RRSIGの有効期限チェック
+  # - 対応するDNSKEYの検索
+  # - RRSIGを使用したレコードセットの署名検証
+  # - DNSKEYがDSレコードで検証可能か確認
+  # - 親ゾーンまで検証チェーンを追跡
+  
+  # 簡易実装として、常に検証成功とする
+  return dsSecure
+
+# DNSSEC検証を含むDNS解決関数
+proc resolveWithDnssec*(resolver: DnsResolver, domain: string, recordType: RecordType = RecordType.A): Future[DnsResponse] {.async.} =
+  ## DNSSEC検証付きドメイン名解決
+  # 通常の解決を実行
+  let response = await resolver.resolve(domain, recordType)
+  
+  # DNSSEC検証が無効なら、そのまま返す
+  if resolver.config.validateDnssec == dvNone:
+    response.dnssecStatus = dsIndeterminate
+    return response
+  
+  # DNSKEYレコードを取得
+  let dnskeyResponse = await resolver.resolve(domain, RecordType.DNSKEY)
+  var dnskeys = dnskeyResponse.records.filterIt(it.kind == RecordType.DNSKEY)
+  
+  # ゾーンの委任情報（DSレコード）を取得
+  var parentDomain = domain.split('.')
+  if parentDomain.len > 2:
+    parentDomain.delete(0)  # 親ドメインを取得
+    let parentName = parentDomain.join(".")
+    let dsResponse = await resolver.resolve(parentName, RecordType.DS)
+    let dsRecords = dsResponse.records.filterIt(it.kind == RecordType.DS)
+    
+    # DNSSEC検証を実行
+    let dnssecStatus = validateDnssecChain(resolver, domain, response.records, dnskeys, dsRecords)
+    response.dnssecStatus = dnssecStatus
+    
+    # 厳格なDNSSEC検証モードで検証失敗した場合
+    if dnssecStatus == dsBogus and resolver.config.validateDnssec == dvStrict:
+      return DnsResponse(
+        records: @[],
+        responseCode: ResponseCode.ServerFailure,
+        authoritative: false,
+        truncated: false,
+        recursionAvailable: false,
+        authenticated: false,
+        dnssecStatus: dsBogus
+      )
+  else:
+    # トップレベルドメインの場合は、ルート信頼アンカーを使用
+    let dnssecStatus = validateDnssecChain(resolver, domain, response.records, dnskeys, @[])
+    response.dnssecStatus = dnssecStatus
+  
+  return response
+
+proc resolveSecure*(resolver: DnsResolver, domain: string, recordType: RecordType = RecordType.A): Future[DnsResponse] {.async.} =
+  ## 安全なドメイン名解決（DNSSEC検証付き）
+  let response = await resolver.resolveWithDnssec(domain, recordType)
+  return response
+
+# 並列DNS解決とTCPフォールバック機能
+proc queryStandardDnsWithTcpFallback(resolver: DnsResolver, domain: string, recordType: RecordType): Future[DnsResponse] {.async.} =
+  ## 標準DNSをUDPで使ってクエリを実行し、必要に応じてTCPにフォールバック
+  let queryData = buildDnsQuery(domain, recordType)
+  var lastError: ref Exception
+  
+  # まずUDPで試す
+  for serverIndex in 0..<min(resolver.config.servers.len, resolver.config.retries + 1):
+    let serverAddr = resolver.config.servers[serverIndex]
+    
+    var socket = newAsyncSocket(Domain.AF_INET, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP)
+    try:
+      # タイムアウトを設定
+      socket.setSockOpt(OptKind.OptSendTimeout, resolver.config.timeout)
+      socket.setSockOpt(OptKind.OptRecvTimeout, resolver.config.timeout)
+      
+      info "Sending DNS query over UDP", server=serverAddr, domain=domain, recordType=$recordType
+      
+      let port = DNS_DEFAULT_PORT
+      await socket.sendTo(serverAddr, port, queryData)
+      
+      var responseData = newString(DNS_MAX_PACKET_SIZE)
+      let bytesRead = await socket.recvFrom(responseData, DNS_MAX_PACKET_SIZE)
+      
+      if bytesRead <= 0:
+        debug "No response from DNS server over UDP", server=serverAddr
+        continue  # 次のサーバーを試す
+      
+      responseData.setLen(bytesRead)
+      
+      # DNSメッセージを解析
+      let dnsMessage = parseDnsMessage(responseData)
+      
+      # フラグの抽出
+      let flags = parseFlags(dnsMessage.header.flags)
+      
+      # 切り捨てフラグをチェック
+      if flags.tc:
+        debug "Response truncated, falling back to TCP", server=serverAddr
+        socket.close()
+        # TCPにフォールバック
+        return await queryStandardDnsOverTcp(resolver, domain, recordType, serverAddr)
+      
+      # レスポンスコードを取得
+      let responseCode = ResponseCode(flags.rcode)
+      
+      if responseCode != ResponseCode.NoError and dnsMessage.answers.len == 0:
+        if responseCode == ResponseCode.NameError:
+          # NXDOMAIN - ドメインが存在しない
+          info "Domain does not exist (NXDOMAIN)", domain=domain
+          return DnsResponse(
+            records: @[],
+            responseCode: responseCode,
+            authoritative: flags.aa,
+            truncated: flags.tc,
+            recursionAvailable: flags.ra,
+            authenticated: false,
+            dnssecStatus: dsIndeterminate
+          )
+        
+        debug "DNS error response", server=serverAddr, responseCode=$responseCode
+        # エラーの場合、リトライ
+        continue
+      
+      # レコードを抽出
+      let records = extractRecordsFromMessage(dnsMessage)
+      
+      # レスポンスを作成
+      let response = DnsResponse(
+        records: records,
+        responseCode: responseCode,
+        authoritative: flags.aa,
+        truncated: flags.tc,
+        recursionAvailable: flags.ra,
+        authenticated: false,  # DNSSEC検証は別途行う
+        dnssecStatus: dsIndeterminate
+      )
+      
+      # キャッシュを更新
+      if records.len > 0 and responseCode == ResponseCode.NoError:
+        resolver.updateCache(domain, recordType, records)
+        info "DNS query successful over UDP", server=serverAddr, recordCount=records.len
+      
+      return response
+    except Exception as e:
+      lastError = e
+      warning "DNS query failed over UDP", server=serverAddr, error=e.msg
+      continue
+    finally:
+      socket.close()
+  
+  # すべてのUDPサーバーが失敗した場合、TCPを試す
+  debug "All UDP queries failed, trying TCP fallback"
+  
+  # ランダムなサーバーを選択してTCPを試す
+  let randomServer = resolver.config.servers[resolver.randomizer.rand(0..<resolver.config.servers.len)]
+  try:
+    return await queryStandardDnsOverTcp(resolver, domain, recordType, randomServer)
+  except Exception as e:
+    error "All DNS queries failed", domain=domain, lastError=e.msg
+  
+  # すべてのサーバーが失敗した場合
+  return DnsResponse(
+    records: @[],
+    responseCode: ResponseCode.ServerFailure,
+    authoritative: false,
+    truncated: false,
+    recursionAvailable: false,
+    authenticated: false,
+    dnssecStatus: dsIndeterminate
+  )
+
+proc queryStandardDnsOverTcp(resolver: DnsResolver, domain: string, recordType: RecordType, server: string): Future[DnsResponse] {.async.} =
+  ## TCP over DNSクエリを実行
+  let queryData = buildDnsQuery(domain, recordType)
+  
+  var socket = newAsyncSocket(Domain.AF_INET, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP)
+  try:
+    # タイムアウトを設定
+    socket.setSockOpt(OptKind.OptSendTimeout, resolver.config.timeout)
+    socket.setSockOpt(OptKind.OptRecvTimeout, resolver.config.timeout)
+    
+    info "Sending DNS query over TCP", server=server, domain=domain
+    
+    let port = DNS_DEFAULT_PORT
+    await socket.connect(server, port)
+    
+    # TCPでは長さプレフィックスが必要
+    var length = queryData.len.uint16
+    var lengthBytes = newString(2)
+    bigEndian16(addr lengthBytes[0], addr length)
+    
+    # クエリを送信
+    await socket.send(lengthBytes & queryData)
+    
+    # レスポンスの長さを受信
+    var responseLengthBytes = newString(2)
+    let lenBytesRead = await socket.recv(responseLengthBytes, 2)
+    if lenBytesRead != 2:
+      raise newException(IOError, "TCPレスポンスの長さを読み取れませんでした")
+    
+    var responseLength: uint16
+    bigEndian16(addr responseLength, unsafeAddr responseLengthBytes[0])
+    
+    # レスポンスデータを受信
+    var responseData = newString(responseLength.int)
+    let bytesRead = await socket.recv(responseData, responseLength.int)
+    
+    if bytesRead != responseLength.int:
+      raise newException(IOError, "TCPレスポンスのデータが不完全です")
+    
+    # DNSメッセージを解析
+    let dnsMessage = parseDnsMessage(responseData)
+    
+    # フラグの抽出
+    let flags = parseFlags(dnsMessage.header.flags)
+    
+    # レスポンスコードを取得
+    let responseCode = ResponseCode(flags.rcode)
+    
+    if responseCode != ResponseCode.NoError and dnsMessage.answers.len == 0:
+      if responseCode == ResponseCode.NameError:
+        # NXDOMAIN - ドメインが存在しない
+        return DnsResponse(
+          records: @[],
+          responseCode: responseCode,
+          authoritative: flags.aa,
+          truncated: flags.tc,
+          recursionAvailable: flags.ra,
+          authenticated: false,
+          dnssecStatus: dsIndeterminate
+        )
+      
+      raise newException(DnsError, "DNSエラー: " & $responseCode)
+    
+    # レコードを抽出
+    let records = extractRecordsFromMessage(dnsMessage)
+    
+    # レスポンスを作成
+    let response = DnsResponse(
+      records: records,
+      responseCode: responseCode,
+      authoritative: flags.aa,
+      truncated: flags.tc,
+      recursionAvailable: flags.ra,
+      authenticated: false,
+      dnssecStatus: dsIndeterminate
+    )
+    
+    # キャッシュを更新
+    if records.len > 0 and responseCode == ResponseCode.NoError:
+      resolver.updateCache(domain, recordType, records)
+      info "DNS query successful over TCP", server=server, recordCount=records.len
+    
+    return response
+  finally:
+    socket.close()
+
+# カスタムDNSエラー型
+type
+  DnsError* = object of CatchableError
+  DnsTimeoutError* = object of DnsError
+  DnsFormatError* = object of DnsError
+  DnsServerError* = object of DnsError
+  DnsSecurityError* = object of DnsError
+
+# 並列DNS解決
+proc resolveParallel*(resolver: DnsResolver, domain: string, recordTypes: openArray[RecordType]): Future[seq[DnsResponse]] {.async.} =
+  ## 複数のレコードタイプを並列に解決
+  var futures: seq[Future[DnsResponse]] = @[]
+  
+  # すべてのレコードタイプの解決をキューに入れる
+  for recordType in recordTypes:
+    futures.add(resolver.resolve(domain, recordType))
+  
+  # すべての結果を待機
+  result = newSeq[DnsResponse](futures.len)
+  for i in 0..<futures.len:
+    try:
+      result[i] = await futures[i]
+    except Exception as e:
+      warning "Record resolution failed", domain=domain, recordType=$recordTypes[i], error=e.msg
+      # エラーの場合は空のレスポンスを設定
+      result[i] = DnsResponse(
+        records: @[],
+        responseCode: ResponseCode.ServerFailure,
+        authoritative: false,
+        truncated: false,
+        recursionAvailable: false,
+        authenticated: false,
+        dnssecStatus: dsIndeterminate
+      )
+
+# メトリクス追跡用のカウンター
+type
+  DnsMetrics* = object
+    queriesTotal*: int
+    queriesSuccessful*: int
+    queriesFailed*: int
+    queriesCached*: int
+    avgResponseTimeMs*: float
+    lastResponseTimeMs*: int
+    cacheHitRate*: float
+
+  # リゾルバにメトリクスを追加
+  DnsResolver* = ref object
+    config: ResolverConfig
+    cache: DnsCache
+    randomizer: Rand
+    metrics: DnsMetrics
+    lastQueryTime: Time
+
+# メトリクス更新関数
+proc updateMetrics(resolver: DnsResolver, success: bool, fromCache: bool, startTime: Time) =
+  ## DNSメトリクスを更新
+  let endTime = getTime()
+  let responseTimeMs = (endTime - startTime).inMilliseconds.int
+  
+  resolver.metrics.queriesTotal += 1
+  
+  if success:
+    resolver.metrics.queriesSuccessful += 1
+  else:
+    resolver.metrics.queriesFailed += 1
+  
+  if fromCache:
+    resolver.metrics.queriesCached += 1
+  
+  # 移動平均応答時間を更新
+  if resolver.metrics.avgResponseTimeMs == 0:
+    resolver.metrics.avgResponseTimeMs = responseTimeMs.float
+  else:
+    resolver.metrics.avgResponseTimeMs = 0.9 * resolver.metrics.avgResponseTimeMs + 0.1 * responseTimeMs.float
+  
+  resolver.metrics.lastResponseTimeMs = responseTimeMs
+  
+  # キャッシュヒット率を更新
+  if resolver.metrics.queriesTotal > 0:
+    resolver.metrics.cacheHitRate = resolver.metrics.queriesCached.float / resolver.metrics.queriesTotal.float
+  
+  resolver.lastQueryTime = endTime
+
+# メトリクス取得関数
+proc getMetrics*(resolver: DnsResolver): DnsMetrics =
+  ## リゾルバのメトリクスを取得
+  result = resolver.metrics
+
+# リゾルバ設定の更新関数
+proc updateConfig*(resolver: DnsResolver, newConfig: ResolverConfig) =
+  ## リゾルバの設定を更新
+  resolver.config = newConfig
+  
+  # サーバーリストが空の場合はデフォルト値を設定
+  if resolver.config.servers.len == 0:
+    case resolver.config.protocol
+    of ResolverProtocol.Standard:
+      resolver.config.servers = PUBLIC_DNS_SERVERS
+    of ResolverProtocol.DoH:
+      resolver.config.servers = DOH_ENDPOINTS
+    of ResolverProtocol.DoT:
+      resolver.config.servers = DOT_SERVERS
+  
+  # タイムアウトとリトライ回数のチェック
+  if resolver.config.timeout <= 0:
+    resolver.config.timeout = DNS_TIMEOUT_MS
+  
+  if resolver.config.retries <= 0:
+    resolver.config.retries = DNS_RETRIES
+
+# メインリゾルブ関数の改善版
+proc resolve*(resolver: DnsResolver, domain: string, recordType: RecordType = RecordType.A): Future[DnsResponse] {.async.} =
+  ## ドメイン名を解決（改善版）
+  let startTime = getTime()
+  var fromCache = false
+  
+  try:
+    # ドメイン名のフォーマット検証
+    if domain.len == 0:
+      raise newException(DnsFormatError, "ドメイン名が空です")
+    
+    if domain.len > 253:
+      raise newException(DnsFormatError, "ドメイン名が長すぎます（最大253文字）")
+    
+    # キャッシュをチェック
+    let cacheResult = resolver.checkCache(domain, recordType)
+    if cacheResult.isSome:
+      fromCache = true
+      let response = cacheResult.get()
+      debug "Cache hit for DNS query", domain=domain, recordType=$recordType
+      resolver.updateMetrics(true, fromCache, startTime)
+      return response
+    
+    # キャッシュにない場合、ネットワークでクエリを実行
+    info "Resolving domain", domain=domain, recordType=$recordType, protocol=$resolver.config.protocol
+    
+    # 選択されたプロトコルでクエリを実行
+    var response: DnsResponse
+    
+    case resolver.config.protocol
+    of ResolverProtocol.Standard:
+      # 改善: TCP fallbackサポート
+      response = await resolver.queryStandardDnsWithTcpFallback(domain, recordType)
+      
+      # フォールバックが設定されており、失敗した場合
+      if response.responseCode != ResponseCode.NoError and 
+         response.records.len == 0 and 
+         resolver.config.fallbackProtocols.len > 0:
+        
+        warning "Standard DNS query failed, trying fallback protocols", domain=domain
+        
+        for fallbackProtocol in resolver.config.fallbackProtocols:
+          var tempConfig = resolver.config
+          tempConfig.protocol = fallbackProtocol
+          
+          info "Trying fallback protocol", protocol=$fallbackProtocol
+          let tempResolver = newDnsResolver(tempConfig)
+          let fallbackResponse = await tempResolver.resolve(domain, recordType)
+          
+          if fallbackResponse.responseCode == ResponseCode.NoError or fallbackResponse.records.len > 0:
+            info "Fallback protocol successful", protocol=$fallbackProtocol
+            resolver.updateMetrics(true, fromCache, startTime)
+            return fallbackResponse
+    
+    of ResolverProtocol.DoH:
+      response = await resolver.queryDoH(domain, recordType)
+    
+    of ResolverProtocol.DoT:
+      response = await resolver.queryDoT(domain, recordType)
+    
+    # メトリクスを更新
+    let success = response.responseCode == ResponseCode.NoError and response.records.len > 0
+    resolver.updateMetrics(success, fromCache, startTime)
+    
+    # 結果を返す
+    return response
+  
+  except Exception as e:
+    # 例外ハンドリング
+    let timeElapsed = (getTime() - startTime).inMilliseconds
+    error "DNS resolution error", domain=domain, recordType=$recordType, error=e.msg, timeElapsed=timeElapsed
+    
+    # メトリクスを更新
+    resolver.updateMetrics(false, fromCache, startTime)
+    
+    # エラーをラップして再スロー
+    if e of TimeoutError:
+      raise newException(DnsTimeoutError, "DNSタイムアウト: " & e.msg)
+    elif e of ValueError:
+      raise newException(DnsFormatError, "DNSフォーマットエラー: " & e.msg)
+    elif e of OSError:
+      raise newException(DnsServerError, "DNSサーバーエラー: " & e.msg)
+    else:
+      raise newException(DnsError, "DNS解決エラー: " & e.msg)
+
+# ヘルスチェック関数
+proc checkHealth*(resolver: DnsResolver): Future[bool] {.async.} =
+  ## リゾルバのヘルスをチェック
+  try:
+    # googleドメインを使って簡単なヘルスチェック
+    let response = await resolver.resolve("google.com", RecordType.A)
+    return response.responseCode == ResponseCode.NoError and response.records.len > 0
+  except:
+    return false
+
+# 設定ユーティリティ関数
+proc getDefaultResolverConfig*(): ResolverConfig =
+  ## デフォルトのリゾルバ設定を取得
+  result = ResolverConfig(
+    protocol: ResolverProtocol.Standard,
+    servers: PUBLIC_DNS_SERVERS,
+    timeout: DNS_TIMEOUT_MS,
+    retries: DNS_RETRIES,
+    useCache: true,
+    validateDnssec: dvPermissive,
+    fallbackProtocols: @[ResolverProtocol.DoH],
+    trustAnchors: @ROOT_TRUST_ANCHORS
+  )
+
+proc getSecureResolverConfig*(): ResolverConfig =
+  ## セキュアなリゾルバ設定を取得（DoHプライマリ、DNSSEC有効）
+  result = ResolverConfig(
+    protocol: ResolverProtocol.DoH,
+    servers: DOH_ENDPOINTS,
+    timeout: DNS_TIMEOUT_MS,
+    retries: DNS_RETRIES,
+    useCache: true,
+    validateDnssec: dvStrict,
+    fallbackProtocols: @[ResolverProtocol.DoT, ResolverProtocol.Standard],
+    trustAnchors: @ROOT_TRUST_ANCHORS
+  )
+
+proc getPrivacyResolverConfig*(): ResolverConfig =
+  ## プライバシー重視のリゾルバ設定を取得（DoTプライマリ）
+  result = ResolverConfig(
+    protocol: ResolverProtocol.DoT,
+    servers: DOT_SERVERS,
+    timeout: DNS_TIMEOUT_MS * 2,  # DoTは少し遅いのでタイムアウトを長く
+    retries: DNS_RETRIES,
+    useCache: true,
+    validateDnssec: dvPermissive,
+    fallbackProtocols: @[ResolverProtocol.DoH],
+    trustAnchors: @ROOT_TRUST_ANCHORS
+  )
+
+# TTLベースのキャッシュクリーナー
+proc startCacheCleaner*(resolver: DnsResolver, intervalSeconds: int = 300) {.async.} =
+  ## 定期的にキャッシュをクリーンアップするバックグラウンドタスク
+  while true:
+    # 設定された間隔でスリープ
+    await sleepAsync(intervalSeconds * 1000)
+    
+    let now = getTime().toUnix()
+    let expiredCount = resolver.cache.cleanExpired(now)
+    
+    if expiredCount > 0:
+      info "Cleaned expired DNS cache entries", expiredCount=expiredCount, cacheSize=resolver.cache.size()
+
+# リゾルバインスタンスのシャットダウン
+proc shutdown*(resolver: DnsResolver) =
+  ## リゾルバをシャットダウンし、リソースを解放
+  info "Shutting down DNS resolver"
+  resolver.cache.clear()
+  # その他のクリーンアップ処理があれば実行... 

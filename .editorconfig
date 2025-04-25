@@ -1,0 +1,35 @@
+# 複数の開発者が同じプロジェクトで利用するエディタやIDE間で、コーディングスタイルを一貫させるための設定ファイルです。
+# editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = off
+
+# Crystal固有の設定
+[*.cr]
+indent_style = space
+indent_size = 2
+max_line_length = 100
+
+# Nim固有の設定
+[*.nim]
+indent_style = space
+indent_size = 2
+max_line_length = 80
+
+# Zig固有の設定
+[*.zig]
+indent_style = space
+indent_size = 4 # Zig standard is 4 spaces
+max_line_length = 100 # Common preference, adjust if needed
+
+[Makefile]
+indent_style = tab

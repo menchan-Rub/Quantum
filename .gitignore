@@ -1,0 +1,51 @@
+# 一般
+*.log
+logs
+*.tmp
+tmp/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# ビルド成果物
+build/
+dist/
+*.o
+*.so
+*.dll
+*.dylib
+*.exe
+*.app
+
+# 依存関係
+/vendor/
+/lib/
+node_modules/
+shards/
+nimcache/
+
+# IDE固有
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Crystal固有
+/.shards/
+/lib/
+*.dwarf
+
+# Nim固有
+nimcache/
+*.nim.cfg
+*.nimble-link
+
+# Zig固有
+zig-cache/
+zig-out/
+
+# シークレット
+*.env
+secrets.*
+credentials.*

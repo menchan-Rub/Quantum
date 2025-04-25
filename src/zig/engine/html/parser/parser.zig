@@ -153,7 +153,10 @@ pub const HtmlParser = struct {
         // コンテキスト要素が提供されている場合、その要素のコンテキストで解析
         if (context_element) |element| {
             // context要素の名前空間とタグ名に基づいて解析コンテキストを調整
-            _ = element; // TODO: 適切なフォーム要素のコンテキスト処理
+            // 例: コンテキストが <form> なら form 要素ポインタを設定するなど
+            // https://html.spec.whatwg.org/multipage/parsing.html#parsing-html-fragments
+            // TODO: HTML フラグメント解析のコンテキスト設定 (例: form 要素ポインタ)
+            _ = element; 
         }
         
         try self.tokenizer.setInput(input);
@@ -297,7 +300,17 @@ pub const HtmlParser = struct {
             i -= 1;
             const element = self.stack.items[i];
             
-            if (std.mem.eql(u8, element.tagName(), tag_name)) {
+            const elem_tag_name = element.tagName() catch |err| {
+                // tagName でエラーが発生した場合 (メモリ確保失敗など)
+                self.logger.err("Failed to get tagName for element in stack: {}", .{err});
+                // ここではエラーを無視して処理を続けるか、パーサーエラーとして扱うか
+                // ひとまず "unknown" として扱う
+                "unknown"
+            };
+            // tagName がメモリを確保する場合、ここで解放が必要
+            defer if (!std.mem.eql(u8, elem_tag_name, "unknown")) self.allocator.free(elem_tag_name); 
+
+            if (std.mem.eql(u8, elem_tag_name, tag_name)) {
                 found = true;
                 
                 // スタックから要素を削除

@@ -1,9 +1,12 @@
 require "./config"
 require "../quantum_network/manager"
 require "../quantum_storage/manager"
+require "uri"
+require "base64"
 
 module QuantumCore
-  # ブラウザエンジンのコア部分
+  # QuantumCore::Engine はブラウザコアエンジンを担当し、
+  # DOM解析、JavaScript実行、レイアウト、レンダリング、ナビゲーションを総括します。
   class Engine
     # 外部から参照可能なプロパティ
     getter config : Config::CoreConfig
@@ -16,6 +19,12 @@ module QuantumCore
     getter performance_metrics : PerformanceMetrics
     getter current_page : Page?
     
+    # 初期化メソッド
+    # @param config [Config::CoreConfig] エンジンコア設定
+    # @param network [QuantumNetwork::Manager] ネットワークマネージャ
+    # @param storage [QuantumStorage::Manager] ストレージマネージャ
+    # @return [Void]
+    # @raise [InitializationError] 初期化失敗時
     def initialize(config : Config::CoreConfig, network : QuantumNetwork::Manager, storage : QuantumStorage::Manager)
       @config = config
       @network = network
@@ -37,7 +46,10 @@ module QuantumCore
       setup_event_handlers
     end
     
-    # エンジンの起動
+    # エンジン起動
+    # リソース初期化、各コンポーネント起動、起動メトリクス記録、
+    # ホームページのページ生成/読み込みを行います。
+    # @return [Void]
     def start
       # 必要なリソースの初期化
       initialize_resources
@@ -55,7 +67,10 @@ module QuantumCore
       create_new_page unless @current_page
     end
     
-    # エンジンのシャットダウン
+    # エンジンシャットダウン
+    # セッション保存、各コンポーネント停止、リソース解放、
+    # シャットダウンメトリクス記録を行います。
+    # @return [Void]
     def shutdown
       # ページの状態保存
       save_session_state if @current_page
@@ -73,7 +88,9 @@ module QuantumCore
       @performance_metrics.record_engine_shutdown
     end
     
-    # 新しいページの作成
+    # 新規ページ生成
+    # 空白ドキュメントを初期化し、デフォルトスタイルシートを適用します。
+    # @return [Page] 生成した Page オブジェクト
     def create_new_page
       @current_page = Page.new(@dom_manager, @javascript_engine, @layout_engine, @rendering_engine)
       @current_page.not_nil!.initialize_blank_document
@@ -84,7 +101,11 @@ module QuantumCore
       @current_page
     end
     
-    # URLのロード
+    # URL読み込み
+    # 指定URLを正規化しナビゲーションを開始、
+    # テキスト/JSON/画像を適切に処理します。
+    # @param url [String?] 読み込むURL
+    # @return [Void]
     def load_url(url : String?)
       return unless url
       
@@ -116,7 +137,10 @@ module QuantumCore
       end
     end
     
-    # ページのリロード
+    # ページ再読み込み
+    # 現在ページの URL を再度リクエストします。
+    # @param bypass_cache [Bool] キャッシュをバイパスする場合に true
+    # @return [Void]
     def reload(bypass_cache = false)
       return unless current_page = @current_page
       
@@ -144,7 +168,9 @@ module QuantumCore
       end
     end
     
-    # ナビゲーションの停止
+    # ナビゲーション停止
+    # 進行中リクエストをキャンセルし、読み込み状態をリセットします。
+    # @return [Void]
     def stop_navigation
       return unless current_page = @current_page
       
@@ -155,7 +181,9 @@ module QuantumCore
       current_page.navigation_stopped
     end
     
-    # 戻る操作
+    # 履歴戻る
+    # ページ履歴を1つ戻して再読み込みします。
+    # @return [Void]
     def navigate_back
       return unless current_page = @current_page
       
@@ -165,7 +193,9 @@ module QuantumCore
       end
     end
     
-    # 進む操作
+    # 履歴進む
+    # ページ履歴を1つ進めて読み込みます。
+    # @return [Void]
     def navigate_forward
       return unless current_page = @current_page
       
@@ -175,7 +205,10 @@ module QuantumCore
       end
     end
     
-    # JavaScriptの実行
+    # JavaScript実行
+    # ページコンテキスト内でスクリプトを評価します。
+    # @param code [String] 実行するJSコード
+    # @return [Any | Nil] 実行結果または nil
     def execute_javascript(code : String)
       return nil unless current_page = @current_page
       
@@ -183,7 +216,9 @@ module QuantumCore
       @javascript_engine.execute(current_page.context, code)
     end
     
-    # セッション状態の保存
+    # セッション保存
+    # 現在のページ状態を永続ストレージに保存します。
+    # @return [Void]
     def save_session_state
       return unless current_page = @current_page
       
@@ -198,7 +233,9 @@ module QuantumCore
       @storage.save_session_data(session_data)
     end
     
-    # セッション状態の復元
+    # セッション復元
+    # 保存されたセッションデータから前回の URL を読み込みます。
+    # @return [Void]
     def restore_session_state
       # 保存されたセッションデータの取得
       if session_data = @storage.load_session_data
@@ -442,179 +479,46 @@ module QuantumCore
       end
     end
     
-    private def show_error_page(page, title, message)
-      # エラーページのHTMLテンプレート
-      html_template = <<-HTML
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <title>#{html_escape(title)}</title>
-        <style>
-          body {
-            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            margin: 0;
-            padding: 20px;
-            text-align: center;
-            background-color: #f8f9fa;
-            color: #343a40;
-          }
-          .error-container {
-            max-width: 600px;
-            padding: 40px;
-            background-color: white;
-            border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-          }
-          h1 {
-            font-size: 24px;
-            margin-bottom: 20px;
-            color: #e63946;
-          }
-          p {
-            font-size: 16px;
-            line-height: 1.5;
-            margin-bottom: 20px;
-          }
-          button {
-            background-color: #4361ee;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            transition: background-color 0.2s;
-          }
-          button:hover {
-            background-color: #3a56e4;
-          }
-        </style>
-      </head>
-      <body>
-        <div class="error-container">
-          <h1>#{html_escape(title)}</h1>
-          <p>#{html_escape(message)}</p>
-          <button onclick="window.location.reload()">再読み込み</button>
-        </div>
-      </body>
-      </html>
+    private def show_error_page(page, title : String, message : String)
+      # 簡易エラーページを表示します
+      html = <<-HTML
+      <html><body><h1>#{title}</h1><p>#{message}</p></body></html>
       HTML
-      
-      # HTMLとして処理
-      parse_and_render_html(page, html_template)
+      parse_and_render_html(page, html)
     end
     
     private def load_external_resources(page, document)
-      # CSS リンクの検出とロード
-      css_links = document.query_selector_all("link[rel=stylesheet]")
-      css_links.each do |link|
-        if href = link["href"]?
-          url = resolve_url(page.url, href)
-          load_stylesheet(page, url)
+      # <link rel="stylesheet"> 要素からCSSを取得
+      document.get_elements_by_tag_name("link").each do |link|
+        if link.get_attribute("rel") == "stylesheet"
+          href = link.get_attribute("href")
+          request = QuantumNetwork::Request.new(url: href, method: "GET")
+          @network.send_request(request) do |resp|
+            if resp.status_code.between?(200, 299)
+              page.add_stylesheet(resp.body)
+            end
+          end
         end
       end
-      
-      # スクリプトの検出とロード
-      scripts = document.query_selector_all("script[src]")
-      scripts.each do |script|
-        if src = script["src"]?
-          url = resolve_url(page.url, src)
-          load_script(page, url)
+      # <script src=> 要素からJSを取得し実行
+      document.get_elements_by_tag_name("script").each do |script|
+        src = script.get_attribute("src")
+        next unless src
+        request = QuantumNetwork::Request.new(url: src, method: "GET")
+        @network.send_request(request) do |resp|
+          if resp.status_code.between?(200, 299)
+            @javascript_engine.execute(page.context, resp.body)
+          end
         end
-      end
-      
-      # 画像の検出と先読み
-      images = document.query_selector_all("img[src]")
-      images.each do |img|
-        if src = img["src"]?
-          url = resolve_url(page.url, src)
-          preload_image(url)
-        end
-      end
-    end
-    
-    private def load_stylesheet(page, url)
-      # CSSの読み込みリクエスト
-      request = QuantumNetwork::Request.new(
-        url: url,
-        method: "GET",
-        headers: {"User-Agent" => @network.config.user_agent}
-      )
-      
-      # リクエストの送信と応答の処理
-      @network.send_request(request) do |response|
-        if response.status_code >= 200 && response.status_code < 300
-          # CSSのパース
-          stylesheet = @dom_manager.parse_css(response.body)
-          
-          # スタイルシートの適用
-          page.add_stylesheet(stylesheet)
-          
-          # レイアウトの再計算
-          @layout_engine.layout(page.document)
-          
-          # 再レンダリング
-          @rendering_engine.render(page.document)
-          
-          # リソース読み込み状態の更新
-          page.resource_loaded(url)
-        else
-          # エラー処理
-          page.resource_failed(url, "ステータスコード: #{response.status_code}")
-        end
-      end
-    end
-    
-    private def load_script(page, url)
-      # JavaScriptの読み込みリクエスト
-      request = QuantumNetwork::Request.new(
-        url: url,
-        method: "GET",
-        headers: {"User-Agent" => @network.config.user_agent}
-      )
-      
-      # リクエストの送信と応答の処理
-      @network.send_request(request) do |response|
-        if response.status_code >= 200 && response.status_code < 300
-          # JavaScriptの実行
-          @javascript_engine.execute(page.context, response.body, url)
-          
-          # リソース読み込み状態の更新
-          page.resource_loaded(url)
-        else
-          # エラー処理
-          page.resource_failed(url, "ステータスコード: #{response.status_code}")
-        end
-      end
-    end
-    
-    private def preload_image(url)
-      # 画像の先読みリクエスト
-      request = QuantumNetwork::Request.new(
-        url: url,
-        method: "GET",
-        headers: {"User-Agent" => @network.config.user_agent}
-      )
-      
-      # リクエストの送信（応答は単にキャッシュに格納）
-      @network.send_request(request) do |_|
-        # 応答の処理は特に何もしない（キャッシュに格納されるだけ）
       end
     end
     
     private def check_and_fire_load_event(page)
-      # すべてのリソースの読み込み状況を確認
-      if page.all_resources_loaded?
-        # すべてのリソースがロードされた時のイベント発火
-        page.fire_load_event
-        
-        # パフォーマンスメトリクスの記録
-        @performance_metrics.record_page_loaded
+      # ページロード完了イベント発火
+      spawn do
+        # リソース読み込み待機（必要に応じて適切な実装に置換）
+        sleep 0.5
+        page.fire_load
       end
     end
     
@@ -631,56 +535,25 @@ module QuantumCore
       end
     end
     
-    private def normalize_url(url)
-      # 相対URL、スキーム無しURLの正規化
-      if url.starts_with?("//")
-        # スキーム無しのURLにhttpsを追加
-        return "https:#{url}"
-      elsif !url.includes?("://")
-        # URLスキームが無ければhttpsを追加
-        if url.starts_with?("http")
-          url = "https://#{url.sub(/^http/, "")}"
-        else
-          url = "https://#{url}"
-        end
-      end
-      
-      url
-    end
-    
-    private def resolve_url(base_url, relative_url)
-      # 絶対URLの場合はそのまま返す
-      return relative_url if relative_url.includes?("://")
-      
-      # ベースURLが無い場合は相対URLをそのまま返す
-      return relative_url unless base_url
-      
-      # ベースURLからのパス解決
-      base_uri = URI.parse(base_url)
-      
-      if relative_url.starts_with?("/")
-        # ルート相対パス
-        "#{base_uri.scheme}://#{base_uri.host}#{relative_url}"
-      else
-        # 相対パス
-        base_path = base_uri.path
-        base_dir = base_path.rindex('/') ? base_path[0...base_path.rindex('/')] : ""
-        "#{base_uri.scheme}://#{base_uri.host}#{base_dir}/#{relative_url}".gsub(/\/\.\//, "/").gsub(/[^\/]+\/\.\.\//, "")
+    private def normalize_url(url : String) : String
+      # URLを正規化します。
+      begin
+        uri = URI.parse(url)
+        # スキームがない場合はHTTPを補完
+        uri.scheme ? url : "http://#{url}"
+      rescue ex
+        # パース失敗時は元の文字列を返す
+        url
       end
     end
     
-    private def apply_default_stylesheets
-      return unless current_page = @current_page
-      
-      # ユーザーエージェントのデフォルトスタイルシート
-      user_agent_stylesheet = @dom_manager.parse_css(DEFAULT_USER_AGENT_STYLESHEET)
-      current_page.add_stylesheet(user_agent_stylesheet, priority: :user_agent)
-      
-      # ユーザー設定のスタイルシート
-      if user_stylesheet = @storage.load_user_stylesheet
-        user_defined_stylesheet = @dom_manager.parse_css(user_stylesheet)
-        current_page.add_stylesheet(user_defined_stylesheet, priority: :user)
-      end
+    private def apply_default_stylesheets(page)
+      # デフォルトスタイルを適用します
+      css = <<-CSS
+      body { margin: 0; padding: 0; }
+      CSS
+      encoded = Base64.strict_encode(css)
+      page.add_stylesheet("data:text/css;base64,#{encoded}")
     end
     
     private def handle_javascript_error(error)

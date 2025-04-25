@@ -1,16 +1,29 @@
 require "./quantum_core/**"
-require "./quantum_ui/**"
+require "./quantum_ui/ui_layer"
 
 module QuantumBrowser
   VERSION = "0.1.0"
+  # アプリケーション名定数 (ファイルパス生成などで利用)
+  APP_NAME = "QuantumBrowser"
 
-  # ブラウザエンジンの起動ポイント
+  # QuantumBrowser::Engine はブラウザの各コンポーネント（UI、ネットワーク、コア、ストレージ）を統括し、
+  # 完全なライフサイクル管理（初期化、起動、シャットダウン）を行う公開APIクラスです。
   class Engine
+    # 設定オブジェクトを取得します
+    getter config : QuantumCore::Config
     getter core : QuantumCore::Engine
     getter ui : QuantumUI::Manager
     getter network : QuantumNetwork::Manager
     getter storage : QuantumStorage::Manager
     
+    # 初期化メソッド。
+    #
+    # 指定された設定ファイルパスを基に設定を読み込み、
+    # 各コンポーネント（ストレージ、ネットワーク、コア、UI、パフォーマンスモニター）の
+    # インスタンスを生成します。
+    #
+    # @param config_path [String?] 設定ファイルのパス (省略時はデフォルト設定を使用)
+    # @return [Void]
     def initialize(config_path : String? = nil)
       # 設定の読み込み
       config = if config_path
@@ -18,6 +31,8 @@ module QuantumBrowser
       else
         QuantumCore::Config.default
       end
+      # 設定オブジェクトを保持
+      @config = config
       
       # 各コンポーネントの初期化
       @storage = QuantumStorage::Manager.new(config.storage)
@@ -32,6 +47,12 @@ module QuantumBrowser
       setup_signal_handlers
     end
     
+    # ブラウザを起動します。
+    #
+    # 各コンポーネントをスタートし、パフォーマンスモニターを開始後、
+    # UIのメインループを実行します。
+    #
+    # @return [Void]
     def start
       # コンポーネントの起動
       @storage.start
@@ -46,6 +67,12 @@ module QuantumBrowser
       @ui.main_loop
     end
     
+    # 正常シャットダウン処理を実行します。
+    #
+    # UI、コア、ネットワーク、ストレージ、パフォーマンスモニターの
+    # シャットダウン処理を順次実行します。
+    #
+    # @return [Void]
     def shutdown
       # 正常終了の処理
       @ui.shutdown
@@ -114,8 +141,15 @@ end
 # エンジンの初期化と起動
 engine = QuantumBrowser::Engine.new(config_path)
 
-# 初期URLが指定されていれば読み込む
-engine.core.load_url(initial_url) if initial_url
+# 初期URLが指定されていればそのURLを読み込み、それ以外は設定のホームページを読み込みます
+if initial_url
+  engine.core.load_url(initial_url)
+else
+  # 設定のホームページURLを取得して読み込む
+  if (home_url = engine.config.homepage_url?)
+    engine.core.load_url(home_url)
+  end
+end
 
 # ブラウザの起動
 engine.start 
