@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const mem = @import("../memory/allocator.zig"); // Global allocator
-const errors = @import("../util/error.zig");   // Common errors
+const errors = @import("../util/error.zig"); // Common errors
 const Node = @import("./node.zig").Node;
 const NodeType = @import("./node_type.zig").NodeType;
 const Document = @import("./document.zig").Document;
@@ -71,17 +71,17 @@ pub const Text = struct {
     /// テキストデータを設定します。
     pub fn setData(self: *Text, allocator: std.mem.Allocator, new_data: []const u8) !void {
         const old_data = self.data; // 古いデータを保持 (MutationRecord 用)
-        
+
         // 新しいデータを複製して所有
         const owned_new_data = try allocator.dupe(u8, new_data);
         // エラーが発生した場合、古いデータはそのまま
-        
+
         // 古いデータを解放
         allocator.free(old_data);
         // 新しいデータを設定
         self.data = owned_new_data;
 
-        // --- MutationObserver 通知 --- 
+        // --- MutationObserver 通知 ---
         if (self.node_ptr.owner_document) |doc| {
             // レコードを作成
             var record = try MutationRecord.create(allocator, .characterData, self.node_ptr);
@@ -102,7 +102,62 @@ pub const Text = struct {
         return self.data.len;
     }
 
-    // TODO: splitText, wholeText など
+    /// 指定された位置でテキストノードを分割します。
+    /// 分割後、元のノードは0からoffsetまでを保持し、新しいノードはoffset以降を保持します。
+    /// 新しいノードは元のノードの次の兄弟として挿入されます。
+    pub fn splitText(self: *Text, allocator: std.mem.Allocator, offset: usize) !*Node {
+        // 1. データの長さをチェック
+        if (offset > self.data.len) {
+            return error.IndexSizeError;
+        }
+
+        // 2. offset以降のテキストを取得
+        const new_data = self.data[offset..];
+
+        // 3. 新しいテキストノードを作成
+        var new_node = try Text.create(allocator, self.node_ptr.owner_document orelse return error.NoOwnerDocument, new_data);
+
+        // 4. 元のノードのテキストを更新（切り詰める）
+        try self.setData(allocator, self.data[0..offset]);
+
+        // 5. 親ノードがある場合、新しいノードを挿入
+        if (self.node_ptr.parent_node) |parent| {
+            _ = try parent.insertBefore(allocator, new_node, self.node_ptr.next_sibling);
+        }
+
+        // 6. 新しいノードを返す
+        return new_node;
+    }
+
+    /// 論理的に隣接するすべてのテキストノードを結合した値を返します。
+    /// このノードの前後に位置するすべてのテキストノードの内容が連結されます。
+    pub fn wholeText(self: *const Text, allocator: std.mem.Allocator) ![]const u8 {
+        // 親ノードがない場合は自分自身のデータを返す
+        if (self.node_ptr.parent_node == null) {
+            return try allocator.dupe(u8, self.data);
+        }
+
+        const parent = self.node_ptr.parent_node.?;
+
+        // 結果を格納するための動的配列
+        var result = std.ArrayList(u8).init(allocator);
+        errdefer result.deinit();
+
+        // 親の子ノードを走査
+        var current_child = parent.first_child;
+
+        while (current_child) |child| {
+            // テキストノードのみを処理
+            if (child.node_type == .text_node) {
+                const child_text: *Text = @ptrCast(@alignCast(child.specific_data.?));
+                try result.appendSlice(child_text.data);
+            }
+
+            current_child = child.next_sibling;
+        }
+
+        return result.toOwnedSlice();
+    }
 };
 
 // Text ノードのテスト (修正が必要)
@@ -145,4 +200,4 @@ test "Text setData" {
 
     try std.testing.expectEqualStrings(new_data, text.data);
     try std.testing.expect(text.length() == new_data.len);
-} 
+}

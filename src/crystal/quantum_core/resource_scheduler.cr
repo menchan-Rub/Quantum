@@ -8,6 +8,7 @@ require "deque"
 require "mutex"
 require "uri"
 require "fiber" # バックグラウンドタスク用
+require "atomic"
 
 module QuantumCore
   # 優先度と同時実行制限に基づいてネットワークリソースリクエストをスケジュールし実行する。
@@ -25,11 +26,15 @@ module QuantumCore
     end
 
     # キューで待機中または処理中のリクエストを表す
-    record RequestItem, request_id : UInt64, page_id : UInt64, url : URI, priority : Priority, timestamp : Time, bypass_cache : Bool, fiber : Fiber? do
-      # スケジューラによって生成された一意のrequest_idを使用
-      # キャッシュバイパスフラグを追加
-      # キャンセル用にリクエストを処理するFiberを保存
-    end
+    private record RequestItem,
+      request_id : UInt64,
+      page_id : UInt64,
+      url : URI,
+      priority : Priority,
+      timestamp : Time,
+      bypass_cache : Bool,
+      fiber : Fiber?, # このリクエストを実行しているFiber
+      cancelled : Atomic::Bool = Atomic::Bool.new(false) # キャンセルフラグ
 
     # --- インスタンス変数 --- #
     @queues : Hash(Priority, Deque(RequestItem))
@@ -78,317 +83,127 @@ module QuantumCore
     def cancel_requests_for_page(page_id : UInt64)
       cancelled_pending_count = 0
       active_items_to_cancel = [] of RequestItem
-
+      
       @mutex.synchronize do
         # 保留中のリクエストをキャンセル
-        Priority.each do |priority|
-          queue = @queues[priority]
-          items_to_keep = queue.reject do |item|
+        @queues.each do |priority, queue|
+          queue.reject! do |item|
             if item.page_id == page_id
               cancelled_pending_count += 1
-              @logger.trace { "ページ#{page_id}の保留中リクエストID #{item.request_id}をキャンセル中" }
-              true # キューから削除
+              @logger.debug { "保留中のリクエストをキャンセルしました: #{item.url} (優先度: #{priority})" }
+              true
             else
-              false # キューに保持
+              false
             end
           end
-          # フィルタリングされたアイテムでキューを置き換え（可能であればDeque内部で効率的に処理、そうでなければ再構築）
-          @queues[priority] = Deque(RequestItem).concat(items_to_keep)
         end
-
-        # このページのアクティブなリクエストを特定
-        active_items_to_cancel = @active_requests.values.select { |item| item.page_id == page_id }
-      end
-
-      @logger.info { "ページ#{page_id}の保留中リクエスト#{cancelled_pending_count}件をキャンセルしました" } if cancelled_pending_count > 0
-
-      # アクティブなリクエストをキャンセル（ミューテックス外で）
-      if active_items_to_cancel.any?
-          @logger.info { "ページ#{page_id}のアクティブなリクエスト#{active_items_to_cancel.size}件のキャンセルを要求中" }
-          active_items_to_cancel.each do |item|
-              cancel_active_request(item)
-          end
-      end
-    end
-
-    # 特定のアクティブなリクエストをキャンセル
-    private def cancel_active_request(item : RequestItem)
-      @logger.debug { "アクティブなリクエストID #{item.request_id}のキャンセルを試行中（Fiber: #{item.fiber.inspect}）" }
-      # HTTPリクエストを実行しているFiberに停止を通知する方法が必要
-      # 選択肢1: Fiberで例外を発生させる（可能かつ安全な場合）
-      # 選択肢2: Fiber内のループでチェックする共有フラグ（例：Atomic Boolean）を使用
-      # 選択肢3: 基礎となるIO（client.close）を閉じる - クライアントアクセスが必要かもしれない
-
-      # 簡単のため、例外を発生させてみましょう。これは脆弱かもしれません。
-      begin
-        item.fiber.try &.raise(Fiber::Cancelled.new("リクエストがスケジューラによってキャンセルされました"))
-      rescue ex
-        @logger.warn(exception: ex) { "リクエスト#{item.request_id}のFiberでキャンセルを発生させることに失敗しました" }
-      end
-
-      # キャンセル信号の成功に関わらず、スケジューラスロットを解放し、
-      # さらなる処理/イベント配信を防ぐために、すぐに完了としてマーク
-      handle_request_finished(item.request_id, cancelled: true)
-    end
-
-
-    # ページが閉じられたときに呼び出され、そのリクエストをキャンセルする
-    def page_closed(page_id : UInt64)
-      @logger.debug { "ページ#{page_id}が閉じられました。関連するリクエストをキャンセルします。" }
-      cancel_requests_for_page(page_id)
-    end
-
-    # --- リクエスト実行（Nimブリッジとの相互作用に代わるもの） --- #
-
-    # 別のFiberでHTTPリクエストを実行
-    private def execute_request(item : RequestItem)
-      spawn name: "http_req_#{item.request_id}" do
-        client : HTTP::Client? = nil
-        response : HTTP::Client::Response? = nil
-        begin
-          # 1. HTTPクライアントを作成
-          client = HTTP::Client.new(item.url, tls: item.url.scheme == "https")
-          client.read_timeout = 30.seconds # タイムアウト例
-          client.connect_timeout = 15.seconds
-
-          # bypass_cacheがtrueの場合、キャッシュ制御ヘッダーを追加
-          headers = HTTP::Headers.new
-          if item.bypass_cache
-            headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
-            headers["Pragma"] = "no-cache" # HTTP/1.0互換性のため
-            headers["Expires"] = "0"
-          end
-          
-          # ブラウザのユーザーエージェントとその他の標準ヘッダーを設定
-          headers["User-Agent"] = "QuantumBrowser/1.0 Crystal/#{Crystal::VERSION}"
-          headers["Accept"] = "*/*"
-          headers["Accept-Language"] = "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"
-          headers["Connection"] = "keep-alive"
-          
-          # 将来的にはCookieストアからCookieを取得して追加する
-          # headers["Cookie"] = get_cookies_for_domain(item.url.host.to_s)
-
-          # 2. リクエストを実行（現時点ではGET）
-          @logger.debug { "リクエスト#{item.request_id}のHTTP GETを実行中、URL: #{item.url}" }
-          response = client.get(item.url.request_target, headers: headers)
-          @logger.debug { "リクエスト#{item.request_id}のレスポンスヘッダーを受信（ステータス: #{response.status_code}）" }
-
-          # 3. レスポンス受信イベントを配信
-          security_info = {
-            "protocol" => client.tls.try(&.protocol) || "none",
-            "cipher" => client.tls.try(&.cipher) || "none",
-            "cert_verified" => client.tls.try(&.verified) || false
-          }
-          
-          dispatch_network_event(
-            QuantumEvents::EventType::NETWORK_RESPONSE_RECEIVED,
-            QuantumEvents::NetworkResponseReceivedData.new(
-              request_id: item.request_id.to_s,
-              page_id: item.page_id.to_s,
-              url: item.url.to_s,
-              status_code: response.status_code,
-              headers: response.headers.to_h, # 単純なHashに変換
-              security_info: security_info
-            )
-          )
-
-          # 4. レスポンスボディを処理（ストリーミング）
-          body = response.body_io
-          if body
-            buffer = Bytes.new(8192) # チャンクで読み込み
-            total_bytes_read = 0
-            start_time = Time.monotonic
-            
-            while (bytes_read = body.read(buffer)) > 0
-              # データを配信する前にキャンセル要求をチェック
-              # これにはAtomicBoolやFiberステータスをチェックするようなメカニズムが必要
-              # 簡略化：現時点では続行
-              chunk = buffer[0, bytes_read]
-              total_bytes_read += bytes_read
-              
-              @logger.trace { "リクエスト#{item.request_id}の#{bytes_read}バイトのデータを配信中" }
-              dispatch_network_event(
-                QuantumEvents::EventType::NETWORK_DATA_RECEIVED,
-                QuantumEvents::NetworkDataReceivedData.new(
-                  request_id: item.request_id.to_s,
-                  page_id: item.page_id.to_s,
-                  data_chunk: chunk, # 実際のバイトを送信
-                  bytes_received: bytes_read,
-                  total_bytes: total_bytes_read
-                )
-              )
-            end
-            
-            elapsed_time = Time.monotonic - start_time
-            @logger.debug { "リクエスト#{item.request_id}のボディ読み込みが完了（#{total_bytes_read}バイト、#{elapsed_time.total_milliseconds.round(2)}ms）" }
-          else
-             @logger.debug { "リクエスト#{item.request_id}にはボディコンテンツがありません" }
-          end
-
-          # 5. 完了イベントを配信
-          @logger.debug { "リクエスト#{item.request_id}の正常完了を配信中" }
-          
-          # タイミング情報を計算
-          timing_info = {
-            "total_time" => (Time.utc - item.timestamp).total_milliseconds.round(2),
-            "content_type" => response.headers["Content-Type"]? || "unknown"
-          }
-          
-          dispatch_network_event(
-            QuantumEvents::EventType::NETWORK_REQUEST_COMPLETED,
-            QuantumEvents::NetworkRequestCompletedData.new(
-              request_id: item.request_id.to_s,
-              page_id: item.page_id.to_s,
-              url: item.url.to_s,
-              status_code: response.status_code,
-              encoded_data_length: response.content_length? || -1, # 利用可能な場合はcontent_lengthを使用
-              timing_info: timing_info
-            )
-          )
-
-        rescue ex : Fiber::Cancelled
-          # リクエストは外部からキャンセルされた（例：cancel_active_requestによって）
-          # handle_request_finished(cancelled: true)は既に呼び出されている
-          @logger.info { "HTTPリクエストFiber #{item.request_id}がキャンセルされました: #{ex.message}" }
-          # ここではさらにイベントを配信しない
-
-        rescue ex : IO::TimeoutError
-          @logger.warn(exception: ex) { "URL #{item.url}のHTTPリクエスト#{item.request_id}がタイムアウトしました" }
-          dispatch_network_event(
-            QuantumEvents::EventType::NETWORK_REQUEST_FAILED,
-            QuantumEvents::NetworkRequestErrorData.new(
-              request_id: item.request_id.to_s,
-              page_id: item.page_id.to_s,
-              url: item.url.to_s,
-              error_message: "リクエストがタイムアウトしました: #{ex.message}",
-              status_code: response.try(&.status_code), # ヘッダーが受信された場合はステータスを含める
-              error_type: "timeout"
-            )
-          )
-        rescue ex : OpenSSL::Error # TLS/SSLエラーをキャッチ
-            @logger.error(exception: ex) { "リクエスト#{item.request_id}、URL #{item.url}のTLS/SSLエラー" }
-            dispatch_network_event(
-                QuantumEvents::EventType::NETWORK_REQUEST_FAILED,
-                QuantumEvents::NetworkRequestErrorData.new(
-                    request_id: item.request_id.to_s,
-                    page_id: item.page_id.to_s,
-                    url: item.url.to_s,
-                    error_message: "TLS/SSLエラー: #{ex.message}",
-                    error_type: "ssl"
-                )
-            )
-        rescue ex : Socket::Error # DNS解決、接続拒否などのソケットエラー
-          @logger.error(exception: ex) { "リクエスト#{item.request_id}、URL #{item.url}のソケットエラー" }
-          dispatch_network_event(
-            QuantumEvents::EventType::NETWORK_REQUEST_FAILED,
-            QuantumEvents::NetworkRequestErrorData.new(
-              request_id: item.request_id.to_s,
-              page_id: item.page_id.to_s,
-              url: item.url.to_s,
-              error_message: "ネットワークエラー: #{ex.message}",
-              error_type: "network"
-            )
-          )
-        rescue ex # その他の潜在的なエラーをキャッチ
-          @logger.error(exception: ex) { "URL #{item.url}のHTTPリクエスト#{item.request_id}が失敗しました" }
-          dispatch_network_event(
-            QuantumEvents::EventType::NETWORK_REQUEST_FAILED,
-            QuantumEvents::NetworkRequestErrorData.new(
-              request_id: item.request_id.to_s,
-              page_id: item.page_id.to_s,
-              url: item.url.to_s,
-              error_message: "リクエストが失敗しました: #{ex.message}",
-              status_code: response.try(&.status_code),
-              error_type: "general"
-            )
-          )
-        ensure
-          # 6. クライアントをクリーンアップし、スケジューラでリクエストを完了としてマーク
-          client.try &.close
-          # 外部からキャンセルされた場合を*除いて*完了としてマーク
-          # handle_request_finishedは成功/失敗/外部キャンセルの両方で呼び出される
-          unless ex.is_a?(Fiber::Cancelled)
-            handle_request_finished(item.request_id)
+        
+        # 実行中のリクエストを収集
+        @active_requests.each do |request_id, item|
+          if item.page_id == page_id
+            active_items_to_cancel << item
           end
         end
       end
+      
+      # 実行中のリクエストをキャンセル
+      active_items_to_cancel.each do |item|
+        cancel_active_request(item.request_id)
+      end
+      
+      @logger.info { "ページ #{page_id} のリクエストをキャンセルしました（保留中: #{cancelled_pending_count}、実行中: #{active_items_to_cancel.size}）" }
     end
 
-    # EventDispatcherを介してネットワークイベントを配信するヘルパー
-    private def dispatch_network_event(type : QuantumEvents::EventType, data : QuantumEvents::EventData)
-        begin
-            @event_dispatcher.dispatch(QuantumEvents::Event.new(type, data))
-        rescue ex
-             @logger.error(exception: ex) { "ネットワークイベントの配信に失敗しました: タイプ=#{type}, データ=#{data.inspect}" }
-        end
-    end
-
-
-    # リクエストが完了したとき（成功、エラー、またはキャンセル）に内部的に呼び出される
-    private def handle_request_finished(request_id : UInt64, cancelled = false)
-      removed_item : RequestItem? = nil
+    # 特定のリクエストをキャンセル
+    def cancel_request(request_id : UInt64) : Bool
       @mutex.synchronize do
-        removed_item = @active_requests.delete(request_id)
+        # 保留中のリクエストから検索・削除
+        @queues.each do |priority, queue|
+          if queue.any? { |item| item.request_id == request_id }
+            queue.reject! { |item| item.request_id == request_id }
+            @logger.debug { "保留中のリクエスト #{request_id} をキャンセルしました" }
+            return true
+          end
+        end
+        
+        # 実行中のリクエストから検索・キャンセル
+        if @active_requests.has_key?(request_id)
+          cancel_active_request(request_id)
+          return true
+        end
       end
-      if removed_item
-        status = cancelled ? "キャンセル" : "完了"
-        @logger.debug { "リクエスト#{request_id}が#{status}しました。アクティブ: #{@active_requests.size}。キューをチェック中。" }
-        # スロットが空いたので、次の待機中リクエストのディスパッチを試みる
-        try_dispatch_next
-      else
-        # これはキャンセルが自然完了と同時に発生した場合に起こる可能性がある
-        @logger.warn { "不明または既に非アクティブなリクエストID: #{request_id}の完了信号を受信しました" }
+      
+      false
+    end
+
+    # 統計情報の取得
+    def get_statistics : NamedTuple(
+      pending_requests: Int32,
+      active_requests: Int32,
+      total_completed: UInt64,
+      total_failed: UInt64,
+      average_response_time: Float64
+    )
+      @mutex.synchronize do
+        pending_count = @queues.values.sum(&.size)
+        active_count = @active_requests.size
+        
+        {
+          pending_requests: pending_count,
+          active_requests: active_count,
+          total_completed: @total_completed,
+          total_failed: @total_failed,
+          average_response_time: @average_response_time
+        }
       end
     end
 
-    # --- 内部ロジック --- #
+    # 優先度の変更
+    def change_priority(request_id : UInt64, new_priority : Priority) : Bool
+      @mutex.synchronize do
+        # 保留中のリクエストから検索
+        @queues.each do |current_priority, queue|
+          if item_index = queue.index { |item| item.request_id == request_id }
+            item = queue.delete_at(item_index)
+            item.priority = new_priority
+            @queues[new_priority].push(item)
+            @logger.debug { "リクエスト #{request_id} の優先度を #{current_priority} から #{new_priority} に変更しました" }
+            return true
+          end
+        end
+      end
+      
+      false
+    end
 
-    # リクエストを適切な優先度キューに追加し、リクエストIDを返す
+    # --- 内部実装 --- #
+
+    # リクエストをキューに追加
     private def add_request(page_id : UInt64, url : URI, priority : Priority, bypass_cache : Bool) : UInt64
       request_id = generate_request_id
-      # 最初、fiberはnilです。リクエストがディスパッチされるときに設定されます。
-      item = RequestItem.new(request_id, page_id, url, priority, Time.utc, bypass_cache, nil)
+      
+      item = RequestItem.new(
+        request_id: request_id,
+        page_id: page_id,
+        url: url,
+        priority: priority,
+        bypass_cache: bypass_cache,
+        created_at: Time.utc,
+        retry_count: 0
+      )
+      
       @mutex.synchronize do
         @queues[priority].push(item)
-        @logger.debug { "リクエストがキューに追加されました: ID #{request_id}, ページ #{page_id}, URL #{url} (優先度: #{priority}, キャッシュ: #{bypass_cache ? 'バイパス' : '使用'})" }
+        @logger.debug { "リクエストをキューに追加しました: #{url} (ID: #{request_id}, 優先度: #{priority})" }
       end
-      try_dispatch_next
-      request_id # 生成されたIDを返す
+      
+      # 即座に処理を試行
+      process_queue
+      
+      request_id
     end
 
-    # 同時実行制限が許可する場合、次の最高優先度リクエストのディスパッチを試みる
-    private def try_dispatch_next
-      item_to_dispatch : RequestItem? = nil
-      can_dispatch = false
-
-      @mutex.synchronize do
-        can_dispatch = @active_requests.size < @max_concurrent_requests
-        if can_dispatch
-          Priority.each do |priority|
-            queue = @queues[priority]
-            unless queue.empty?
-              # ディスパッチするアイテムをキューから取り出す
-              item = queue.shift.not_nil!
-              # 新しいFiberでリクエストを実行し、Fiber参照を保存
-              executing_fiber = execute_request(item)
-              # アイテムをFiber参照で更新し、アクティブリクエストに追加
-              item_with_fiber = item.copy(fiber: executing_fiber)
-              @active_requests[item.request_id] = item_with_fiber
-              item_to_dispatch = item_with_fiber # ミューテックス外でのログ用
-              break # ディスパッチするアイテムが見つかった
-            end
-          end
-        end
-      end
-
-      # ディスパッチをログに記録（ミューテックス外で）
-      if item = item_to_dispatch
-        @logger.info { "リクエストをディスパッチ中: ID #{item.request_id}, ページ #{item.page_id}, URL #{item.url} (優先度: #{item.priority})。アクティブ: #{@active_requests.size}" }
-        # 実際の実行はミューテックス内のexecute_request呼び出しによって既に開始されている
-      end
-    end
-
-    # 新しいリクエスト用の一意のIDを生成
+    # リクエストIDの生成
     private def generate_request_id : UInt64
       @mutex.synchronize do
         @request_id_counter += 1
@@ -396,57 +211,410 @@ module QuantumCore
       end
     end
 
-    # 優先度変更ロジック（直接実行モデルでは大幅な再作業が必要）
-    def change_priority(request_id : UInt64, new_priority : Priority)
-      item_found = false
-      
+    # キューの処理
+    private def process_queue
+      spawn do
+        loop do
+          item = get_next_request
+          break unless item
+          
+          execute_request(item)
+        end
+      end
+    end
+
+    # 次のリクエストを取得
+    private def get_next_request : RequestItem?
       @mutex.synchronize do
-        # アクティブリクエスト内でアイテムを検索
-        if @active_requests.has_key?(request_id)
-          @logger.info { "アクティブなリクエスト#{request_id}の優先度を#{new_priority}に変更しようとしましたが、実行中のリクエストの優先度は変更できません" }
-          item_found = true
-          # 実行中のリクエストの優先度は変更できないため、何もしない
-          return
+        return nil if @active_requests.size >= @max_concurrent_requests
+        
+        # 優先度順にキューをチェック
+        Priority.each do |priority|
+          queue = @queues[priority]
+          unless queue.empty?
+            item = queue.shift
+            @active_requests[item.request_id] = item
+            return item
+          end
         end
         
-        # キュー内でアイテムを検索
-        Priority.each do |current_priority|
-          queue = @queues[current_priority]
-          item_index = queue.index { |item| item.request_id == request_id }
+        nil
+      end
+    end
+
+    # リクエストの実行
+    private def execute_request(item : RequestItem)
+      start_time = Time.utc
+      
+      begin
+        @logger.debug { "リクエストを実行中: #{item.url} (ID: #{item.request_id})" }
+        
+        # HTTP リクエストの実行
+        response = perform_http_request(item)
+        
+        # 成功時の処理
+        handle_request_success(item, response, start_time)
+        
+      rescue ex : Exception
+        # エラー時の処理
+        handle_request_error(item, ex, start_time)
+      ensure
+        # アクティブリクエストから削除
+        @mutex.synchronize do
+          @active_requests.delete(item.request_id)
+        end
+        
+        # 次のリクエストを処理
+        process_queue
+      end
+    end
+
+    # HTTP リクエストの実行
+    private def perform_http_request(item : RequestItem) : HTTP::Client::Response
+      # HTTPクライアントの設定
+      client = HTTP::Client.new(item.url.host.not_nil!, item.url.port)
+      client.connect_timeout = 10.seconds
+      client.read_timeout = 30.seconds
+      
+      # ヘッダーの設定
+      headers = HTTP::Headers.new
+      headers["User-Agent"] = "Quantum Browser/1.0"
+      headers["Accept"] = "*/*"
+      headers["Accept-Encoding"] = "gzip, deflate, br"
+      headers["Connection"] = "keep-alive"
+      
+      # キャッシュ制御
+      if item.bypass_cache
+        headers["Cache-Control"] = "no-cache"
+        headers["Pragma"] = "no-cache"
+      end
+      
+      # リクエストの実行
+      path = item.url.path.empty? ? "/" : item.url.path
+      if query = item.url.query
+        path += "?" + query
+      end
+      
+      response = client.get(path, headers)
+      
+      # レスポンスの検証
+      validate_response(response)
+      
+      response
+    end
+
+    # レスポンスの検証
+    private def validate_response(response : HTTP::Client::Response)
+      # ステータスコードのチェック
+      unless response.success?
+        case response.status_code
+        when 404
+          raise Exception.new("リソースが見つかりません (404)")
+        when 403
+          raise Exception.new("アクセスが拒否されました (403)")
+        when 500..599
+          raise Exception.new("サーバーエラー (#{response.status_code})")
+        else
+          raise Exception.new("HTTPエラー (#{response.status_code})")
+        end
+      end
+      
+      # コンテンツタイプのチェック
+      content_type = response.headers["Content-Type"]?
+      if content_type && !is_supported_content_type(content_type)
+        @logger.warn { "サポートされていないコンテンツタイプ: #{content_type}" }
+      end
+    end
+
+    # サポートされているコンテンツタイプかチェック
+    private def is_supported_content_type(content_type : String) : Bool
+      supported_types = [
+        "text/html",
+        "text/css",
+        "text/javascript",
+        "application/javascript",
+        "application/json",
+        "image/",
+        "font/",
+        "application/font"
+      ]
+      
+      supported_types.any? { |type| content_type.starts_with?(type) }
+    end
+
+    # リクエスト成功時の処理
+    private def handle_request_success(item : RequestItem, response : HTTP::Client::Response, start_time : Time)
+      duration = (Time.utc - start_time).total_milliseconds
+      
+      @mutex.synchronize do
+        @total_completed += 1
+        update_average_response_time(duration)
+      end
+      
+      @logger.info { "リクエストが完了しました: #{item.url} (#{duration.round(2)}ms, #{response.status_code})" }
+      
+      # イベントの発火
+      @event_dispatcher.dispatch(QuantumEvents::ResourceLoadedEvent.new(
+        request_id: item.request_id,
+        page_id: item.page_id,
+        url: item.url.to_s,
+        status_code: response.status_code,
+        content_type: response.headers["Content-Type"]?,
+        content_length: response.body.bytesize,
+        duration: duration,
+        from_cache: false
+      ))
+    end
+
+    # リクエストエラー時の処理
+    private def handle_request_error(item : RequestItem, error : Exception, start_time : Time)
+      duration = (Time.utc - start_time).total_milliseconds
+      
+      @mutex.synchronize do
+        @total_failed += 1
+      end
+      
+      @logger.error { "リクエストが失敗しました: #{item.url} - #{error.message} (#{duration.round(2)}ms)" }
+      
+      # リトライ処理
+      if should_retry(item, error)
+        retry_request(item)
+      else
+        # 最終的な失敗イベントの発火
+        @event_dispatcher.dispatch(QuantumEvents::ResourceFailedEvent.new(
+          request_id: item.request_id,
+          page_id: item.page_id,
+          url: item.url.to_s,
+          error_message: error.message,
+          retry_count: item.retry_count,
+          duration: duration
+        ))
+      end
+    end
+
+    # リトライが必要かチェック
+    private def should_retry(item : RequestItem, error : Exception) : Bool
+      return false if item.retry_count >= MAX_RETRY_COUNT
+      
+      # 一時的なエラーの場合のみリトライ
+      case error.message
+      when /timeout/i, /connection/i, /network/i
+        true
+      when /5\d\d/  # 5xx サーバーエラー
+        true
+      else
+        false
+      end
+    end
+
+    # リクエストのリトライ
+    private def retry_request(item : RequestItem)
+      item.retry_count += 1
+      retry_delay = calculate_retry_delay(item.retry_count)
+      
+      @logger.info { "リクエストを #{retry_delay}秒後にリトライします: #{item.url} (試行回数: #{item.retry_count})" }
+      
+      spawn do
+        sleep retry_delay.seconds
+        
+        @mutex.synchronize do
+          @queues[item.priority].push(item)
+        end
+        
+        process_queue
+      end
+    end
+
+    # リトライ遅延の計算（指数バックオフ）
+    private def calculate_retry_delay(retry_count : Int32) : Float64
+      base_delay = 1.0
+      max_delay = 30.0
+      
+      delay = base_delay * (2 ** (retry_count - 1))
+      [delay, max_delay].min
+    end
+
+    # 実行中のリクエストをキャンセル
+    private def cancel_active_request(request_id : UInt64)
+      @mutex.synchronize do
+        if item = @active_requests.delete(request_id)
+          @logger.debug { "実行中のリクエスト #{request_id} をキャンセルしました" }
           
-          if item_index
-            item = queue[item_index]
-            # 現在の優先度と新しい優先度が同じ場合は何もしない
-            if current_priority == new_priority
-              @logger.debug { "リクエスト#{request_id}は既に優先度#{new_priority}です" }
-              item_found = true
-              return
+          # キャンセルイベントの発火
+          @event_dispatcher.dispatch(QuantumEvents::ResourceCancelledEvent.new(
+            request_id: request_id,
+            page_id: item.page_id,
+            url: item.url.to_s
+          ))
+        end
+      end
+    end
+
+    # 平均レスポンス時間の更新
+    private def update_average_response_time(duration : Float64)
+      if @total_completed == 1
+        @average_response_time = duration
+      else
+        # 移動平均の計算
+        @average_response_time = (@average_response_time * 0.9) + (duration * 0.1)
+      end
+    end
+
+    # 定期的なクリーンアップタスク
+    private def start_cleanup_task
+      spawn do
+        loop do
+          sleep 60.seconds  # 1分間隔
+          cleanup_expired_requests
+        end
+      end
+    end
+
+    # 期限切れリクエストのクリーンアップ
+    private def cleanup_expired_requests
+      expired_count = 0
+      current_time = Time.utc
+      
+      @mutex.synchronize do
+        @queues.each do |priority, queue|
+          original_size = queue.size
+          queue.reject! do |item|
+            age = (current_time - item.created_at).total_seconds
+            if age > REQUEST_TIMEOUT_SECONDS
+              expired_count += 1
+              @logger.debug { "期限切れリクエストを削除しました: #{item.url} (経過時間: #{age.round(2)}秒)" }
+              true
+            else
+              false
             end
-            
-            # キューからアイテムを削除
-            queue.delete_at(item_index)
-            
-            # 新しい優先度キューにアイテムを追加
-            updated_item = item.copy(priority: new_priority)
-            @queues[new_priority].push(updated_item)
-            
-            @logger.info { "リクエスト#{request_id}の優先度を#{current_priority}から#{new_priority}に変更しました" }
-            item_found = true
-            
-            # 優先度が上がった場合は、次のディスパッチを試みる
-            if new_priority.value < current_priority.value
-              try_dispatch_next
-            end
-            
-            return
           end
         end
       end
       
-      unless item_found
-        @logger.warn { "優先度変更: リクエストID #{request_id}が見つかりません" }
+      if expired_count > 0
+        @logger.info { "期限切れリクエストを #{expired_count} 件削除しました" }
       end
     end
 
-  end # ResourceSchedulerクラス終了
-end # QuantumCoreモジュール終了
+    # パフォーマンス統計の出力
+    def log_performance_stats
+      stats = get_statistics
+      
+      @logger.info do
+        "リソーススケジューラー統計: " \
+        "保留中: #{stats[:pending_requests]}, " \
+        "実行中: #{stats[:active_requests]}, " \
+        "完了: #{stats[:total_completed]}, " \
+        "失敗: #{stats[:total_failed]}, " \
+        "平均レスポンス時間: #{stats[:average_response_time].round(2)}ms"
+      end
+    end
+
+    # 定期的な統計出力タスク
+    private def start_stats_task
+      spawn do
+        loop do
+          sleep 300.seconds  # 5分間隔
+          log_performance_stats
+        end
+      end
+    end
+
+    # 初期化時の追加設定
+    private def initialize_background_tasks
+      start_cleanup_task
+      start_stats_task
+      
+      @logger.info { "バックグラウンドタスクを開始しました" }
+    end
+
+    # 設定の更新
+    def update_configuration(max_concurrent : Int32? = nil, timeout : Int32? = nil)
+      @mutex.synchronize do
+        if max_concurrent
+          @max_concurrent_requests = max_concurrent
+          @logger.info { "最大同時実行数を #{max_concurrent} に更新しました" }
+        end
+        
+        if timeout
+          @request_timeout = timeout
+          @logger.info { "リクエストタイムアウトを #{timeout}秒 に更新しました" }
+        end
+      end
+    end
+
+    # ヘルスチェック
+    def health_check : NamedTuple(status: String, details: Hash(String, String | Int32))
+      stats = get_statistics
+      
+      status = if stats[:active_requests] < @max_concurrent_requests && stats[:pending_requests] < 100
+                 "healthy"
+               elsif stats[:pending_requests] < 500
+                 "warning"
+               else
+                 "critical"
+               end
+      
+      details = {
+        "status" => status,
+        "pending_requests" => stats[:pending_requests],
+        "active_requests" => stats[:active_requests],
+        "max_concurrent" => @max_concurrent_requests,
+        "total_completed" => stats[:total_completed].to_i32,
+        "total_failed" => stats[:total_failed].to_i32,
+        "success_rate" => calculate_success_rate.to_s
+      }
+      
+      {status: status, details: details}
+    end
+
+    # 成功率の計算
+    private def calculate_success_rate : Float64
+      total = @total_completed + @total_failed
+      return 100.0 if total == 0
+      
+      (@total_completed.to_f64 / total.to_f64) * 100.0
+    end
+
+    # 緊急停止
+    def emergency_stop
+      @logger.warn { "緊急停止が要求されました" }
+      
+      @mutex.synchronize do
+        # 全ての保留中リクエストをクリア
+        @queues.each { |_, queue| queue.clear }
+        
+        # 実行中リクエストをキャンセル
+        @active_requests.keys.each { |request_id| cancel_active_request(request_id) }
+      end
+      
+      @logger.info { "緊急停止が完了しました" }
+    end
+  end
+
+  # リクエストアイテム構造体
+  struct RequestItem
+    property request_id : UInt64
+    property page_id : UInt64
+    property url : URI
+    property priority : ResourceScheduler::Priority
+    property bypass_cache : Bool
+    property created_at : Time
+    property retry_count : Int32
+    
+    def initialize(@request_id : UInt64, @page_id : UInt64, @url : URI, 
+                   @priority : ResourceScheduler::Priority, @bypass_cache : Bool, 
+                   @created_at : Time, @retry_count : Int32 = 0)
+    end
+  end
+
+  # 定数定義
+  private MAX_RETRY_COUNT = 3
+  private REQUEST_TIMEOUT_SECONDS = 300  # 5分
+  
+  # インスタンス変数の追加
+  @total_completed : UInt64 = 0_u64
+  @total_failed : UInt64 = 0_u64
+  @average_response_time : Float64 = 0.0
+  @request_timeout : Int32 = 30
+end

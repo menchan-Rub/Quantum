@@ -2,6 +2,8 @@ require "json"
 require "http/client"
 require "base64"
 require "openssl/cipher"
+require "openssl/digest"
+require "openssl/pbkdf2" # PBKDF2を使用するためのライブラリをインポート
 require "log"
 
 module QuantumCore
@@ -431,29 +433,31 @@ module QuantumCore
       data = {} of String => JSON::Any
       
       begin
-        # 全てのパスワードエントリを取得
-        # 実際の実装では、前回の同期以降に変更されたエントリのみを取得するロジックを追加すべき
-        # また、パスワードは転送前に暗号化する必要がある
+        # 前回の同期以降に変更されたパスワードエントリのみを取得
+        since = @last_sync_time || Time.unix(0)
         
         # 同期APIで使用する暗号化キーを取得または生成
         sync_key = get_sync_encryption_key
         
-        # パスワードをエクスポート（一時ファイルに）
-        temp_file = File.tempfile("passwords")
-        begin
-          @storage_manager.password_manager.export(temp_file.path)
-          
-          # ファイルの内容を読み込み
-          json_data = File.read(temp_file.path)
-          
-          # データを暗号化
-          encrypted_data = encrypt_sensitive_data(json_data, sync_key)
-          
-          data["encrypted"] = JSON::Any.new(encrypted_data)
-        ensure
-          # 一時ファイルを削除
-          temp_file.delete
+        # 変更されたパスワードのみを取得
+        changed_passwords = @storage_manager.password_manager.get_entries_modified_since(since)
+        
+        if changed_passwords.empty?
+          # 変更がない場合は早期リターン
+          Log.debug { "同期対象のパスワード変更はありません" }
+          return {} of String => JSON::Any
         end
+        
+        # 変更されたパスワードをJSONに変換
+        passwords_json = changed_passwords.to_json
+        
+        # データを暗号化
+        encrypted_data = encrypt_sensitive_data(passwords_json, sync_key)
+        
+        # メタデータを追加
+        data["encrypted"] = JSON::Any.new(encrypted_data)
+        data["count"] = JSON::Any.new(changed_passwords.size.to_i64)
+        data["last_modified"] = JSON::Any.new(Time.utc.to_unix)
       rescue ex
         Log.error { "パスワードの変更収集中にエラーが発生しました: #{ex.message}" }
       end
@@ -731,11 +735,61 @@ module QuantumCore
     
     # キー導出関数
     private def derive_key(password : String) : Bytes
-      # 単純なハッシュ化でキーを導出
-      # 実際の実装では、より強力なPBKDF2などのキー導出関数を使用すべき
-      digest = OpenSSL::Digest.new("sha256")
-      digest.update(password)
-      digest.final
+      # 保存済みのソルトがあれば取得、なければ新規生成
+      salt = get_or_create_salt
+      
+      # イテレーション回数（設定から読み込み、デフォルトは10000）
+      iterations = get_pbkdf2_iterations
+      
+      # PBKDF2を使用してパスワードからキーを導出
+      # より強力なキー導出関数を使用して、ブルートフォース攻撃への耐性を高める
+      key_length = 32 # AES-256用の32バイトキー
+
+      OpenSSL::PBKDF2.pbkdf2_hmac(
+        password,
+        salt,
+        iterations,
+        key_length,
+        OpenSSL::Algorithm::SHA256
+      )
+    end
+    
+    # PBKDF2のイテレーション回数を取得
+    private def get_pbkdf2_iterations : Int32
+      # 設定からイテレーション回数を取得
+      preferences = @storage_manager.preferences_manager
+      iterations = preferences.get_int("pbkdf2_iterations", 10000)
+      
+      # 最小値を保証（セキュリティ低下を防止）
+      if iterations < 10000
+        iterations = 10000
+        preferences.set_int("pbkdf2_iterations", iterations)
+        preferences.save
+      end
+      
+      iterations
+    end
+    
+    # ソルトを取得または生成
+    private def get_or_create_salt : Bytes
+      # 設定からソルトを取得
+      preferences = @storage_manager.preferences_manager
+      salt_hex = preferences.get_string("sync_encryption_salt", "")
+      
+      if salt_hex.empty?
+        # 新しいソルトを生成（32バイト）
+        salt = Random::Secure.random_bytes(32)
+        salt_hex = salt.hexstring
+        
+        # ソルトを保存
+        preferences.set_string("sync_encryption_salt", salt_hex)
+        preferences.save
+        
+        return salt
+      else
+        # 保存されたソルトを復元
+        return salt_hex.hexbytes
+      end
     end
     
     # デバイスIDを生成または読み込み

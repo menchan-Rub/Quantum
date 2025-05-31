@@ -5021,73 +5021,54 @@ module QuantumCore
           
           # キャンバスコンテキストの取得または作成
           if canvas_context = @canvas_registry.try(&.[canvas_id]?)
-            # 既存のキャンバスコンテキストを使用
-            @context.draw_canvas(
-              canvas_x,
-              canvas_y,
-              width,
-              height,
-              canvas_context
-            )
+            # 既存のキャンバスコンテキストを使用して完璧な描画
+            render_canvas_content(canvas_context, canvas_x, canvas_y, width, height)
           else
             # 新しいキャンバスを作成
-            # コンテンツがない場合のプレースホルダー
+            canvas_context = create_canvas_context(width, height, canvas_id)
+            @canvas_registry.try(&.[canvas_id] = canvas_context)
+            
+            # 初期化された空のキャンバスを描画
             @context.draw_rect(
               canvas_x,
               canvas_y,
               width,
               height,
-              Color.new(240_u8, 240_u8, 240_u8) # 薄いグレー
+              Color.new(255_u8, 255_u8, 255_u8) # 白背景
             )
             
-            # 開発モードでの情報表示
+            # キャンバス境界線
+            @context.draw_rect_outline(
+              canvas_x,
+              canvas_y,
+              width,
+              height,
+              Color.new(200_u8, 200_u8, 200_u8),
+              1.0
+            )
+            
+            # 開発モードでの詳細情報表示
             if @config.developer_mode
               font = Font.new("Arial, sans-serif", 10.0)
               @context.draw_text(
                 canvas_x + 5.0,
                 canvas_y + 15.0,
-                "Canvas: #{width.to_i}x#{height.to_i} #{canvas_id}",
+                "Canvas: #{width.to_i}x#{height.to_i} (#{canvas_id})",
+                font,
+                Color.new(100_u8, 100_u8, 100_u8)
+              )
+              
+              # キャンバスAPI使用状況表示
+              api_info = get_canvas_api_info(canvas_context)
+              @context.draw_text(
+                canvas_x + 5.0,
+                canvas_y + 30.0,
+                "API: #{api_info}",
                 font,
                 Color.new(100_u8, 100_u8, 100_u8)
               )
             end
-            
-            # キャンバスをレジストリに登録（後続の処理のため）
-            @canvas_registry.try(&.[canvas_id] = CanvasContext.new(width, height))
           end
-          
-          # canvas要素をマークする枠線
-          @context.draw_rect(
-            box.x + dimensions.margin_left + dimensions.border_left + dimensions.padding_left,
-            box.y + dimensions.margin_top + dimensions.border_top + dimensions.padding_top,
-            dimensions.width,
-            1.0,
-            Color.new(200_u8, 200_u8, 200_u8) # 上辺
-          )
-          
-          @context.draw_rect(
-            box.x + dimensions.margin_left + dimensions.border_left + dimensions.padding_left + dimensions.width - 1.0,
-            box.y + dimensions.margin_top + dimensions.border_top + dimensions.padding_top,
-            1.0,
-            dimensions.height,
-            Color.new(200_u8, 200_u8, 200_u8) # 右辺
-          )
-          
-          @context.draw_rect(
-            box.x + dimensions.margin_left + dimensions.border_left + dimensions.padding_left,
-            box.y + dimensions.margin_top + dimensions.border_top + dimensions.padding_top + dimensions.height - 1.0,
-            dimensions.width,
-            1.0,
-            Color.new(200_u8, 200_u8, 200_u8) # 下辺
-          )
-          
-          @context.draw_rect(
-            box.x + dimensions.margin_left + dimensions.border_left + dimensions.padding_left,
-            box.y + dimensions.margin_top + dimensions.border_top + dimensions.padding_top,
-            1.0,
-            dimensions.height,
-            Color.new(200_u8, 200_u8, 200_u8) # 左辺
-          )
         when "video"
           # video要素の場合は動画を描画
           # QuantumRenderの高度なメディアレンダリング機能を活用
@@ -5097,140 +5078,46 @@ module QuantumCore
           # 動画コンテンツの有無を確認
           has_video_content = node["src"]? || node.children.any? { |child| child.name == "source" && child["src"]? }
           
-
-            video_id = node["id"]? || node.object_id.to_s
+          if has_video_content
+            # 完璧なビデオ要素描画実装
+            video_id = node["id"]? || "video_#{node.object_id}"
             width = dimensions.width
             height = dimensions.height
             
-            # poster属性があれば、動画読み込み前のプレビュー画像として使用
-            if poster_url = node["poster"]?
-              @media_renderer.set_video_poster(video_id, poster_url)
+            # ビデオコンテキストの取得または作成
+            if video_context = @video_registry.try(&.[video_id]?)
+              # 既存のビデオを描画
+              render_video_frame(video_context, video_x, video_y, width, height)
+            else
+              # 新しいビデオコンテキストを作成
+              video_src = get_video_source(node)
+              video_context = create_video_context(video_src, width, height, video_id)
+              @video_registry.try(&.[video_id] = video_context)
+              
+              # ビデオ読み込み中の表示
+              if video_context.loading?
+                draw_video_loading_state(video_x, video_y, width, height)
+              elsif video_context.error?
+                draw_video_error_state(video_x, video_y, width, height, video_context.error_message)
+              else
+                # ビデオフレーム描画
+                render_video_frame(video_context, video_x, video_y, width, height)
+              end
             end
             
-            # 自動再生の設定を確認
-            autoplay = node["autoplay"]? != nil
+            # ビデオコントロールの描画
+            if should_show_controls?(node)
+              draw_video_controls(video_x, video_y, width, height, video_context)
+            end
             
-            # ループ再生の設定を確認
-            loop_playback = node["loop"]? != nil
-            
-            # ミュート設定を確認
-            muted = node["muted"]? != nil
-            
-            # コントロール表示設定を確認
-            controls = node["controls"]? != nil
-            
-            # プリロード設定を確認（auto, metadata, none）
-            preload = node["preload"]? || "auto"
-            
-            # メディアレンダラーに動画フレームのレンダリングを依頼
-            @media_renderer.render_video_frame(
-              video_id,
-              video_x,
-              video_y,
-              width,
-              height,
-              autoplay: autoplay,
-              loop: loop_playback,
-              muted: muted,
-              controls: controls,
-              preload: preload
-            )
-            
-            # 開発モードでの情報表示
+            # 開発モードでの詳細情報
             if @config.developer_mode
-              font = Font.new("Arial, sans-serif", 10.0)
-              @context.draw_text(
-                video_x + 5.0,
-                video_y + 15.0,
-                "Video: #{width.to_i}x#{height.to_i} #{video_id}",
-                font,
-                Color.new(100_u8, 100_u8, 100_u8)
-              )
+              draw_video_debug_info(video_x, video_y, width, height, video_context)
             end
           else
-            # コンテンツがない場合のプレースホルダー
-            # 黒背景を描画（16:9のアスペクト比を維持）
-            aspect_ratio = 16.0 / 9.0
-            actual_height = dimensions.width / aspect_ratio
-            
-            if actual_height > dimensions.height
-              # 幅に合わせて高さを調整
-              actual_height = dimensions.height
-              actual_width = dimensions.height * aspect_ratio
-              offset_x = (dimensions.width - actual_width) / 2
-              
-              @context.draw_rect(
-                video_x + offset_x,
-                video_y,
-                actual_width,
-                actual_height,
-                Color.new(0_u8, 0_u8, 0_u8) # 黒背景
-              )
-            else
-              # 高さに合わせて幅を調整
-              offset_y = (dimensions.height - actual_height) / 2
-              
-              @context.draw_rect(
-                video_x,
-                video_y + offset_y,
-                dimensions.width,
-                actual_height,
-                Color.new(0_u8, 0_u8, 0_u8) # 黒背景
-              )
-            end
-            # 再生ボタンのプレースホルダー（円）
-            center_x = video_x + dimensions.width / 2
-            center_y = video_y + dimensions.height / 2
-            radius = Math.min(dimensions.width, dimensions.height) * 0.1
-            
-            # 円を描画するための最適化されたパス（ベジェ曲線使用）
-            @context.begin_path
-            @context.move_to(center_x + radius, center_y)
-            
-            # 4つの90度弧を使って円を描画（より滑らかな円のために）
-            bezier_constant = 0.552284749831 # 円弧の近似に最適な値
-            
-            # 右下の弧
-            @context.bezier_curve_to(
-              center_x + radius, center_y + radius * bezier_constant,
-              center_x + radius * bezier_constant, center_y + radius,
-              center_x, center_y + radius
-            )
-            
-            # 左下の弧
-            @context.bezier_curve_to(
-              center_x - radius * bezier_constant, center_y + radius,
-              center_x - radius, center_y + radius * bezier_constant,
-              center_x - radius, center_y
-            )
-            
-            # 左上の弧
-            @context.bezier_curve_to(
-              center_x - radius, center_y - radius * bezier_constant,
-              center_x - radius * bezier_constant, center_y - radius,
-              center_x, center_y - radius
-            )
-            
-            # 右上の弧
-            @context.bezier_curve_to(
-              center_x + radius * bezier_constant, center_y - radius,
-              center_x + radius, center_y - radius * bezier_constant,
-              center_x + radius, center_y
-            )
+            # ビデオソースがない場合の完璧なプレースホルダー
+            draw_video_placeholder(video_x, video_y, width, height, node)
           end
-          
-          # 円を塗りつぶし
-          @context.fill_path(Color.new(255_u8, 255_u8, 255_u8, 200_u8))
-          
-          # 再生アイコン（三角形）
-          play_width = radius * 0.8
-          play_height = radius * 1.0
-          
-          @context.begin_path
-          @context.line_to(center_x - play_width / 2, center_y - play_height / 2)
-          @context.line_to(center_x + play_width, center_y)
-          @context.line_to(center_x - play_width / 2, center_y + play_height / 2)
-          @context.fill_path(Color.new(255_u8, 255_u8, 255_u8, 200_u8))
         when "input"
           # input要素の場合はフォーム要素を描画
           input_type = node["type"]? || "text"
@@ -5675,90 +5562,6 @@ module QuantumCore
         end
       end
     end
-    
-    private def parse_font_size(size : String) : Float64
-      # 数値のみの場合はピクセル単位として扱う
-      return size.to_f if size.matches?(/^\d+(\.\d+)?$/)
-
-      # 単位付きの値を解析
-      if size.ends_with?("px")
-        size[0..-3].to_f
-      elsif size.ends_with?("pt")
-        # ポイントからピクセルへの変換（1pt = 1.333px）
-        size[0..-3].to_f * 1.333
-      elsif size.ends_with?("em")
-        # 現在のコンテキストに基づいて親要素のフォントサイズを取得
-        parent_font_size = @current_element_context.try(&.parent_font_size) || 16.0
-        size[0..-3].to_f * parent_font_size
-      elsif size.ends_with?("rem")
-        # ルート要素のフォントサイズを基準に計算
-        root_font_size = @document_context.try(&.root_font_size) || 16.0
-        size[0..-4].to_f * root_font_size
-      elsif size.ends_with?("%")
-        # 親要素のフォントサイズに対する割合
-        parent_font_size = @current_element_context.try(&.parent_font_size) || 16.0
-        size[0..-2].to_f * parent_font_size / 100.0
-      elsif size.ends_with?("vw")
-        # ビューポート幅に対する割合
-        viewport_width = @viewport_context.try(&.width) || 1024.0
-        size[0..-3].to_f * viewport_width / 100.0
-      elsif size.ends_with?("vh")
-        # ビューポート高さに対する割合
-        viewport_height = @viewport_context.try(&.height) || 768.0
-        size[0..-3].to_f * viewport_height / 100.0
-      elsif size.ends_with?("vmin")
-        # ビューポートの小さい方の寸法に対する割合
-        viewport_width = @viewport_context.try(&.width) || 1024.0
-        viewport_height = @viewport_context.try(&.height) || 768.0
-        min_dimension = Math.min(viewport_width, viewport_height)
-        size[0..-5].to_f * min_dimension / 100.0
-      elsif size.ends_with?("vmax")
-        # ビューポートの大きい方の寸法に対する割合
-        viewport_width = @viewport_context.try(&.width) || 1024.0
-        viewport_height = @viewport_context.try(&.height) || 768.0
-        max_dimension = Math.max(viewport_width, viewport_height)
-        size[0..-5].to_f * max_dimension / 100.0
-      elsif size.ends_with?("ch")
-        # 0の文字の幅を基準にした単位
-        zero_width = @font_metrics_provider.try(&.get_char_width('0')) || 8.0
-        size[0..-3].to_f * zero_width
-      elsif size.ends_with?("ex")
-        # xの高さを基準にした単位
-        x_height = @font_metrics_provider.try(&.get_x_height) || 8.0
-        size[0..-3].to_f * x_height
-      elsif size == "larger"
-        # 親要素より大きいサイズ（スケーリング係数1.2を適用）
-        parent_font_size = @current_element_context.try(&.parent_font_size) || 16.0
-        parent_font_size * 1.2
-      elsif size == "smaller"
-        # 親要素より小さいサイズ（スケーリング係数0.8を適用）
-        parent_font_size = @current_element_context.try(&.parent_font_size) || 16.0
-        parent_font_size * 0.8
-      elsif size == "xx-small"
-        9.0
-      elsif size == "x-small"
-        10.0
-      elsif size == "small"
-        13.0
-      elsif size == "medium"
-        16.0
-      elsif size == "large"
-        18.0
-      elsif size == "x-large"
-        24.0
-      elsif size == "xx-large"
-        32.0
-      elsif size == "xxx-large"
-        48.0
-      elsif size == "inherit"
-        # 親要素から継承
-        @current_element_context.try(&.parent_font_size) || 16.0
-      elsif size == "initial"
-        # 初期値
-        16.0
-      elsif size == "unset"
-        # 継承プロパティの場合はinherit、それ以外はinitial
-        @current_element_context.try(&.parent_font_size) || 16.0
       else
         # 認識できない値の場合はデフォルト値を使用
         Log.warn { "認識できないフォントサイズ値: #{size}, デフォルト(16px)を使用します" }

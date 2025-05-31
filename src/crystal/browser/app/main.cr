@@ -28,6 +28,13 @@ require "../../core/utils/crash_reporter"       # クラッシュ発生時のレ
 require "../../core/commands/*"                 # コア機能に関連するコマンド実装 (追加の可能性)
 require "log"                                   # 標準のロギングライブラリ
 require "signal"                                # OSシグナル処理用
+require "../quantum_browser"
+require "../network/http3_network_manager"
+require "../network/http3_client"
+require "../network/http3_performance_monitor"
+require "../network/network_factory"
+require "option_parser"
+require "log"
 
 # ==============================================================================
 # ブラウザアプリケーション モジュール

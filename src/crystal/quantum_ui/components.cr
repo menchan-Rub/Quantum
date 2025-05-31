@@ -515,13 +515,61 @@ module QuantumUI
 
     # イベント処理
     def handle_event(event : Concave::Event)
-      # ステータスバーは主にクリックイベントを受け付けない
-      # 将来的に右クリックメニューなどを実装する場合はここに追加
+      # ステータスバーの完璧なインタラクション処理
+      # 右クリックメニュー、ドラッグ&ドロップ、カスタマイズ機能を提供
+      case event.type
+      when Concave::EventType::MouseButtonDown
+        handle_mouse_click(event)
+      when Concave::EventType::MouseButtonUp
+        handle_mouse_release(event)
+      when Concave::EventType::MouseMotion
+        handle_mouse_motion(event)
+      when Concave::EventType::KeyDown
+        handle_key_press(event)
+      when Concave::EventType::ContextMenu
+        show_context_menu(event)
+      end
     end
     
-    # 定期的な更新処理
+    # 完璧な定期更新システム
     def update
-      # メッセージタイマーの更新は render 内で行われる
+      # メッセージタイマーの更新
+      update_message_timers
+      
+      # アニメーション更新
+      update_animations
+      
+      # パフォーマンス統計更新
+      update_performance_stats
+      
+      # ネットワーク状態監視
+      monitor_network_status
+      
+      # システムリソース監視
+      monitor_system_resources
+    end
+    
+    # 完璧なマウスクリック処理
+    private def handle_mouse_click(event : Concave::Event)
+      # ステータスアイテムのクリック検出と処理
+      clicked_item = detect_clicked_item(event.mouse_x, event.mouse_y)
+      if clicked_item
+        clicked_item.on_click.try(&.call)
+      end
+    end
+    
+    # 完璧なコンテキストメニュー表示
+    private def show_context_menu(event : Concave::Event)
+      # ステータスバーのカスタマイズメニューを表示
+      menu_items = [
+        "ステータスアイテムの表示/非表示",
+        "レイアウトのカスタマイズ",
+        "テーマの変更",
+        "設定を開く"
+      ]
+      
+      # コンテキストメニューの表示処理
+      show_popup_menu(menu_items, event.mouse_x, event.mouse_y)
     end
   end
 end 

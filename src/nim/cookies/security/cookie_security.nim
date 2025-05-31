@@ -298,25 +298,19 @@ proc cleanExpiredCsrfTokens*(manager: CookieSecurityManager) =
 # クッキーセキュリティチェック
 ##################
 
-proc isSameSitePolicyAllowed*(cookie: Cookie, requestUrl: Uri, sourceUrl: Uri): bool =
-  ## Same-Siteポリシーに基づいてクッキーが許可されるかをチェック
+proc isSameSitePolicyAllowed*(cookie: Cookie, requestUrl: Uri, sourceUrl: Uri, requestMethod: string = "GET", isTopLevelNavigation: bool = true): bool =
+  ## Same-Siteポリシーに基づいてクッキーが許可されるかを厳密に判定
   case cookie.sameSite
   of ssNone:
-    # Same-Site制限なし
     return true
-  
   of ssLax:
-    # 同一オリジンは許可
     if requestUrl.hostname == sourceUrl.hostname:
       return true
-    
-    # 異なるオリジンからのトップレベルGETナビゲーションは許可
-    # 注意: 実際の実装ではリクエストメソッドとフレームタイプの情報が必要
-    # ここでは簡略化しています
-    return true  # 実際の実装ではさらに条件が必要
-  
+    # トップレベルGETナビゲーションのみ許可
+    if isTopLevelNavigation and requestMethod.toUpperAscii() == "GET":
+      return true
+    return false
   of ssStrict:
-    # 同一オリジンのみ許可
     return requestUrl.hostname == sourceUrl.hostname
 
 proc evaluateCookieRisk*(cookie: Cookie): int =

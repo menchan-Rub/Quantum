@@ -4,13 +4,14 @@
 
 const std = @import("std");
 const mem = @import("../memory/allocator.zig"); // Global allocator
-const errors = @import("../util/error.zig");   // Common errors
+const errors = @import("../util/error.zig"); // Common errors
 const Event = @import("./event.zig").Event;
 const EventListener = @import("./event_listener.zig").EventListener;
 const EventListenerCallback = @import("./event_listener.zig").EventListenerCallback;
 const AddEventListenerOptions = @import("./event_listener.zig").AddEventListenerOptions;
 const EventListenerOptions = @import("./event_listener.zig").EventListenerOptions;
 const RegisteredEventListener = @import("./event_listener.zig").RegisteredEventListener;
+const Node = @import("../dom/node.zig").Node; // Node型をインポート
 
 // イベントタイプ (文字列) をキーとし、登録済みリスナーのリストを値とする HashMap。
 pub const ListenerMap = std.StringHashMap(std.ArrayList(RegisteredEventListener));
@@ -180,53 +181,125 @@ pub const EventTarget = struct {
         // イベントターゲットを設定
         event.target = target_ptr;
 
-        // ディスパッチフラグを設定
+        // 伝播パスを構築 (ターゲットからルートへ)
+        var path = std.ArrayList(*Node).init(self.allocator); // EventTargetがallocatorを持つ前提
+        defer path.deinit();
+
+        if (target_ptr) |target_opaque| {
+            // target_ptr が Node* であると仮定。実際の型に合わせてキャストが必要。
+            // このキャストは、EventTarget が Node 構造体内にあり、target_ptr がその Node* を指す場合に有効。
+            // より安全な方法は、target_ptr の型情報を別途渡すか、EventTarget が Node を知る方法を持つことです。
+            const current_node: *Node = @ptrCast(@alignCast(target_opaque));
+            var node_walker: ?*Node = current_node;
+            while (node_walker) |nw| {
+                try path.insert(0, nw); // 先頭に追加してルートからのパスを構築
+                node_walker = nw.parent_node;
+            }
+        }
+
         event.dispatch = true;
-        event.eventPhase = .at_target; // 簡略化: ターゲットフェーズのみ
-        // currentTarget は、イベントがこの EventTarget を通過するときに設定される。
-        // EventTarget は Node などに埋め込まれるため、currentTarget は target_ptr と同じになる。
-        event.currentTarget = target_ptr;
 
-        // リスナーリストを取得
-        if (self.listener_map.get(event.type)) |listeners| {
-            // リスナーリストのコピーを作成
-            var listener_copy = try listeners.clone();
-            defer listener_copy.deinit();
+        // キャプチャリングフェーズ
+        event.eventPhase = .capturing_phase;
+        for (path.items) |path_node| {
+            if (path_node == event.target) continue; // ターゲット自身はキャプチャリングフェーズでは処理しない
+            event.currentTarget = @ptrCast(path_node);
 
-            var i: usize = 0;
-            while (i < listener_copy.items.len) {
-                const reg = listener_copy.items[i];
-                i += 1;
+            // path_node (Node*) から EventTarget を取得する必要がある。
+            // Node 構造体が event_target フィールドを持つと仮定。
+            const current_event_target = &path_node.event_target;
+            if (current_event_target.listener_map.get(event.type)) |listeners| {
+                var listener_copy = try listeners.clone();
+                defer listener_copy.deinit();
+                var i: usize = 0;
+                while (i < listener_copy.items.len) {
+                    const reg = listener_copy.items[i];
+                    i += 1;
+                    if (!reg.options.capture) continue; // キャプチャリングリスナーのみ
 
-                if (event.immediate_propagation_stopped) break;
+                    if (event.immediate_propagation_stopped) break;
 
-                // passive リスナーの場合、preventDefault を無効化する
-                // (本来はもっと早い段階でフラグを設定する方が効率的)
-                const original_canceled = event.canceled;
-                if (reg.options.passive) {
-                    event.cancelable = false; // preventDefault を一時的に無効化
+                    const original_cancelable = event.cancelable;
+                    if (reg.options.passive) event.cancelable = false;
+                    reg.listener.callback(event, reg.listener.user_data);
+                    if (reg.options.passive) event.cancelable = original_cancelable;
+
+                    if (reg.options.once) {
+                        current_event_target.removeEventListener(event.type, reg.listener, .{ .capture = true });
+                    }
                 }
+            }
+            if (event.propagation_stopped) break; // stopPropagation() が呼ばれたらフェーズ終了
+        }
 
-                // コールバック実行
-                reg.listener.callback(event, reg.listener.user_data);
+        // ターゲットフェーズ
+        if (!event.propagation_stopped) {
+            event.eventPhase = .at_target;
+            event.currentTarget = target_ptr;
+            // self は現在の EventTarget インスタンスを指す (path_node.event_target とは異なる場合がある、特に event.target が直接の EventTarget ではない場合)
+            // ここでは self (イベントが最初にディスパッチされた EventTarget) のリスナーを実行する
+            if (self.listener_map.get(event.type)) |listeners| {
+                var listener_copy = try listeners.clone();
+                defer listener_copy.deinit();
+                var i: usize = 0;
+                while (i < listener_copy.items.len) {
+                    const reg = listener_copy.items[i];
+                    i += 1;
+                    if (reg.options.capture) continue; // ターゲットフェーズ/バブリングリスナーのみ
 
-                // passive リスナーで preventDefault が呼ばれても canceled フラグを戻す
-                if (reg.options.passive) {
-                    event.cancelable = true; // 元の cancelable 状態に戻す
-                    event.canceled = original_canceled; // preventDefault の効果を無効化
-                }
+                    if (event.immediate_propagation_stopped) break;
 
-                if (reg.options.once) {
-                    self.removeEventListener(event.type, reg.listener, .{ .capture = reg.options.capture });
+                    const original_cancelable = event.cancelable;
+                    if (reg.options.passive) event.cancelable = false;
+                    reg.listener.callback(event, reg.listener.user_data);
+                    if (reg.options.passive) event.cancelable = original_cancelable;
+
+                    if (reg.options.once) {
+                        self.removeEventListener(event.type, reg.listener, .{ .capture = false });
+                    }
                 }
             }
         }
 
-        // ディスパッチフラグを解除
+        // バブリングフェーズ
+        if (event.bubbles and !event.propagation_stopped) {
+            event.eventPhase = .bubbling_phase;
+            var i = path.items.len;
+            while (i > 0) {
+                i -= 1;
+                const path_node = path.items[i];
+                if (path_node == event.target) continue;
+                event.currentTarget = @ptrCast(path_node);
+
+                const current_event_target = &path_node.event_target;
+                if (current_event_target.listener_map.get(event.type)) |listeners| {
+                    var listener_copy = try listeners.clone();
+                    defer listener_copy.deinit();
+                    var k: usize = 0;
+                    while (k < listener_copy.items.len) {
+                        const reg = listener_copy.items[k];
+                        k += 1;
+                        if (reg.options.capture) continue; // バブリングリスナーのみ
+
+                        if (event.immediate_propagation_stopped) break;
+
+                        const original_cancelable = event.cancelable;
+                        if (reg.options.passive) event.cancelable = false;
+                        reg.listener.callback(event, reg.listener.user_data);
+                        if (reg.options.passive) event.cancelable = original_cancelable;
+
+                        if (reg.options.once) {
+                            current_event_target.removeEventListener(event.type, reg.listener, .{ .capture = false });
+                        }
+                    }
+                }
+                if (event.propagation_stopped) break; // stopPropagation() が呼ばれたらフェーズ終了
+            }
+        }
+
         event.dispatch = false;
         event.eventPhase = .none;
         event.currentTarget = null;
-        // event.target はディスパッチ後も保持される。
 
         return !event.canceled;
     }
@@ -457,5 +530,175 @@ test "EventTarget dispatchEvent propagation and cancellation" {
 }
 
 // 関連テストは既に上記に含まれるか、現状の dispatchEvent では実装できないため削除。
-// // TODO: stopPropagation, stopImmediatePropagation, preventDefault のテスト
-// // TODO: once オプションのテスト (リスナー削除が必要) 
+// 以下は追加のテスト実装
+
+test "stopPropagation and stopImmediatePropagation" {
+    const allocator = std.testing.allocator;
+    var parent = try EventTarget.create(allocator);
+    defer parent.deinit();
+
+    var child = try EventTarget.create(allocator);
+    defer child.deinit();
+
+    // 親子関係を設定
+    child.parent = parent;
+
+    // イベントリスナーカウンター
+    var parent_handler_count: usize = 0;
+    var child_handler_count: usize = 0;
+
+    // stopPropagationテスト用ハンドラー
+    const test_parent_handler = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            _ = data;
+            parent_handler_count += 1;
+        }
+    }.handler;
+
+    // stopImmediatePropagationテスト用ハンドラー
+    const test_child_handler1 = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            _ = data;
+            child_handler_count += 1;
+            // 伝播を止める
+            event.stopPropagation();
+        }
+    }.handler;
+
+    const test_child_handler2 = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            _ = data;
+            child_handler_count += 1;
+        }
+    }.handler;
+
+    const test_child_handler3 = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            _ = data;
+            child_handler_count += 1;
+            // 即時に伝播を止める
+            event.stopImmediatePropagation();
+        }
+    }.handler;
+
+    const test_child_handler4 = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            _ = data;
+            child_handler_count += 1; // これは呼ばれないはず
+        }
+    }.handler;
+
+    // リスナーを登録
+    try parent.addEventListener("test-stop-propagation", test_parent_handler, .{});
+    try child.addEventListener("test-stop-propagation", test_child_handler1, .{});
+    try child.addEventListener("test-stop-propagation", test_child_handler2, .{});
+
+    try child.addEventListener("test-stop-immediate", test_child_handler3, .{});
+    try child.addEventListener("test-stop-immediate", test_child_handler4, .{});
+    try parent.addEventListener("test-stop-immediate", test_parent_handler, .{});
+
+    // イベントを生成
+    var event1 = try Event.create(allocator, "test-stop-propagation", .{});
+    defer event1.deinit(allocator);
+    event1.initialized = true;
+
+    // イベントをディスパッチ
+    _ = try child.dispatchEvent(null, event1);
+
+    // stopPropagationテスト: 子要素のハンドラーは両方呼ばれるが、親には伝播しない
+    try std.testing.expectEqual(@as(usize, 2), child_handler_count);
+    try std.testing.expectEqual(@as(usize, 0), parent_handler_count);
+
+    // カウンターをリセット
+    child_handler_count = 0;
+    parent_handler_count = 0;
+
+    // 2つ目のイベントを生成
+    var event2 = try Event.create(allocator, "test-stop-immediate", .{});
+    defer event2.deinit(allocator);
+    event2.initialized = true;
+
+    // イベントをディスパッチ
+    _ = try child.dispatchEvent(null, event2);
+
+    // stopImmediatePropagationテスト: 最初の子ハンドラーのみ呼ばれ、2つ目の子ハンドラーと親には伝播しない
+    try std.testing.expectEqual(@as(usize, 1), child_handler_count);
+    try std.testing.expectEqual(@as(usize, 0), parent_handler_count);
+}
+
+test "preventDefault test" {
+    const allocator = std.testing.allocator;
+    var target = try EventTarget.create(allocator);
+    defer target.deinit();
+
+    var default_prevented = false;
+
+    // デフォルト処理を防ぐハンドラー
+    const prevent_handler = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            _ = data;
+            event.preventDefault();
+        }
+    }.handler;
+
+    // デフォルト処理のステータスをチェックするハンドラー
+    const check_handler = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            var prevented = @ptrCast(*bool, @alignCast(@alignOf(bool), data.?));
+            prevented.* = event.defaultPrevented;
+        }
+    }.handler;
+
+    // リスナーを登録
+    try target.addEventListener("test-prevent", prevent_handler, .{});
+    try target.addEventListener("test-prevent", check_handler, .{ .data = &default_prevented });
+
+    // イベントを生成
+    var event = try Event.create(allocator, "test-prevent", .{});
+    defer event.deinit(allocator);
+    event.initialized = true;
+
+    // イベントをディスパッチ
+    _ = try target.dispatchEvent(null, event);
+
+    // defaultPreventedがtrueになっているか確認
+    try std.testing.expect(default_prevented);
+    try std.testing.expect(event.defaultPrevented);
+}
+
+test "once option test" {
+    const allocator = std.testing.allocator;
+    var target = try EventTarget.create(allocator);
+    defer target.deinit();
+
+    var handler_count: usize = 0;
+
+    // 1回だけ呼ばれるハンドラー
+    const once_handler = struct {
+        fn handler(event: *Event, data: ?*anyopaque) void {
+            _ = event;
+            var count = @ptrCast(*usize, @alignCast(@alignOf(usize), data.?));
+            count.* += 1;
+        }
+    }.handler;
+
+    // once オプション付きでリスナーを登録
+    try target.addEventListener("test-once", once_handler, .{ .once = true, .data = &handler_count });
+
+    // イベントを2回ディスパッチ
+    var event1 = try Event.create(allocator, "test-once", .{});
+    defer event1.deinit(allocator);
+    event1.initialized = true;
+    _ = try target.dispatchEvent(null, event1);
+
+    var event2 = try Event.create(allocator, "test-once", .{});
+    defer event2.deinit(allocator);
+    event2.initialized = true;
+    _ = try target.dispatchEvent(null, event2);
+
+    // ハンドラーは1回だけ呼ばれるはず
+    try std.testing.expectEqual(@as(usize, 1), handler_count);
+
+    // リスナーが自動的に削除されているか確認
+    try std.testing.expectEqual(@as(usize, 0), target.listener_map.count());
+}

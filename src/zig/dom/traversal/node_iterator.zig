@@ -3,137 +3,400 @@
 // https://dom.spec.whatwg.org/#nodeiterator
 
 const std = @import("std");
-const Node = @import("../node.zig").Node;
+const dom = @import("../../dom/elements/node.zig");
+const NodeType = @import("../../dom/elements/node_types.zig").NodeType;
 const NodeFilter = @import("./node_filter.zig").NodeFilter;
+const NodeFilterResult = @import("./node_filter.zig").NodeFilterResult;
 
-/// NodeIterator は、特定の NodeFilter によって決定されるノードのセットを
-/// 文書順 (document order) で反復処理するために使用されます。
-pub const NodeIterator = struct {
-    // --- Public Fields (Read-Only) --- https://dom.spec.whatwg.org/#dom-nodeiterator-root
-    root: *Node, // 走査の起点となるノード
-    whatToShow: u32, // NodeFilter.SHOW_* のビットマスク
-    filter: ?NodeFilter.CallbackFilter, // オプションのカスタムフィルター
+/// NodeFilter の定数
+pub const NodeFilterConstants = struct {
+    pub const FILTER_ACCEPT: u16 = 1;
+    pub const FILTER_REJECT: u16 = 2;
+    pub const FILTER_SKIP: u16 = 3;
 
-    // --- Internal State ---
-    // 仕様上の "reference node" と "pointer before reference node" に相当
-    reference_node: *Node, // 現在のイテレータの位置を示すノード
-    pointer_before_reference_node: bool, // イテレータが参照ノードの前にあるか後にあるか
-    
-    // イテレータがアクティブかどうか (detach で false になる)
-    // TODO: DOM の変更に対応するためのより高度なメカニズムが必要になる可能性がある
-    is_active: bool,
+    // nodeType フィルタリング用の定数
+    pub const SHOW_ALL: u32 = 0xFFFFFFFF;
+    pub const SHOW_ELEMENT: u32 = 0x1;
+    pub const SHOW_ATTRIBUTE: u32 = 0x2;
+    pub const SHOW_TEXT: u32 = 0x4;
+    pub const SHOW_CDATA_SECTION: u32 = 0x8;
+    pub const SHOW_ENTITY_REFERENCE: u32 = 0x10;
+    pub const SHOW_ENTITY: u32 = 0x20;
+    pub const SHOW_PROCESSING_INSTRUCTION: u32 = 0x40;
+    pub const SHOW_COMMENT: u32 = 0x80;
+    pub const SHOW_DOCUMENT: u32 = 0x100;
+    pub const SHOW_DOCUMENT_TYPE: u32 = 0x200;
+    pub const SHOW_DOCUMENT_FRAGMENT: u32 = 0x400;
+    pub const SHOW_NOTATION: u32 = 0x800;
+};
 
-    // アロケータ (現時点では不要かもしれないが保持)
-    allocator: std.mem.Allocator,
+/// NodeFilter インターフェース定義
+pub const CustomNodeFilter = struct {
+    acceptNode: *const fn (node: *dom.Node) u16,
 
-    /// NodeIterator を作成します。
-    /// 通常は Document.createNodeIterator 経由で呼び出されます。
-    pub fn create(
-        allocator: std.mem.Allocator,
-        root_node: *Node,
-        what_to_show: u32,
-        node_filter: ?NodeFilter.CallbackFilter,
-    ) !*NodeIterator {
-        const iterator = try allocator.create(NodeIterator);
-        iterator.* = .{
-            .root = root_node,
-            .whatToShow = what_to_show,
-            .filter = node_filter,
-            // 初期状態: root ノードの直前を指す
-            .reference_node = root_node,
-            .pointer_before_reference_node = true,
-            .is_active = true,
-            .allocator = allocator,
-        };
-        std.log.debug("Created NodeIterator with root {any}", .{root_node});
-        return iterator;
-    }
-
-    /// NodeIterator を破棄します。
-    /// (現時点では内部でメモリ確保していないため、デアロケートのみ)
-    pub fn destroy(self: *NodeIterator) void {
-        std.log.debug("Destroying NodeIterator for root {any}", .{self.root});
-        self.allocator.destroy(self);
-    }
-
-    /// イテレータを非アクティブ化します。仕様上の detach() に相当します。
-    /// これ以降、nextNode() や previousNode() は null を返します。
-    pub fn detach(self: *NodeIterator) void {
-        std.log.debug("Detaching NodeIterator for root {any}", .{self.root});
-        self.is_active = false;
-    }
-
-    /// 次のノードを取得します。
-    /// 仕様: https://dom.spec.whatwg.org/#dom-nodeiterator-nextnode
-    pub fn nextNode(self: *NodeIterator) ?*Node {
-        if (!self.is_active) return null;
-
-        // TODO: 走査アルゴリズムとフィルタリングを実装
-        std.log.warn("NodeIterator.nextNode() not fully implemented yet.", .{});
-        return null;
-    }
-
-    /// 前のノードを取得します。
-    /// 仕様: https://dom.spec.whatwg.org/#dom-nodeiterator-previousnode
-    pub fn previousNode(self: *NodeIterator) ?*Node {
-        if (!self.is_active) return null;
-
-        // TODO: 逆方向の走査アルゴリズムとフィルタリングを実装
-        std.log.warn("NodeIterator.previousNode() not fully implemented yet.", .{});
-        return null;
-    }
-
-    // --- フィルター適用ヘルパー --- 
-    fn filterNode(self: *const NodeIterator, node: *Node) i32 {
-        // 1. whatToShow でフィルタリング
-        const accept_show = NodeFilter.acceptNodeToShow(self.whatToShow, node);
-        if (accept_show == NodeFilter.FILTER_REJECT) {
-            return NodeFilter.FILTER_REJECT;
-        }
-
-        // 2. カスタムフィルターがあれば適用
-        if (self.filter) |f| {
-            const accept_custom = f.acceptNode(node);
-            // NodeIterator では FILTER_SKIP は FILTER_REJECT として扱う
-            if (accept_custom == NodeFilter.FILTER_SKIP) {
-                return NodeFilter.FILTER_REJECT;
-            }
-            return accept_custom;
-        } else {
-            // カスタムフィルターがなければ、whatToShow の結果 (ACCEPT) を返す
-            return NodeFilter.FILTER_ACCEPT;
-        }
+    pub fn init(callback: *const fn (node: *dom.Node) u16) CustomNodeFilter {
+        return CustomNodeFilter{ .acceptNode = callback };
     }
 };
 
-// --- テスト (プレースホルダー) ---
-test "NodeIterator creation and basic properties" {
+/// NodeIterator インターフェースは、DOM ノードのシーケンスを通じて反復処理する機能を表します。
+/// 開始ノードから開始し、ドキュメントツリー内の順序に従ってノードを走査します。
+pub const NodeIterator = struct {
+    /// イテレータの開始ノード。
+    root: *dom.Node,
+
+    /// 現在の参照ノード。
+    referenceNode: *dom.Node,
+
+    /// イテレータが現在参照ノードを指す前であるかどうか。
+    pointerBeforeReferenceNode: bool,
+
+    /// ノードをフィルタリングするために使用される NodeFilter。
+    filter: ?*NodeFilter,
+
+    /// フィルタリングするノードタイプを指定するビットマスク。
+    whatToShow: u32,
+
+    /// 新しい NodeIterator を作成します。
+    pub fn init(root: *dom.Node, whatToShow: u32, filter: ?*NodeFilter) NodeIterator {
+        return NodeIterator{
+            .root = root,
+            .referenceNode = root,
+            .pointerBeforeReferenceNode = true,
+            .filter = filter,
+            .whatToShow = whatToShow,
+        };
+    }
+
+    /// 現在の参照ノードを取得します。
+    pub fn getRoot(self: *NodeIterator) *dom.Node {
+        return self.root;
+    }
+
+    /// 現在の参照ノードを取得します。
+    pub fn getReferenceNode(self: *NodeIterator) *dom.Node {
+        return self.referenceNode;
+    }
+
+    /// イテレータが現在参照ノードを指す前であるかどうかを確認します。
+    pub fn getPointerBeforeReferenceNode(self: *NodeIterator) bool {
+        return self.pointerBeforeReferenceNode;
+    }
+
+    /// フィルタリングするノードタイプを指定するビットマスクを取得します。
+    pub fn getWhatToShow(self: *NodeIterator) u32 {
+        return self.whatToShow;
+    }
+
+    /// ノードをフィルタリングするために使用される NodeFilter を取得します。
+    pub fn getFilter(self: *NodeIterator) ?*NodeFilter {
+        return self.filter;
+    }
+
+    /// 次のノードに移動します。
+    pub fn nextNode(self: *NodeIterator) ?*dom.Node {
+        var result: ?*dom.Node = null;
+        var node = self.referenceNode;
+        var beforeNode = self.pointerBeforeReferenceNode;
+
+        while (true) {
+            if (beforeNode) {
+                beforeNode = false;
+            } else {
+                // 次のノードを探す
+                var next = self.getNextNode(node);
+                if (next) |nextNode| {
+                    node = nextNode;
+                } else {
+                    return null;
+                }
+            }
+
+            // ノードをフィルタリングする
+            var filterResult = self.acceptNode(node);
+            if (filterResult == NodeFilterResult.FILTER_ACCEPT) {
+                result = node;
+                break;
+            }
+        }
+
+        self.referenceNode = result orelse self.referenceNode;
+        self.pointerBeforeReferenceNode = false;
+        return result;
+    }
+
+    /// 前のノードに移動します。
+    pub fn previousNode(self: *NodeIterator) ?*dom.Node {
+        var result: ?*dom.Node = null;
+        var node = self.referenceNode;
+        var beforeNode = self.pointerBeforeReferenceNode;
+
+        while (true) {
+            if (!beforeNode) {
+                beforeNode = true;
+            } else {
+                // 前のノードを探す
+                var prev = self.getPreviousNode(node);
+                if (prev) |prevNode| {
+                    node = prevNode;
+                } else {
+                    return null;
+                }
+            }
+
+            // ノードをフィルタリングする
+            var filterResult = self.acceptNode(node);
+            if (filterResult == NodeFilterResult.FILTER_ACCEPT) {
+                result = node;
+                break;
+            }
+        }
+
+        self.referenceNode = result orelse self.referenceNode;
+        self.pointerBeforeReferenceNode = true;
+        return result;
+    }
+
+    /// TreeWalker や NodeIterator を廃止します。
+    pub fn detach(self: *NodeIterator) void {
+        // DOM4では廃止されたが、互換性のために残している
+        // 何もしない
+        _ = self;
+    }
+
+    /// 指定されたノードをフィルターで受け入れるかどうかを判断します。
+    fn acceptNode(self: *NodeIterator, node: *dom.Node) NodeFilterResult {
+        // whatToShowビットマスクをチェックする
+        if ((self.whatToShow & (@as(u32, 1) << @intCast(node.nodeType - 1))) == 0) {
+            return NodeFilterResult.FILTER_SKIP;
+        }
+
+        // カスタムフィルタが設定されている場合は呼び出す
+        if (self.filter) |filter| {
+            return filter.acceptNode(node);
+        }
+
+        return NodeFilterResult.FILTER_ACCEPT;
+    }
+
+    /// 現在のノードの次のノードを取得します。
+    fn getNextNode(self: *NodeIterator, node: *dom.Node) ?*dom.Node {
+        // 子ノードがある場合は最初の子を返す
+        if (node.firstChild) |child| {
+            return child;
+        }
+
+        // 子がない場合は兄弟または祖先の兄弟を探す
+        var current = node;
+        while (true) {
+            // ルートに到達した場合は終了
+            if (std.meta.eql(current, self.root)) {
+                return null;
+            }
+
+            // 次の兄弟がある場合はそれを返す
+            if (current.nextSibling) |sibling| {
+                return sibling;
+            }
+
+            // 親ノードに移動
+            if (current.parentNode) |parent| {
+                current = parent;
+            } else {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    /// 現在のノードの前のノードを取得します。
+    fn getPreviousNode(self: *NodeIterator, node: *dom.Node) ?*dom.Node {
+        // ルートに到達した場合は終了
+        if (std.meta.eql(node, self.root)) {
+            return null;
+        }
+
+        // 前の兄弟がある場合、その最も深い最後の子孫を返す
+        if (node.previousSibling) |sibling| {
+            var current = sibling;
+            // 最も深い最後の子孫を探す
+            while (current.lastChild) |child| {
+                current = child;
+            }
+            return current;
+        }
+
+        // 親ノードを返す
+        if (node.parentNode) |parent| {
+            // ルートの親には戻らない
+            if (std.meta.eql(parent, self.root)) {
+                return null;
+            }
+            return parent;
+        }
+
+        return null;
+    }
+};
+
+// ノードAがノードBの祖先かどうかをチェック
+fn isAncestorOf(node_a: *dom.Node, node_b: *dom.Node) bool {
+    var current = node_b;
+    while (current.parentNode != null) {
+        if (current.parentNode.? == node_a) {
+            return true;
+        }
+        current = current.parentNode.?;
+    }
+    return false;
+}
+
+// テスト用のNodeFilterCallback
+fn testFilterCallback(node: *dom.Node) u16 {
+    // テキストノードのみ受け入れる
+    if (node.nodeType == .text_node) {
+        return NodeFilterConstants.FILTER_ACCEPT;
+    }
+    return NodeFilterConstants.FILTER_REJECT;
+}
+
+test "NodeIterator basic functionality" {
     const allocator = std.testing.allocator;
-    // テスト用の Document と Root Node を作成
-    var doc_node_storage = Node{.node_type = .document_node, .owner_document = null, .parent_node=null, .first_child=null, .last_child=null, .previous_sibling=null, .next_sibling=null, .specific_data=null, .event_target = try @import("../events/event_target.zig").EventTarget.create(allocator)};
-    var doc_node_mut = doc_node_storage;
-    doc_node_mut.owner_document = &doc_node_mut;
-    const doc_node = &doc_node_mut;
-    defer doc_node.event_target.destroy(allocator);
 
-    const root_elem_storage = Node{.node_type = .element_node, .owner_document = doc_node, .parent_node = doc_node, .first_child=null, .last_child=null, .previous_sibling=null, .next_sibling=null, .specific_data=null, .event_target = try @import("../events/event_target.zig").EventTarget.create(allocator)};
-    // create に渡すために mutable なポインタが必要
-    var root_elem_mut = root_elem_storage; 
-    _ = &root_elem_mut; // Use the variable to silence the linter error
-    defer root_elem_mut.event_target.destroy(allocator);
+    // テスト用のDOM構造を作成
+    var document = try dom.Document.create(allocator);
+    defer document.destroy();
 
-    const iterator = try NodeIterator.create(allocator, &root_elem_mut, NodeFilter.SHOW_ALL, null);
-    defer iterator.destroy();
+    var root_elem = try document.createElement("div");
+    try document.appendChild(root_elem);
 
-    try std.testing.expectEqual(&root_elem_mut, iterator.root);
-    try std.testing.expectEqual(NodeFilter.SHOW_ALL, iterator.whatToShow);
-    try std.testing.expectEqual(null, iterator.filter);
-    try std.testing.expectEqual(&root_elem_mut, iterator.reference_node);
-    try std.testing.expectEqual(true, iterator.pointer_before_reference_node);
-    try std.testing.expectEqual(true, iterator.is_active);
+    var child1 = try document.createElement("p");
+    try root_elem.appendChild(child1);
 
-    iterator.detach();
-    try std.testing.expectEqual(false, iterator.is_active);
-    try std.testing.expectEqual(null, iterator.nextNode()); // Detached
-    try std.testing.expectEqual(null, iterator.previousNode()); // Detached
-} 
+    var text1 = try document.createTextNode("Hello");
+    try child1.appendChild(text1);
+
+    var child2 = try document.createElement("span");
+    try root_elem.appendChild(child2);
+
+    var text2 = try document.createTextNode("World");
+    try child2.appendChild(text2);
+
+    // NodeIteratorを作成（すべてのノードを表示）
+    var iterator = try NodeIterator.init(root_elem, NodeFilterConstants.SHOW_ALL, null);
+
+    // 前進イテレーション
+    const node1 = iterator.nextNode();
+    try std.testing.expectEqual(child1, @ptrCast(*dom.Element, node1.?));
+
+    const node2 = iterator.nextNode();
+    try std.testing.expectEqual(text1, @ptrCast(*dom.Text, node2.?));
+
+    const node3 = iterator.nextNode();
+    try std.testing.expectEqual(child2, @ptrCast(*dom.Element, node3.?));
+
+    const node4 = iterator.nextNode();
+    try std.testing.expectEqual(text2, @ptrCast(*dom.Text, node4.?));
+
+    const node5 = iterator.nextNode();
+    try std.testing.expect(node5 == null); // これ以上ノードはない
+
+    // 後方イテレーション
+    const prev1 = iterator.previousNode();
+    try std.testing.expectEqual(text2, @ptrCast(*dom.Text, prev1.?));
+
+    const prev2 = iterator.previousNode();
+    try std.testing.expectEqual(child2, @ptrCast(*dom.Element, prev2.?));
+
+    const prev3 = iterator.previousNode();
+    try std.testing.expectEqual(text1, @ptrCast(*dom.Text, prev3.?));
+
+    const prev4 = iterator.previousNode();
+    try std.testing.expectEqual(child1, @ptrCast(*dom.Element, prev4.?));
+
+    const prev5 = iterator.previousNode();
+    try std.testing.expect(prev5 == null); // これ以上前のノードはない
+}
+
+test "NodeIterator with filter" {
+    const allocator = std.testing.allocator;
+
+    // テスト用のDOM構造を作成
+    var document = try dom.Document.create(allocator);
+    defer document.destroy();
+
+    var root_elem = try document.createElement("div");
+    try document.appendChild(root_elem);
+
+    var child1 = try document.createElement("p");
+    try root_elem.appendChild(child1);
+
+    var text1 = try document.createTextNode("Hello");
+    try child1.appendChild(text1);
+
+    var child2 = try document.createElement("span");
+    try root_elem.appendChild(child2);
+
+    var text2 = try document.createTextNode("World");
+    try child2.appendChild(text2);
+
+    // テキストノードだけを表示するフィルタを作成
+    const filter = CustomNodeFilter.init(testFilterCallback);
+
+    // NodeIteratorをフィルタ付きで作成
+    var iterator = try NodeIterator.init(root_elem, NodeFilterConstants.SHOW_ALL, filter);
+
+    // テキストノードだけが返されることを確認
+    const node1 = iterator.nextNode();
+    try std.testing.expectEqual(text1, @ptrCast(*dom.Text, node1.?));
+
+    const node2 = iterator.nextNode();
+    try std.testing.expectEqual(text2, @ptrCast(*dom.Text, node2.?));
+
+    const node3 = iterator.nextNode();
+    try std.testing.expect(node3 == null); // これ以上テキストノードはない
+}
+
+test "NodeIterator node removal handling" {
+    const allocator = std.testing.allocator;
+
+    // テスト用のDOM構造を作成
+    var document = try dom.Document.create(allocator);
+    defer document.destroy();
+
+    var root_elem = try document.createElement("div");
+    try document.appendChild(root_elem);
+
+    var child1 = try document.createElement("p");
+    try root_elem.appendChild(child1);
+
+    var text1 = try document.createTextNode("Hello");
+    try child1.appendChild(text1);
+
+    var child2 = try document.createElement("span");
+    try root_elem.appendChild(child2);
+
+    var text2 = try document.createTextNode("World");
+    try child2.appendChild(text2);
+
+    // NodeIteratorを作成
+    var iterator = try NodeIterator.init(root_elem, NodeFilterConstants.SHOW_ALL, null);
+
+    // イテレーターを進める
+    _ = iterator.nextNode(); // child1
+    _ = iterator.nextNode(); // text1
+
+    // 現在の参照ノードはtext1
+    try std.testing.expectEqual(text1, iterator.referenceNode);
+
+    // text1の親（child1）を削除
+    try child1.remove();
+
+    // イテレーターの状態が適切に更新されていることを確認
+    try iterator.handleNodeRemoval(@ptrCast(*dom.Node, child1));
+
+    // 次のノードはchild2になるはず
+    const next = iterator.nextNode();
+    try std.testing.expectEqual(child2, @ptrCast(*dom.Element, next.?));
+}

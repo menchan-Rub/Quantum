@@ -197,13 +197,21 @@ proc addCookieFromHeader*(manager: CookieManager, header: string, domain: string
         path = "/"
     
     elif attr.startsWith("expires="):
-      # 日付形式のパース（簡略化）
-      # 実際の実装では完全なHTTPの日付パースが必要
+      # HTTP日付パース（RFC準拠・複数フォーマット対応）
       let dateStr = attr[8..^1].strip()
-      try:
-        # 簡易実装
-        expirationTime = some(parse(dateStr, "ddd, dd MMM yyyy HH:mm:ss 'GMT'"))
-      except:
+      let formats = [
+        "EEE, dd MMM yyyy HH:mm:ss 'GMT'",   # RFC 1123
+        "EEEE, dd-MMM-yy HH:mm:ss 'GMT'",    # RFC 850
+        "EEE MMM d HH:mm:ss yyyy"            # ANSI C asctime
+      ]
+      var parsed = false
+      for fmt in formats:
+        try:
+          expirationTime = some(parse(dateStr, fmt))
+          parsed = true
+          break
+        except: discard
+      if not parsed:
         # 無効な日付形式は無視
         discard
     

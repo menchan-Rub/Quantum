@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const mem = @import("../memory/allocator.zig"); // Global allocator
-const errors = @import("../util/error.zig");   // Common errors
+const errors = @import("../util/error.zig"); // Common errors
 const Node = @import("./node.zig").Node;
 const NodeType = @import("./node_type.zig").NodeType;
 const Document = @import("./document.zig").Document;
@@ -15,16 +15,16 @@ const HTMLElement = @import("./elements/html_element.zig").HTMLElement;
 const HTMLAnchorElement = @import("./elements/html_anchor_element.zig").HTMLAnchorElement;
 const HTMLDivElement = @import("./elements/html_div_element.zig").HTMLDivElement;
 const HTMLSpanElement = @import("./elements/html_span_element.zig").HTMLSpanElement;
-const HTMLImageElement    = @import("./elements/html_image_element.zig").HTMLImageElement;
-const HTMLInputElement    = @import("./elements/html_input_element.zig").HTMLInputElement;
-const HTMLButtonElement   = @import("./elements/html_button_element.zig").HTMLButtonElement;
-const HTMLFormElement     = @import("./elements/html_form_element.zig").HTMLFormElement;
-const HTMLHeadingElement  = @import("./elements/html_heading_element.zig").HTMLHeadingElement;
-const HTMLParagraphElement= @import("./elements/html_paragraph_element.zig").HTMLParagraphElement;
-const HTMLScriptElement   = @import("./elements/html_script_element.zig").HTMLScriptElement;
-const HTMLStyleElement    = @import("./elements/html_style_element.zig").HTMLStyleElement;
-const HTMLTableElement    = @import("./elements/html_table_element.zig").HTMLTableElement;
-const HTMLCollection = std.ArrayList(*Node);  // HTMLCollection の型エイリアス
+const HTMLImageElement = @import("./elements/html_image_element.zig").HTMLImageElement;
+const HTMLInputElement = @import("./elements/html_input_element.zig").HTMLInputElement;
+const HTMLButtonElement = @import("./elements/html_button_element.zig").HTMLButtonElement;
+const HTMLFormElement = @import("./elements/html_form_element.zig").HTMLFormElement;
+const HTMLHeadingElement = @import("./elements/html_heading_element.zig").HTMLHeadingElement;
+const HTMLParagraphElement = @import("./elements/html_paragraph_element.zig").HTMLParagraphElement;
+const HTMLScriptElement = @import("./elements/html_script_element.zig").HTMLScriptElement;
+const HTMLStyleElement = @import("./elements/html_style_element.zig").HTMLStyleElement;
+const HTMLTableElement = @import("./elements/html_table_element.zig").HTMLTableElement;
+const HTMLCollection = std.ArrayList(*Node); // HTMLCollection の型エイリアス
 const validation = @import("../util/validation.zig");
 const MutationRecord = @import("./mutations/mutation_record.zig").MutationRecord;
 const MutationType = @import("./mutations/mutation_record.zig").MutationType;
@@ -36,8 +36,8 @@ const html_ns = "http://www.w3.org/1999/xhtml";
 
 // --- HTML 要素の具象型を保持するための Tagged Union ---
 pub const HTMLSpecificData = union(enum) {
-    none: void,                                // HTML 要素ではない、または不明な要素
-    generic: *HTMLElement,                     // 汎用 HTMLElement
+    none: void, // HTML 要素ではない、または不明な要素
+    generic: *HTMLElement, // 汎用 HTMLElement
     div: *HTMLDivElement,
     span: *HTMLSpanElement,
     a: *HTMLAnchorElement,
@@ -60,50 +60,50 @@ pub const HTMLSpecificData = union(enum) {
     // Node.destroyRecursive から呼び出される
     pub fn destroy(self: HTMLSpecificData, allocator: std.mem.Allocator) void {
         switch (self) {
-            .none    => {},
+            .none => {},
             .generic => |ptr| ptr.destroy(allocator),
-            .div     => |ptr| ptr.destroy(allocator),
-            .span    => |ptr| ptr.destroy(allocator),
-            .a       => |ptr| ptr.destroy(allocator),
-            .img     => |ptr| ptr.destroy(allocator),
-            .input   => |ptr| ptr.destroy(allocator),
-            .button  => |ptr| ptr.destroy(allocator),
-            .form    => |ptr| ptr.destroy(allocator),
-            .h1      => |ptr| ptr.destroy(allocator),
-            .h2      => |ptr| ptr.destroy(allocator),
-            .h3      => |ptr| ptr.destroy(allocator),
-            .h4      => |ptr| ptr.destroy(allocator),
-            .h5      => |ptr| ptr.destroy(allocator),
-            .h6      => |ptr| ptr.destroy(allocator),
-            .p       => |ptr| ptr.destroy(allocator),
-            .script  => |ptr| ptr.destroy(allocator),
-            .style   => |ptr| ptr.destroy(allocator),
-            .table   => |ptr| ptr.destroy(allocator),
+            .div => |ptr| ptr.destroy(allocator),
+            .span => |ptr| ptr.destroy(allocator),
+            .a => |ptr| ptr.destroy(allocator),
+            .img => |ptr| ptr.destroy(allocator),
+            .input => |ptr| ptr.destroy(allocator),
+            .button => |ptr| ptr.destroy(allocator),
+            .form => |ptr| ptr.destroy(allocator),
+            .h1 => |ptr| ptr.destroy(allocator),
+            .h2 => |ptr| ptr.destroy(allocator),
+            .h3 => |ptr| ptr.destroy(allocator),
+            .h4 => |ptr| ptr.destroy(allocator),
+            .h5 => |ptr| ptr.destroy(allocator),
+            .h6 => |ptr| ptr.destroy(allocator),
+            .p => |ptr| ptr.destroy(allocator),
+            .script => |ptr| ptr.destroy(allocator),
+            .style => |ptr| ptr.destroy(allocator),
+            .table => |ptr| ptr.destroy(allocator),
         }
     }
 
     // HTMLElement へのポインタを取得するヘルパー (キャスト用)
     pub fn getBaseHTMLElement(self: HTMLSpecificData) ?*HTMLElement {
         return switch (self) {
-            .none    => null,
+            .none => null,
             .generic => |ptr| ptr,
-            .div     => |ptr| &ptr.base,
-            .span    => |ptr| &ptr.base,
-            .a       => |ptr| &ptr.base,
-            .img     => |ptr| &ptr.base,
-            .input   => |ptr| &ptr.base,
-            .button  => |ptr| &ptr.base,
-            .form    => |ptr| &ptr.base,
-            .h1      => |ptr| &ptr.base,
-            .h2      => |ptr| &ptr.base,
-            .h3      => |ptr| &ptr.base,
-            .h4      => |ptr| &ptr.base,
-            .h5      => |ptr| &ptr.base,
-            .h6      => |ptr| &ptr.base,
-            .p       => |ptr| &ptr.base,
-            .script  => |ptr| &ptr.base,
-            .style   => |ptr| &ptr.base,
-            .table   => |ptr| &ptr.base,
+            .div => |ptr| &ptr.base,
+            .span => |ptr| &ptr.base,
+            .a => |ptr| &ptr.base,
+            .img => |ptr| &ptr.base,
+            .input => |ptr| &ptr.base,
+            .button => |ptr| &ptr.base,
+            .form => |ptr| &ptr.base,
+            .h1 => |ptr| &ptr.base,
+            .h2 => |ptr| &ptr.base,
+            .h3 => |ptr| &ptr.base,
+            .h4 => |ptr| &ptr.base,
+            .h5 => |ptr| &ptr.base,
+            .h6 => |ptr| &ptr.base,
+            .p => |ptr| &ptr.base,
+            .script => |ptr| &ptr.base,
+            .style => |ptr| &ptr.base,
+            .table => |ptr| &ptr.base,
         };
     }
 };
@@ -125,6 +125,10 @@ pub const Element = struct {
     node_ptr: *Node, // Node へのポインタを追加
     // HTML 要素の場合、具象型データへのポインタを保持する Union
     html_data: HTMLSpecificData = .none, // 型を ?*HTMLElement から変更し、デフォルトを .none に
+    // アクセシビリティ属性
+    role: ?[]const u8 = null,
+    tabindex: ?i32 = null,
+    aria_attributes: ?std.StringHashMap([]const u8) = null,
 
     // Element インスタンスを作成する関数。
     // Node も同時に作成し、*Node を返す。
@@ -190,6 +194,9 @@ pub const Element = struct {
             .data = element_data,
             .node_ptr = node,
             .html_data = .none, // まず none で初期化
+            .role = null,
+            .tabindex = null,
+            .aria_attributes = std.StringHashMap([]const u8).init(allocator),
         };
 
         // 5. HTML 要素の場合、HTMLElement と具象要素を作成して関連付ける
@@ -307,7 +314,7 @@ pub const Element = struct {
             // 属性値の変更前に古い値を記録
             attr.setValue(allocator, new_value);
             allocator.free(attr_name_key); // HTML の場合解放
-            // --- MutationObserver 通知 (変更) --- 
+            // --- MutationObserver 通知 (変更) ---
             self.queueAttributeMutation(attr_name_key, old_value);
             allocator.free(old_value.?); // コピーした古い値を解放
         } else {
@@ -320,7 +327,7 @@ pub const Element = struct {
             new_attr.owner_element = self;
             const old = try self.data.setAttribute(attr_name_key, new_attr);
             std.debug.assert(old == null);
-            // --- MutationObserver 通知 (追加) --- 
+            // --- MutationObserver 通知 (追加) ---
             self.queueAttributeMutation(attr_name_key, null);
         }
     }
@@ -335,11 +342,11 @@ pub const Element = struct {
         var lower_name_buf: [128]u8 = undefined;
 
         if (is_html) {
-             if (name.len <= lower_name_buf.len) {
+            if (name.len <= lower_name_buf.len) {
                 search_name_slice = std.ascii.lowerString(lower_name_buf[0..name.len], name);
-             } else {
+            } else {
                 search_name_slice = name; // Fallback
-             }
+            }
         } else {
             search_name_slice = name;
         }
@@ -360,7 +367,7 @@ pub const Element = struct {
             const removed = self.data.removeAttribute(allocator, key_to_remove.?);
             std.debug.assert(removed.? == attr);
             attr.destroy(allocator);
-            // --- MutationObserver 通知 --- 
+            // --- MutationObserver 通知 ---
             self.queueAttributeMutation(key_to_remove.?, old_value_copy);
             allocator.free(old_value_copy); // コピーした古い値を解放
         } else {
@@ -388,9 +395,9 @@ pub const Element = struct {
         var it = self.data.attributes.iterator();
         while (it.next()) |entry| {
             if (is_html) {
-                 if (entry.value_ptr.*.matchesHTML(search_name_slice)) return true;
+                if (entry.value_ptr.*.matchesHTML(search_name_slice)) return true;
             } else {
-                 if (std.mem.eql(u8, entry.key, search_name_slice)) return true;
+                if (std.mem.eql(u8, entry.key, search_name_slice)) return true;
             }
         }
         return false;
@@ -444,13 +451,13 @@ pub const Element = struct {
                 std.debug.assert(removed_old.? == old);
             }
             std.debug.assert(replaced.? == old);
-            // --- MutationObserver 通知 (変更) --- 
+            // --- MutationObserver 通知 (変更) ---
             self.queueAttributeMutation(old_qualified_name.?, old_value);
             if (old_value) |ov| allocator.free(ov); // コピーした古い値を解放
             return old;
         } else {
             std.debug.assert(replaced == null);
-            // --- MutationObserver 通知 (追加) --- 
+            // --- MutationObserver 通知 (追加) ---
             self.queueAttributeMutation(new_qualified_name, null);
             return null;
         }
@@ -476,7 +483,7 @@ pub const Element = struct {
             const removed = self.data.removeAttribute(allocator, qualified_name_to_remove.?);
             std.debug.assert(removed.? == attr);
             attr.owner_element = null;
-            // --- MutationObserver 通知 --- 
+            // --- MutationObserver 通知 ---
             self.queueAttributeMutation(qualified_name_to_remove.?, old_value_copy);
             allocator.free(old_value_copy);
             return attr;
@@ -490,20 +497,20 @@ pub const Element = struct {
             const allocator = doc.allocator;
             // レコードを作成 (エラー時はログ出力して処理継続)
             var record = MutationRecord.create(allocator, .attributes, self.node_ptr) catch |err| {
-                 std.log.err("属性変更の MutationRecord 作成に失敗: {}", .{err});
-                 return;
+                std.log.err("属性変更の MutationRecord 作成に失敗: {}", .{err});
+                return;
             };
-            
+
             record.attributeName = attribute_name; // 属性名は参照のみ（コピーしない）
             record.oldValue = old_value; // 古い値の所有権を移譲
-            
+
             // Document のキューに追加
             doc.queueMutationRecord(record) catch |err| {
-                 std.log.err("属性変更の MutationRecord キューイングに失敗: {}", .{err});
-                 // キューイング失敗時はレコードを破棄
-                 record.destroy();
-                 // old_value の所有権はこの関数が持つため、失敗時は解放する
-                 if (old_value) |ov| allocator.free(ov);
+                std.log.err("属性変更の MutationRecord キューイングに失敗: {}", .{err});
+                // キューイング失敗時はレコードを破棄
+                record.destroy();
+                // old_value の所有権はこの関数が持つため、失敗時は解放する
+                if (old_value) |ov| allocator.free(ov);
             };
         } else {
             // ownerDocument がない場合は何もしない
@@ -629,102 +636,209 @@ pub const Element = struct {
         const allocator = self.node_ptr.owner_document.?.allocator;
         var collection = try HTMLCollection.create(allocator);
         errdefer collection.destroy();
-        
+
         // 子ノードを再帰的に検索
         try self.collectElementsByTagName(tag_name, collection);
-        
+
         return collection;
     }
-    
+
     // 内部ヘルパー: タグ名で要素を収集
     fn collectElementsByTagName(self: *Element, tag_name: []const u8, collection: *HTMLCollection) !void {
         var child = self.node_ptr.first_child;
         while (child != null) : (child = child.?.next_sibling) {
             if (child.?.node_type == .element_node) {
                 const child_elem: *Element = @ptrCast(@alignCast(child.?.specific_data.?));
-                
+
                 // タグ名が一致するか、"*"（全要素）の場合は追加
-                if (std.mem.eql(u8, tag_name, "*") or 
-                    std.ascii.eqlIgnoreCase(child_elem.data.tag_name, tag_name)) {
+                if (std.mem.eql(u8, tag_name, "*") or
+                    std.ascii.eqlIgnoreCase(child_elem.data.tag_name, tag_name))
+                {
                     try collection.append(child.?);
                 }
-                
+
                 // 子要素も再帰的に検索
                 try child_elem.collectElementsByTagName(tag_name, collection);
             }
         }
     }
-    
+
     /// CSSセレクタで最初の要素を検索します
     pub fn querySelector(self: *Element, selector: []const u8) !?*Element {
         // セレクタパーサーとマッチャーを初期化
         const allocator = self.node_ptr.owner_document.?.allocator;
         var parser = try CSSSelector.Parser.init(allocator, selector);
         defer parser.deinit();
-        
+
         var selector_list = try parser.parse();
         defer selector_list.deinit();
-        
+
         // 最初にマッチする要素を検索
         return self.querySelectorImpl(selector_list);
     }
-    
+
     // 内部実装: セレクタマッチング
     fn querySelectorImpl(self: *Element, selector_list: CSSSelector.SelectorList) !?*Element {
         var child = self.node_ptr.first_child;
         while (child != null) : (child = child.?.next_sibling) {
             if (child.?.node_type == .element_node) {
                 const child_elem: *Element = @ptrCast(@alignCast(child.?.specific_data.?));
-                
+
                 // この要素がセレクタにマッチするか確認
                 if (selector_list.matches(child_elem)) {
                     return child_elem;
                 }
-                
+
                 // 子孫要素も検索
                 if (try child_elem.querySelectorImpl(selector_list)) |match| {
                     return match;
                 }
             }
         }
-        
+
         return null;
     }
-    
+
     /// CSSセレクタで全ての要素を検索します
     pub fn querySelectorAll(self: *Element, selector: []const u8) !*NodeList {
         const allocator = self.node_ptr.owner_document.?.allocator;
         var result = try NodeList.create(allocator);
         errdefer result.destroy();
-        
+
         // セレクタパーサーとマッチャーを初期化
         var parser = try CSSSelector.Parser.init(allocator, selector);
         defer parser.deinit();
-        
+
         var selector_list = try parser.parse();
         defer selector_list.deinit();
-        
+
         // マッチする全要素を収集
         try self.querySelectorAllImpl(selector_list, result);
-        
+
         return result;
     }
-    
+
     // 内部実装: 全マッチング要素収集
     fn querySelectorAllImpl(self: *Element, selector_list: CSSSelector.SelectorList, result: *NodeList) !void {
         var child = self.node_ptr.first_child;
         while (child != null) : (child = child.?.next_sibling) {
             if (child.?.node_type == .element_node) {
                 const child_elem: *Element = @ptrCast(@alignCast(child.?.specific_data.?));
-                
+
                 // この要素がセレクタにマッチするか確認
                 if (selector_list.matches(child_elem)) {
                     try result.append(child.?);
                 }
-                
+
                 // 子孫要素も検索
                 try child_elem.querySelectorAllImpl(selector_list, result);
             }
+        }
+    }
+
+    // --- アクセシビリティ属性 Getter/Setter ---
+    pub fn getRole(self: *const Element) ?[]const u8 {
+        return self.role;
+    }
+    pub fn setRole(self: *Element, value: []const u8) void {
+        self.role = value;
+    }
+    pub fn getTabIndex(self: *const Element) ?i32 {
+        return self.tabindex;
+    }
+    pub fn setTabIndex(self: *Element, value: i32) void {
+        self.tabindex = value;
+    }
+    pub fn getAria(self: *const Element, name: []const u8) ?[]const u8 {
+        if (self.aria_attributes) |*map| {
+            return map.get(name);
+        }
+        return null;
+    }
+    pub fn setAria(self: *Element, name: []const u8, value: []const u8) void {
+        if (self.aria_attributes) |*map| {
+            map.put(name, value) catch {};
+        }
+    }
+
+    /// この要素がフォーカス可能か判定
+    pub fn isFocusable(self: *const Element) bool {
+        // tabindexが明示的に設定されていればフォーカス可
+        if (self.tabindex) |idx| {
+            if (idx >= 0) return true;
+        }
+        // disabled属性
+        if (self.hasAttribute("disabled")) return false;
+        // hidden属性
+        if (self.hasAttribute("hidden")) return false;
+        // type=hiddenのinput
+        if (self.data.tag_name.len > 0 and std.mem.eql(u8, self.data.tag_name, "input")) {
+            if (self.getAttribute("type")) |t| {
+                if (std.mem.eql(u8, t, "hidden")) return false;
+            }
+        }
+        // デフォルトでフォーカス可能な要素
+        const focusable_tags = [_][]const u8{ "a", "input", "select", "textarea", "button" };
+        for (focusable_tags) |tag| {
+            if (std.mem.eql(u8, self.data.tag_name, tag)) return true;
+        }
+        return false;
+    }
+
+    /// ルートからtabindex順で次のフォーカス可能要素を取得
+    pub fn findNextFocusable(root: *Node, current: *Element) ?*Element {
+        var focusables = std.ArrayList(*Element).init(root.owner_document.?.allocator);
+        defer focusables.deinit();
+        collectFocusableElements(root, &focusables);
+        if (focusables.items.len == 0) return null;
+        // tabindex順・文書順でソート
+        std.sort.sort(*Element, focusables.items, {}, struct {
+            pub fn lessThan(_: void, a: *Element, b: *Element) bool {
+                const ta = a.tabindex orelse 0;
+                const tb = b.tabindex orelse 0;
+                if (ta != tb) return ta < tb;
+                return @intFromPtr(a) < @intFromPtr(b);
+            }
+        }.lessThan);
+        var found = false;
+        for (focusables.items) |el| {
+            if (found) return el;
+            if (el == current) found = true;
+        }
+        return null;
+    }
+
+    /// ルートからtabindex順で前のフォーカス可能要素を取得
+    pub fn findPrevFocusable(root: *Node, current: *Element) ?*Element {
+        var focusables = std.ArrayList(*Element).init(root.owner_document.?.allocator);
+        defer focusables.deinit();
+        collectFocusableElements(root, &focusables);
+        if (focusables.items.len == 0) return null;
+        std.sort.sort(*Element, focusables.items, {}, struct {
+            pub fn lessThan(_: void, a: *Element, b: *Element) bool {
+                const ta = a.tabindex orelse 0;
+                const tb = b.tabindex orelse 0;
+                if (ta != tb) return ta < tb;
+                return @intFromPtr(a) < @intFromPtr(b);
+            }
+        }.lessThan);
+        var prev: ?*Element = null;
+        for (focusables.items) |el| {
+            if (el == current) return prev;
+            prev = el;
+        }
+        return null;
+    }
+
+    /// ツリー全体からフォーカス可能要素を収集
+    fn collectFocusableElements(node: *Node, out: *std.ArrayList(*Element)) void {
+        if (node.specific_data) |spec| {
+            const el: *Element = @ptrCast(@alignCast(spec));
+            if (el.isFocusable()) out.append(el) catch {};
+        }
+        var child = node.first_child;
+        while (child != null) : (child = child.?.next_sibling) {
+            collectFocusableElements(child.?, out);
         }
     }
 };

@@ -161,176 +161,465 @@ method clear*(cache: CacheInterface): Future[void] {.base, async.} =
   ## 抽象メソッド：サブクラスで実装する必要がある
   raise newException(NotImplementedError, "Method not implemented")
 
+method size*(cache: CacheInterface): Future[int] {.base, async.} =
+  ## キャッシュサイズを取得
+  raise newException(NotImplementedError, "Method not implemented")
+
 method contains*(cache: CacheInterface, url: string): Future[bool] {.base, async.} =
-  ## URL指定でキャッシュエントリが存在するか確認
-  ## 抽象メソッド：サブクラスで実装する必要がある
+  ## URLがキャッシュに存在するかチェック
   raise newException(NotImplementedError, "Method not implemented")
 
-method refresh*(cache: CacheInterface, url: string, newData: CacheEntry): Future[bool] {.base, async.} =
-  ## キャッシュエントリを更新
-  ## 抽象メソッド：サブクラスで実装する必要がある
+method getStats*(cache: CacheInterface): Future[CacheStats] {.base, async.} =
+  ## キャッシュ統計情報を取得
   raise newException(NotImplementedError, "Method not implemented")
 
-method getStats*(cache: CacheInterface): CacheStats {.base.} =
-  ## キャッシュの統計情報を取得
+method cleanup*(cache: CacheInterface): Future[void] {.base, async.} =
+  ## 期限切れエントリのクリーンアップ
+  raise newException(NotImplementedError, "Method not implemented")
+
+# 具体的なキャッシュ実装クラス
+
+type
+  MemoryCacheInterface* = ref object of CacheInterface
+    ## メモリベースのキャッシュ実装
+    entries*: Table[string, CacheEntry]
+    accessTimes*: Table[string, Time]
+    currentSize*: int
+
+  DiskCacheInterface* = ref object of CacheInterface
+    ## ディスクベースのキャッシュ実装
+    cacheDir*: string
+    indexFile*: string
+    entries*: Table[string, CacheEntry]
+
+  HybridCacheInterface* = ref object of CacheInterface
+    ## ハイブリッド（メモリ+ディスク）キャッシュ実装
+    memoryCache*: MemoryCacheInterface
+    diskCache*: DiskCacheInterface
+    memoryThreshold*: int
+
+# MemoryCacheInterface の実装
+
+proc newMemoryCacheInterface*(options: CacheOptions): MemoryCacheInterface =
+  ## メモリキャッシュインターフェースを作成
+  result = MemoryCacheInterface(
+    options: options,
+    stats: CacheStats(),
+    entries: initTable[string, CacheEntry](),
+    accessTimes: initTable[string, Time](),
+    currentSize: 0
+  )
+
+method get*(cache: MemoryCacheInterface, url: string): Future[Option[CacheEntry]] {.async.} =
+  ## メモリキャッシュからエントリを取得
+  cache.stats.requests += 1
+  
+  if url in cache.entries:
+    let entry = cache.entries[url]
+    
+    # 有効期限チェック
+    if isEntryValid(entry):
+      cache.stats.hits += 1
+      cache.accessTimes[url] = getTime()
+      return some(entry)
+    else:
+      # 期限切れエントリを削除
+      cache.entries.del(url)
+      cache.accessTimes.del(url)
+      cache.currentSize -= entry.size
+  
+  cache.stats.misses += 1
+  return none(CacheEntry)
+
+method put*(cache: MemoryCacheInterface, entry: CacheEntry): Future[bool] {.async.} =
+  ## メモリキャッシュにエントリを保存
+  try:
+    # サイズ制限チェック
+    if cache.currentSize + entry.size > cache.options.maxSize:
+      await evictEntries(cache, entry.size)
+    
+    # エントリ数制限チェック
+    if cache.entries.len >= cache.options.maxEntries:
+      await evictOldestEntry(cache)
+    
+    # エントリを保存
+    cache.entries[entry.url] = entry
+    cache.accessTimes[entry.url] = getTime()
+    cache.currentSize += entry.size
+    cache.stats.stores += 1
+    
+    return true
+  except:
+    cache.stats.errors += 1
+    return false
+
+method delete*(cache: MemoryCacheInterface, url: string): Future[bool] {.async.} =
+  ## メモリキャッシュからエントリを削除
+  if url in cache.entries:
+    let entry = cache.entries[url]
+    cache.entries.del(url)
+    cache.accessTimes.del(url)
+    cache.currentSize -= entry.size
+    cache.stats.deletions += 1
+    return true
+  return false
+
+method clear*(cache: MemoryCacheInterface): Future[void] {.async.} =
+  ## メモリキャッシュをクリア
+  cache.entries.clear()
+  cache.accessTimes.clear()
+  cache.currentSize = 0
+  cache.stats = CacheStats()
+
+method size*(cache: MemoryCacheInterface): Future[int] {.async.} =
+  ## メモリキャッシュのサイズを取得
+  return cache.entries.len
+
+method contains*(cache: MemoryCacheInterface, url: string): Future[bool] {.async.} =
+  ## URLがメモリキャッシュに存在するかチェック
+  return url in cache.entries and isEntryValid(cache.entries[url])
+
+method getStats*(cache: MemoryCacheInterface): Future[CacheStats] {.async.} =
+  ## メモリキャッシュの統計情報を取得
+  cache.stats.currentSize = cache.currentSize
+  cache.stats.entryCount = cache.entries.len
   return cache.stats
 
-method getStatus*(cache: CacheInterface, url: string): Future[CacheEntryStatus] {.base, async.} =
-  ## URL指定でキャッシュエントリのステータスを取得
-  ## 抽象メソッド：サブクラスで実装する必要がある
-  raise newException(NotImplementedError, "Method not implemented")
-
-method purgeExpired*(cache: CacheInterface): Future[int] {.base, async.} =
-  ## 期限切れのキャッシュエントリを削除
-  ## 抽象メソッド：サブクラスで実装する必要がある
-  raise newException(NotImplementedError, "Method not implemented")
-
-method persist*(cache: CacheInterface): Future[bool] {.base, async.} =
-  ## キャッシュを永続化
-  ## 抽象メソッド：サブクラスで実装する必要がある
-  raise newException(NotImplementedError, "Method not implemented")
-
-method restore*(cache: CacheInterface): Future[bool] {.base, async.} =
-  ## キャッシュを復元
-  ## 抽象メソッド：サブクラスで実装する必要がある
-  raise newException(NotImplementedError, "Method not implemented")
-
-# ユーティリティ関数
-
-proc isExpired*(entry: CacheEntry): bool =
-  ## キャッシュエントリが期限切れかどうかを確認
-  return getTime() > entry.expiresAt
-
-proc isStale*(entry: CacheEntry): bool =
-  ## キャッシュエントリが古いかどうかを確認
-  # 期限切れだが、再検証すれば使用可能な状態
-  return isExpired(entry) and entry.validator != CacheValidator()
-
-proc getEntryStatus*(entry: CacheEntry): CacheEntryStatus =
-  ## キャッシュエントリのステータスを取得
-  if entry.isNil:
-    return cesInvalid
+method cleanup*(cache: MemoryCacheInterface): Future[void] {.async.} =
+  ## 期限切れエントリのクリーンアップ
+  var expiredUrls: seq[string] = @[]
   
-  if entry.policy == cpNoStore or entry.policy == cpNoCache:
-    return cesStale  # 常に再検証が必要
+  for url, entry in cache.entries:
+    if not isEntryValid(entry):
+      expiredUrls.add(url)
   
-  if isExpired(entry):
-    if isStale(entry):
-      return cesStale
-    else:
-      return cesExpired
-  
-  return cesValid
+  for url in expiredUrls:
+    discard await cache.delete(url)
 
-proc updateLastAccessed*(entry: CacheEntry) =
-  ## 最終アクセス時間を更新
-  entry.lastAccessed = getTime()
-  entry.accessCount += 1
+# DiskCacheInterface の実装
 
-proc calculateExpiryTime*(maxAge: int): Time =
-  ## 有効期限を計算
-  result = getTime() + initDuration(seconds = maxAge)
-
-proc createCacheValidator*(etag: string = "", lastModified: Time = Time()): CacheValidator =
-  ## キャッシュ検証情報を作成
-  result.etag = etag
-  if lastModified != Time():
-    result.lastModified = some(lastModified)
-
-proc createResourceEntry*(url: string, data: seq[byte], contentType: string, 
-                        maxAge: int = 3600, 
-                        policy: CachePolicy = cpPublic): ResourceCacheEntry =
-  ## リソースキャッシュエントリを作成
-  let now = getTime()
-  result = ResourceCacheEntry(
-    url: url,
-    entryType: cetResource,
-    created: now,
-    lastAccessed: now,
-    expiresAt: calculateExpiryTime(maxAge),
-    size: data.len,
-    accessCount: 0,
-    policy: policy,
-    priority: cpNormal,
-    validator: createCacheValidator(),
-    isCompressed: false,
-    data: data,
-    contentType: contentType,
-    contentEncoding: ""
+proc newDiskCacheInterface*(options: CacheOptions): DiskCacheInterface =
+  ## ディスクキャッシュインターフェースを作成
+  result = DiskCacheInterface(
+    options: options,
+    stats: CacheStats(),
+    cacheDir: options.persistencePath,
+    indexFile: options.persistencePath / "index.json",
+    entries: initTable[string, CacheEntry]()
   )
+  
+  # キャッシュディレクトリを作成
+  createDir(result.cacheDir)
+  
+  # インデックスファイルを読み込み
+  asyncCheck result.loadIndex()
 
-proc createResponseEntry*(url: string, statusCode: int, headers: seq[tuple[name: string, value: string]], 
-                         body: seq[byte], maxAge: int = 3600): ResponseCacheEntry =
-  ## HTTPレスポンスキャッシュエントリを作成
-  let now = getTime()
+method get*(cache: DiskCacheInterface, url: string): Future[Option[CacheEntry]] {.async.} =
+  ## ディスクキャッシュからエントリを取得
+  cache.stats.requests += 1
   
-  # キャッシュポリシーを決定
-  var policy = cpPublic
-  var directives: seq[CacheDirective] = @[]
-  var validator = createCacheValidator()
-  
-  # ヘッダーからキャッシュ関連情報を抽出
-  for header in headers:
-    case header.name.toLowerAscii()
-    of "cache-control":
-      let parts = header.value.split(",")
-      for part in parts:
-        let trimmed = part.strip()
-        if trimmed == "no-store":
-          policy = cpNoStore
-        elif trimmed == "no-cache":
-          policy = cpNoCache
-        elif trimmed == "private":
-          policy = cpPrivate
-        elif trimmed == "public":
-          policy = cpPublic
-        elif trimmed == "immutable":
-          policy = cpImmutable
+  if url in cache.entries:
+    let entry = cache.entries[url]
+    
+    # 有効期限チェック
+    if isEntryValid(entry):
+      # ディスクからデータを読み込み
+      let filePath = cache.cacheDir / entry.hash
+      if fileExists(filePath):
+        let data = readFile(filePath)
+        var fullEntry = entry
+        fullEntry.data = data.toBytes()
         
-        if "=" in trimmed:
-          let keyValue = trimmed.split("=", 1)
-          directives.add(CacheDirective(name: keyValue[0].strip(), value: keyValue[1].strip()))
-        else:
-          directives.add(CacheDirective(name: trimmed, value: ""))
-    
-    of "etag":
-      validator.etag = header.value
-    
-    of "last-modified":
-      try:
-        # HTTP日付形式のパース
-        # ここではシンプル化のため未実装
-        discard
-      except:
-        discard
+        cache.stats.hits += 1
+        return some(fullEntry)
+    else:
+      # 期限切れエントリを削除
+      discard await cache.delete(url)
   
-  result = ResponseCacheEntry(
-    url: url,
-    entryType: cetResponse,
-    created: now,
-    lastAccessed: now,
-    expiresAt: calculateExpiryTime(maxAge),
-    size: body.len + headers.len * 64, # 概算
-    accessCount: 0,
-    policy: policy,
-    priority: cpNormal,
-    validator: validator,
-    isCompressed: false,
-    directives: directives,
-    statusCode: statusCode,
-    headers: headers,
-    body: body
+  cache.stats.misses += 1
+  return none(CacheEntry)
+
+method put*(cache: DiskCacheInterface, entry: CacheEntry): Future[bool] {.async.} =
+  ## ディスクキャッシュにエントリを保存
+  try:
+    # ファイルパスを生成
+    let filePath = cache.cacheDir / entry.hash
+    
+    # データをディスクに保存
+    writeFile(filePath, entry.data.toString())
+    
+    # インデックスに追加
+    var indexEntry = entry
+    indexEntry.data = @[]  # インデックスにはデータを保存しない
+    cache.entries[entry.url] = indexEntry
+    
+    # インデックスファイルを更新
+    await cache.saveIndex()
+    
+    cache.stats.stores += 1
+    return true
+  except:
+    cache.stats.errors += 1
+    return false
+
+method delete*(cache: DiskCacheInterface, url: string): Future[bool] {.async.} =
+  ## ディスクキャッシュからエントリを削除
+  if url in cache.entries:
+    let entry = cache.entries[url]
+    let filePath = cache.cacheDir / entry.hash
+    
+    # ファイルを削除
+    if fileExists(filePath):
+      removeFile(filePath)
+    
+    # インデックスから削除
+    cache.entries.del(url)
+    await cache.saveIndex()
+    
+    cache.stats.deletions += 1
+    return true
+  return false
+
+method clear*(cache: DiskCacheInterface): Future[void] {.async.} =
+  ## ディスクキャッシュをクリア
+  # すべてのキャッシュファイルを削除
+  for url, entry in cache.entries:
+    let filePath = cache.cacheDir / entry.hash
+    if fileExists(filePath):
+      removeFile(filePath)
+  
+  # インデックスをクリア
+  cache.entries.clear()
+  await cache.saveIndex()
+  cache.stats = CacheStats()
+
+method size*(cache: DiskCacheInterface): Future[int] {.async.} =
+  ## ディスクキャッシュのサイズを取得
+  return cache.entries.len
+
+method contains*(cache: DiskCacheInterface, url: string): Future[bool] {.async.} =
+  ## URLがディスクキャッシュに存在するかチェック
+  return url in cache.entries and isEntryValid(cache.entries[url])
+
+method getStats*(cache: DiskCacheInterface): Future[CacheStats] {.async.} =
+  ## ディスクキャッシュの統計情報を取得
+  cache.stats.entryCount = cache.entries.len
+  return cache.stats
+
+method cleanup*(cache: DiskCacheInterface): Future[void] {.async.} =
+  ## 期限切れエントリのクリーンアップ
+  var expiredUrls: seq[string] = @[]
+  
+  for url, entry in cache.entries:
+    if not isEntryValid(entry):
+      expiredUrls.add(url)
+  
+  for url in expiredUrls:
+    discard await cache.delete(url)
+
+# HybridCacheInterface の実装
+
+proc newHybridCacheInterface*(options: CacheOptions): HybridCacheInterface =
+  ## ハイブリッドキャッシュインターフェースを作成
+  var memoryOptions = options
+  memoryOptions.maxSize = options.maxSize div 4  # メモリは全体の1/4
+  
+  var diskOptions = options
+  diskOptions.maxSize = options.maxSize  # ディスクは全体サイズ
+  
+  result = HybridCacheInterface(
+    options: options,
+    stats: CacheStats(),
+    memoryCache: newMemoryCacheInterface(memoryOptions),
+    diskCache: newDiskCacheInterface(diskOptions),
+    memoryThreshold: 1024 * 1024  # 1MB以下はメモリに保存
   )
 
-proc defaultCacheOptions*(): CacheOptions =
-  ## デフォルトのキャッシュオプションを取得
-  result = CacheOptions(
-    maxSize: 100 * 1024 * 1024, # 100MB
-    maxEntries: 10000,
-    defaultTtl: 3600, # 1時間
-    storageType: cstMemory,
-    evictionPolicy: cepLRU,
-    compressionEnabled: true,
-    persistenceEnabled: false,
-    persistencePath: ""
-  ) 
+method get*(cache: HybridCacheInterface, url: string): Future[Option[CacheEntry]] {.async.} =
+  ## ハイブリッドキャッシュからエントリを取得
+  cache.stats.requests += 1
+  
+  # まずメモリキャッシュを確認
+  let memoryResult = await cache.memoryCache.get(url)
+  if memoryResult.isSome:
+    cache.stats.hits += 1
+    return memoryResult
+  
+  # 次にディスクキャッシュを確認
+  let diskResult = await cache.diskCache.get(url)
+  if diskResult.isSome:
+    let entry = diskResult.get()
+    
+    # 小さなエントリはメモリにプロモート
+    if entry.size <= cache.memoryThreshold:
+      discard await cache.memoryCache.put(entry)
+    
+    cache.stats.hits += 1
+    return diskResult
+  
+  cache.stats.misses += 1
+  return none(CacheEntry)
+
+method put*(cache: HybridCacheInterface, entry: CacheEntry): Future[bool] {.async.} =
+  ## ハイブリッドキャッシュにエントリを保存
+  if entry.size <= cache.memoryThreshold:
+    # 小さなエントリはメモリに保存
+    let result = await cache.memoryCache.put(entry)
+    if result:
+      cache.stats.stores += 1
+    else:
+      cache.stats.errors += 1
+    return result
+  else:
+    # 大きなエントリはディスクに保存
+    let result = await cache.diskCache.put(entry)
+    if result:
+      cache.stats.stores += 1
+    else:
+      cache.stats.errors += 1
+    return result
+
+method delete*(cache: HybridCacheInterface, url: string): Future[bool] {.async.} =
+  ## ハイブリッドキャッシュからエントリを削除
+  let memoryResult = await cache.memoryCache.delete(url)
+  let diskResult = await cache.diskCache.delete(url)
+  
+  if memoryResult or diskResult:
+    cache.stats.deletions += 1
+    return true
+  return false
+
+method clear*(cache: HybridCacheInterface): Future[void] {.async.} =
+  ## ハイブリッドキャッシュをクリア
+  await cache.memoryCache.clear()
+  await cache.diskCache.clear()
+  cache.stats = CacheStats()
+
+method size*(cache: HybridCacheInterface): Future[int] {.async.} =
+  ## ハイブリッドキャッシュのサイズを取得
+  let memorySize = await cache.memoryCache.size()
+  let diskSize = await cache.diskCache.size()
+  return memorySize + diskSize
+
+method contains*(cache: HybridCacheInterface, url: string): Future[bool] {.async.} =
+  ## URLがハイブリッドキャッシュに存在するかチェック
+  let memoryContains = await cache.memoryCache.contains(url)
+  if memoryContains:
+    return true
+  return await cache.diskCache.contains(url)
+
+method getStats*(cache: HybridCacheInterface): Future[CacheStats] {.async.} =
+  ## ハイブリッドキャッシュの統計情報を取得
+  let memoryStats = await cache.memoryCache.getStats()
+  let diskStats = await cache.diskCache.getStats()
+  
+  cache.stats.hits = memoryStats.hits + diskStats.hits
+  cache.stats.misses = memoryStats.misses + diskStats.misses
+  cache.stats.stores = memoryStats.stores + diskStats.stores
+  cache.stats.deletions = memoryStats.deletions + diskStats.deletions
+  cache.stats.errors = memoryStats.errors + diskStats.errors
+  cache.stats.entryCount = memoryStats.entryCount + diskStats.entryCount
+  cache.stats.currentSize = memoryStats.currentSize + diskStats.currentSize
+  
+  return cache.stats
+
+method cleanup*(cache: HybridCacheInterface): Future[void] {.async.} =
+  ## 期限切れエントリのクリーンアップ
+  await cache.memoryCache.cleanup()
+  await cache.diskCache.cleanup()
+
+# ヘルパー関数
+
+proc evictEntries(cache: MemoryCacheInterface, requiredSize: int): Future[void] {.async.} =
+  ## LRU方式でエントリを削除
+  var sortedEntries: seq[tuple[url: string, time: Time]] = @[]
+  
+  for url, time in cache.accessTimes:
+    sortedEntries.add((url, time))
+  
+  sortedEntries.sort(proc(a, b: tuple[url: string, time: Time]): int =
+    cmp(a.time, b.time)
+  )
+  
+  var freedSize = 0
+  for entry in sortedEntries:
+    if freedSize >= requiredSize:
+      break
+    
+    let cacheEntry = cache.entries[entry.url]
+    freedSize += cacheEntry.size
+    discard await cache.delete(entry.url)
+
+proc evictOldestEntry(cache: MemoryCacheInterface): Future[void] {.async.} =
+  ## 最も古いエントリを削除
+  var oldestUrl = ""
+  var oldestTime = getTime()
+  
+  for url, time in cache.accessTimes:
+    if time < oldestTime:
+      oldestTime = time
+      oldestUrl = url
+  
+  if oldestUrl != "":
+    discard await cache.delete(oldestUrl)
+
+proc loadIndex(cache: DiskCacheInterface): Future[void] {.async.} =
+  ## インデックスファイルを読み込み
+  if fileExists(cache.indexFile):
+    try:
+      let content = readFile(cache.indexFile)
+      let jsonNode = parseJson(content)
+      
+      for url, entryNode in jsonNode:
+        let entry = CacheEntry(
+          url: url,
+          hash: entryNode["hash"].getStr(),
+          headers: initTable[string, string](),
+          data: @[],
+          size: entryNode["size"].getInt(),
+          createdAt: fromUnix(entryNode["createdAt"].getInt()),
+          expiresAt: fromUnix(entryNode["expiresAt"].getInt()),
+          lastModified: if entryNode.hasKey("lastModified"): some(fromUnix(entryNode["lastModified"].getInt())) else: none(Time),
+          etag: if entryNode.hasKey("etag"): some(entryNode["etag"].getStr()) else: none(string)
+        )
+        
+        # ヘッダーを復元
+        if entryNode.hasKey("headers"):
+          for key, value in entryNode["headers"]:
+            entry.headers[key] = value.getStr()
+        
+        cache.entries[url] = entry
+    except:
+      # インデックスファイルが破損している場合は無視
+      discard
+
+proc saveIndex(cache: DiskCacheInterface): Future[void] {.async.} =
+  ## インデックスファイルを保存
+  var jsonNode = newJObject()
+  
+  for url, entry in cache.entries:
+    var entryNode = newJObject()
+    entryNode["hash"] = newJString(entry.hash)
+    entryNode["size"] = newJInt(entry.size)
+    entryNode["createdAt"] = newJInt(entry.createdAt.toUnix())
+    entryNode["expiresAt"] = newJInt(entry.expiresAt.toUnix())
+    
+    if entry.lastModified.isSome:
+      entryNode["lastModified"] = newJInt(entry.lastModified.get().toUnix())
+    
+    if entry.etag.isSome:
+      entryNode["etag"] = newJString(entry.etag.get())
+    
+    # ヘッダーを保存
+    var headersNode = newJObject()
+    for key, value in entry.headers:
+      headersNode[key] = newJString(value)
+    entryNode["headers"] = headersNode
+    
+    jsonNode[url] = entryNode
+  
+  writeFile(cache.indexFile, $jsonNode)
+
+# エクスポート
+export CacheInterface, MemoryCacheInterface, DiskCacheInterface, HybridCacheInterface
+export newMemoryCacheInterface, newDiskCacheInterface, newHybridCacheInterface 

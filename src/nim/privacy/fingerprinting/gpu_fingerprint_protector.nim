@@ -276,11 +276,72 @@ proc hashString(s: string): int =
   result = abs(h)
 
 # シェーダー処理関連
-proc hashShader*(shaderSource: string): string =
-  ## シェーダーソースコードのハッシュを計算
-  ## 単純なハッシュ計算（実際の実装ではもっと堅牢な方法を使用）
-  let h = hashString(shaderSource)
-  return $h
+proc calculateShaderHash*(shader: string): string =
+  ## シェーダーコードからハッシュを計算
+  ## 
+  ## Parameters:
+  ## - shader: シェーダーコード
+  ## 
+  ## Returns:
+  ## - シェーダーのハッシュ値（16進数文字列）
+  
+  # HMAC-SHA256を使用した堅牢なハッシュ計算
+  import nimcrypto/[hash, hmac, sha2]
+  
+  # シェーダーコードの前処理（コメントと空白の正規化）
+  var normalizedShader = shader
+  
+  # 単一行コメントの削除
+  var i = 0
+  while i < normalizedShader.len:
+    if i+1 < normalizedShader.len and normalizedShader[i] == '/' and normalizedShader[i+1] == '/':
+      var j = i
+      while j < normalizedShader.len and normalizedShader[j] != '\n':
+        j += 1
+      normalizedShader.delete(i, j-1)
+    else:
+      i += 1
+  
+  # 複数行コメントの削除
+  i = 0
+  while i < normalizedShader.len:
+    if i+1 < normalizedShader.len and normalizedShader[i] == '/' and normalizedShader[i+1] == '*':
+      var j = i + 2
+      while j+1 < normalizedShader.len and (normalizedShader[j] != '*' or normalizedShader[j+1] != '/'):
+        j += 1
+      if j+1 < normalizedShader.len:
+        normalizedShader.delete(i, j+1)
+      else:
+        normalizedShader.delete(i, normalizedShader.len-1)
+    else:
+      i += 1
+  
+  # 連続する空白を1つに
+  var result = ""
+  var lastWasSpace = false
+  
+  for c in normalizedShader:
+    if c in [' ', '\t', '\n', '\r']:
+      if not lastWasSpace:
+        result.add(' ')
+        lastWasSpace = true
+    else:
+      result.add(c)
+      lastWasSpace = false
+  
+  # HMAC-SHA256によるハッシュ計算
+  # 固定されたキーを使用（実際の環境では安全なキー管理が必要）
+  const secretKey = "Quantum_Browser_Shader_Hash_Key_v1"
+  
+  var ctx: HMAC[sha256]
+  ctx.init(secretKey)
+  ctx.update(result)
+  
+  # ハッシュ値を16進数文字列に変換
+  result = $ctx.finish()
+  
+  # セキュリティ強化のため256ビット全体を使用せず、前半128ビットのみを使用
+  return result[0..31]
 
 proc applyShaderTransformation*(
   shaderSource: string, 
@@ -296,7 +357,7 @@ proc applyShaderTransformation*(
   let noiseLevelStr = formatFloat(noiseLevel, ffDecimal, 6)
   
   # シードの生成（セッションキーとシェーダーハッシュから決定論的に生成）
-  let shaderHash = hashShader(shaderSource)
+  let shaderHash = calculateShaderHash(shaderSource)
   let seed = hashString(sessionKey & shaderHash) mod 10000
   let seedStr = $seed & ".0, " & $(seed mod 137) & ".0"
   
@@ -445,17 +506,30 @@ proc whitelistShader*(protector: GpuFingerprintProtector, shaderHash: string) =
   ## 特定のシェーダーを保護対象外に追加
   protector.shaderHashWhitelist.incl(shaderHash)
 
-proc isShaderWhitelisted*(protector: GpuFingerprintProtector, shaderSource: string): bool =
-  ## シェーダーが保護対象外かどうか
-  let hash = hashShader(shaderSource)
-  return hash in protector.shaderHashWhitelist
+proc isShaderAllowed*(protector: GpuFingerprintProtector, shader: string): bool =
+  ## シェーダーが許可リストに含まれているかチェック
+  ##
+  ## Parameters:
+  ## - shader: チェックするシェーダーコード
+  ##
+  ## Returns:
+  ## - 許可されていればtrue、そうでなければfalse
+  
+  if not protector.enabled:
+    return true
+  
+  # シェーダーのハッシュを計算
+  let shaderHash = calculateShaderHash(shader)
+  
+  # 許可リストにあるかチェック
+  return shaderHash in protector.shaderHashWhitelist
 
 proc selectShaderNoiseMethod*(
   protector: GpuFingerprintProtector, 
   shaderSource: string
 ): ShaderNoiseMethod =
   ## シェーダーに適用するノイズメソッドを選択
-  if not protector.enabled or protector.isShaderWhitelisted(shaderSource):
+  if not protector.enabled or protector.isShaderAllowed(shaderSource):
     return snmNone
   
   # シェーダーの特性に基づいてノイズメソッドを選択
@@ -466,7 +540,7 @@ proc selectShaderNoiseMethod*(
                          shaderSource.contains("varying "))
   
   # シェーダーハッシュを用いて決定論的に選択
-  let hash = hashShader(shaderSource)
+  let hash = calculateShaderHash(shaderSource)
   let methodSeed = protector.sessionKey & hash
   let methodIdx = deterministicRandom(methodSeed, 0, 3)
   
@@ -492,7 +566,7 @@ proc transformShader*(
   shaderSource: string
 ): string =
   ## シェーダーを変換してフィンガープリントを防止
-  if not protector.enabled or protector.isShaderWhitelisted(shaderSource):
+  if not protector.enabled or protector.isShaderAllowed(shaderSource):
     return shaderSource
   
   let noiseMethod = protector.selectShaderNoiseMethod(shaderSource)
@@ -593,6 +667,58 @@ proc getProtectionStatus*(protector: GpuFingerprintProtector): JsonNode =
     },
     "whitelistedShaders": protector.shaderHashWhitelist.len
   }
+
+# WebGLコンテキストの偽装プロファイルを生成
+proc generateSpoofedWebGLProfile*(protector: GpuFingerprintProtector): WebGLProfile =
+  ## ユーザーのセッションに対して一貫したWebGLプロファイルを生成
+  ##
+  ## Returns:
+  ## - 偽装されたWebGLプロファイル
+
+  # セッションキーに基づいた擬似乱数生成器を初期化
+  var rng = initRand(protector.sessionKey.hash)
+  
+  # 標準プロファイルからランダムに選択
+  let baseProfile = STANDARD_WEBGL_PROFILES[rng.rand(STANDARD_WEBGL_PROFILES.len - 1)]
+  
+  # 基本プロファイルをコピー
+  var profile = baseProfile
+  
+  # 一貫性維持のためセッションキーに基づいて微調整
+  if protector.uniformNoiseLevel > 0.0:
+    # サポート拡張を数個ランダムに削除
+    let extensionsToKeep = rng.rand(profile.supportedExtensions.len - 3) + 3
+    profile.supportedExtensions = profile.supportedExtensions[0..<extensionsToKeep]
+    
+    # リソース上限値を微調整
+    let textureSizeVariation = int(float(profile.maxTextureSize) * protector.uniformNoiseLevel * 0.1)
+    profile.maxTextureSize = profile.maxTextureSize - rng.rand(textureSizeVariation)
+    
+    let cubeMapSizeVariation = int(float(profile.maxCubeMapTextureSize) * protector.uniformNoiseLevel * 0.1)
+    profile.maxCubeMapTextureSize = profile.maxCubeMapTextureSize - rng.rand(cubeMapSizeVariation)
+    
+    let renderBufferSizeVariation = int(float(profile.maxRenderbufferSize) * protector.uniformNoiseLevel * 0.1)
+    profile.maxRenderbufferSize = profile.maxRenderbufferSize - rng.rand(renderBufferSizeVariation)
+    
+    # ユニフォーム変数数の微調整
+    let vertexUniformVariation = int(float(profile.maxVertexUniformVectors) * protector.uniformNoiseLevel * 0.1)
+    profile.maxVertexUniformVectors = profile.maxVertexUniformVectors - rng.rand(vertexUniformVariation)
+    
+    let fragmentUniformVariation = int(float(profile.maxFragmentUniformVectors) * protector.uniformNoiseLevel * 0.1)
+    profile.maxFragmentUniformVectors = profile.maxFragmentUniformVectors - rng.rand(fragmentUniformVariation)
+  
+  # プロファイルにブラウザ指紋対策の証拠を残さないよう、微妙に乱数の影響を加える
+  if rng.rand(100) < 30:  # 30%の確率でアンチエイリアシング設定を反転
+    profile.antialiasing = not profile.antialiasing
+  
+  # 最大値が妥当な範囲内になるよう調整
+  profile.maxTextureSize = max(4096, profile.maxTextureSize)
+  profile.maxCubeMapTextureSize = max(4096, profile.maxCubeMapTextureSize)
+  profile.maxRenderbufferSize = max(4096, profile.maxRenderbufferSize)
+  profile.maxVertexUniformVectors = max(128, profile.maxVertexUniformVectors)
+  profile.maxFragmentUniformVectors = max(128, profile.maxFragmentUniformVectors)
+  
+  return profile
 
 when isMainModule:
   # テスト用コード

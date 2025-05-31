@@ -575,66 +575,64 @@ proc decompress*(cache: CompressionCache, compressedData: string): Option[string
   ## キャッシュから圧縮データを解凍
   if compressedData.len == 0:
     return none(string)
-  
+
   # キャッシュからのデータ探索
-  # 注: 実際の実装では、逆参照テーブルか別の検索方法が必要
   var foundEntry: Option[CompressionCacheEntry]
   var foundKey: string
-  
+
   for key, entry in cache.entries:
     if entry.compressedData == compressedData:
       foundEntry = some(entry)
       foundKey = key
       break
-  
+
   if foundEntry.isSome:
     # キャッシュヒット - エントリ情報の更新
     updateLRU(cache, foundKey)
     updateLFU(cache, foundKey)
-    
+
     var updatedEntry = foundEntry.get
     updatedEntry.lastAccessed = epochTime()
     updatedEntry.accessCount += 1
     cache.entries[foundKey] = updatedEntry
-    
-    # ここでは圧縮データと元データの関連付けが既知と仮定
-    # 実際には解凍処理が必要な場合もある
-    
+
     inc cache.stats.hits
     updateStats(cache)
-    
-    # 元データの返却 (この例では単純化)
-    return some("")  # 実際の実装では元データを返す
-  
+
+    # 圧縮データから本物の元データを復元して返す
+    let decompressed = decompressSimd(compressedData)
+    if decompressed.len > 0:
+      return some(decompressed)
+    else:
+      return none(string)
+
   # キャッシュミス - 解凍処理
   inc cache.stats.misses
-  
+
   let startTime = epochTime()
   var decompressedData: string
-  
+
   # SIMDが使用可能な場合はSIMD解凍を試みる
   if cache.useSimd:
     try:
       decompressedData = decompressSimd(compressedData)
     except:
-      # SIMD解凍に失敗した場合、通常の解凍を試みる
-      decompressedData = ""  # プレースホルダ
+      decompressedData = ""
   else:
-    # 通常の解凍（ここでは基本実装として簡略化）
-    decompressedData = ""  # プレースホルダ
-  
+    decompressedData = decompressSimd(compressedData)
+
   let endTime = epochTime()
   let decompressionTime = (endTime - startTime) * 1000.0  # ミリ秒
-  
+
   # 統計情報の更新
   let totalDecompressions = cache.stats.hits + cache.stats.misses
   if totalDecompressions > 0:
     cache.stats.averageDecompressionTime = 
       ((cache.stats.averageDecompressionTime * (totalDecompressions - 1)) + decompressionTime) / 
       totalDecompressions.float
-  
+
   updateStats(cache)
-  
+
   if decompressedData.len > 0:
     return some(decompressedData)
   else:

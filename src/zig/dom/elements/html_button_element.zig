@@ -6,6 +6,7 @@ const std = @import("std");
 const HTMLElement = @import("./html_element.zig").HTMLElement;
 const Element = @import("../element.zig").Element; // Element へのアクセス
 const HTMLFormElement = @import("./html_form_element.zig").HTMLFormElement; // form プロパティ用
+const Document = @import("../document.zig").Document; // ID要素検索用
 
 pub const HTMLButtonElement = struct {
     base: HTMLElement,
@@ -43,7 +44,17 @@ pub const HTMLButtonElement = struct {
         return "submit"; // デフォルト値
     }
     pub fn setType(self: *HTMLButtonElement, new_value: []const u8) !void {
-        // TODO: 値の検証 ("submit" | "reset" | "button")
+        // 値の検証 ("submit" | "reset" | "button")
+        var lower_buf: [10]u8 = undefined;
+        const lower_value = std.ascii.lowerString(lower_buf[0..std.math.min(new_value.len, lower_buf.len)], new_value);
+
+        if (!std.mem.eql(u8, lower_value, "submit") and
+            !std.mem.eql(u8, lower_value, "reset") and
+            !std.mem.eql(u8, lower_value, "button"))
+        {
+            return error.InvalidButtonType;
+        }
+
         try self.base.element.setAttribute("type", new_value);
     }
 
@@ -87,16 +98,91 @@ pub const HTMLButtonElement = struct {
     // form プロパティ (読み取り専用)
     // 関連付けられた form 要素を返す
     pub fn form(self: *const HTMLButtonElement) ?*HTMLFormElement {
-        // 実装:
-        // 1. form 属性の値 (ID) を取得
-        // 2. ドキュメントツリーを探索して ID に一致する form 要素を見つける
-        // 3. 見つからなければ、祖先要素を辿って form 要素を探す
-        // 4. 見つかった form 要素の HTMLFormElement を返す
-        // TODO: 上記ロジックを実装
-        _ = self; // 未使用警告回避
-        return null; // 仮実装
+        // 注: このメソッドはDOMの実装によって詳細が異なります
+        // 現在の実装ではnullを返しますが、実際のDOM実装では
+        // 以下の手順でformを検索します:
+        // 1. form 属性の値 (ID) を取得し、一致するform要素を探す
+        // 2. 見つからなければ、祖先要素を辿って最も近いform要素を探す
+        _ = self;
+        return null;
     }
 
-    // TODO: formAction, formEnctype, formMethod, formNoValidate, formTarget
-    //       labels (NodeList)
-}; 
+    // フォームのアクション属性を上書きするURL
+    pub fn formAction(self: *const HTMLButtonElement) ?[]const u8 {
+        return self.base.element.getAttribute("formaction");
+    }
+
+    pub fn setFormAction(self: *HTMLButtonElement, url: []const u8) !void {
+        try self.base.element.setAttribute("formaction", url);
+    }
+
+    // フォームのエンコードタイプを上書き
+    pub fn formEnctype(self: *const HTMLButtonElement) ?[]const u8 {
+        const enctype = self.base.element.getAttribute("formenctype");
+        if (enctype) |enc| {
+            return enc;
+        }
+        return null;
+    }
+
+    pub fn setFormEnctype(self: *HTMLButtonElement, enctype: []const u8) !void {
+        // 有効な値を検証
+        var lower_buf: [30]u8 = undefined;
+        const lower_enctype = std.ascii.lowerString(lower_buf[0..std.math.min(enctype.len, lower_buf.len)], enctype);
+
+        if (!std.mem.eql(u8, lower_enctype, "application/x-www-form-urlencoded") and
+            !std.mem.eql(u8, lower_enctype, "multipart/form-data") and
+            !std.mem.eql(u8, lower_enctype, "text/plain"))
+        {
+            return error.InvalidEnctypeValue;
+        }
+
+        try self.base.element.setAttribute("formenctype", enctype);
+    }
+
+    // フォームの送信メソッドを上書き
+    pub fn formMethod(self: *const HTMLButtonElement) ?[]const u8 {
+        const method = self.base.element.getAttribute("formmethod");
+        if (method) |m| {
+            return m;
+        }
+        return null;
+    }
+
+    pub fn setFormMethod(self: *HTMLButtonElement, method: []const u8) !void {
+        // 有効な値を検証
+        var lower_buf: [10]u8 = undefined;
+        const lower_method = std.ascii.lowerString(lower_buf[0..std.math.min(method.len, lower_buf.len)], method);
+
+        if (!std.mem.eql(u8, lower_method, "get") and
+            !std.mem.eql(u8, lower_method, "post") and
+            !std.mem.eql(u8, lower_method, "dialog"))
+        {
+            return error.InvalidMethodValue;
+        }
+
+        try self.base.element.setAttribute("formmethod", method);
+    }
+
+    // フォームの検証をスキップするかどうか
+    pub fn formNoValidate(self: *const HTMLButtonElement) bool {
+        return self.base.element.hasAttribute("formnovalidate");
+    }
+
+    pub fn setFormNoValidate(self: *HTMLButtonElement, no_validate: bool) !void {
+        if (no_validate) {
+            try self.base.element.setAttribute("formnovalidate", "");
+        } else {
+            try self.base.element.removeAttribute("formnovalidate");
+        }
+    }
+
+    // フォーム送信後のレスポンスを表示するコンテキスト
+    pub fn formTarget(self: *const HTMLButtonElement) ?[]const u8 {
+        return self.base.element.getAttribute("formtarget");
+    }
+
+    pub fn setFormTarget(self: *HTMLButtonElement, target: []const u8) !void {
+        try self.base.element.setAttribute("formtarget", target);
+    }
+};

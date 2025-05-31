@@ -247,10 +247,8 @@ module QuantumUI
         input_y = y
         
         if mouse_x >= input_x && mouse_x <= input_x + input_width && mouse_y >= input_y && mouse_y <= input_y + input_height
-          # 実際の実装ではテキスト入力モードに入る処理が必要
-          # ここではデモとして値を変更
-          @value = "編集中..." if @value.empty?
-          @on_change.try &.call(@value)
+          # テキスト入力モードに遷移
+          QuantumUI::TextInputManager.instance.start_input(field_id: @current_field)
           return true
         end
         

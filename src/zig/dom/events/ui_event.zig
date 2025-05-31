@@ -7,8 +7,77 @@ const Event = @import("../../events/event.zig").Event;
 const EventInit = @import("../../events/event.zig").EventInit;
 const EventConcreteType = @import("../../events/event.zig").EventConcreteType;
 const time = std.time; // time をインポート
+const builtin = @import("builtin");
 // Window 型が必要になるが、循環参照を避けるか前方宣言を使う
 // const Window = @import("../window/window.zig").Window;
+
+// プラットフォーム固有のロックキー状態取得機能
+const platform = struct {
+    // CapsLock の状態を取得する
+    fn getCapsLockState() bool {
+        // OSに基づいて実装を切り替え
+        if (builtin.os.tag == .windows) {
+            // Windows実装
+            // GetKeyState(VK_CAPITAL) & 0x0001 != 0
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .linux) {
+            // Linux実装
+            // XKeyboard拡張またはX11のキーマップ状態から取得
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .macos) {
+            // macOS実装
+            // IOKit または CG API を使用
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .wasi or builtin.os.tag == .emscripten) {
+            // WebAssembly環境では、JavaScriptからの状態を確認する必要がある
+            return false; // 現在はダミー実装
+        }
+
+        return false; // 未対応プラットフォーム
+    }
+
+    // NumLock の状態を取得する
+    fn getNumLockState() bool {
+        // OSに基づいて実装を切り替え
+        if (builtin.os.tag == .windows) {
+            // Windows実装
+            // GetKeyState(VK_NUMLOCK) & 0x0001 != 0
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .linux) {
+            // Linux実装
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .macos) {
+            // macOS実装
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .wasi or builtin.os.tag == .emscripten) {
+            // WebAssembly環境
+            return false; // 現在はダミー実装
+        }
+
+        return false; // 未対応プラットフォーム
+    }
+
+    // ScrollLock の状態を取得する
+    fn getScrollLockState() bool {
+        // OSに基づいて実装を切り替え
+        if (builtin.os.tag == .windows) {
+            // Windows実装
+            // GetKeyState(VK_SCROLL) & 0x0001 != 0
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .linux) {
+            // Linux実装
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .macos) {
+            // macOS実装
+            return false; // 現在はダミー実装
+        } else if (builtin.os.tag == .wasi or builtin.os.tag == .emscripten) {
+            // WebAssembly環境
+            return false; // 現在はダミー実装
+        }
+
+        return false; // 未対応プラットフォーム
+    }
+};
 
 // UIEventInit ディクショナリ
 // https://uievents.spec.whatwg.org/#dictdef-uieventinit
@@ -71,7 +140,7 @@ pub const UIEvent = struct {
         //    -> Event に追加するか、UIEvent に追加するか？
         //       MouseEvent/KeyboardEvent Init で定義されるため、UIEvent が持つのが自然。
 
-        // --- 再修正: UIEvent に修飾キーフィールドを追加 --- 
+        // --- 再修正: UIEvent に修飾キーフィールドを追加 ---
         // (フィールド定義を元に戻す)
         ui_event.ctrlKey = init.ctrlKey;
         ui_event.shiftKey = init.shiftKey;
@@ -99,11 +168,15 @@ pub const UIEvent = struct {
             return self.shiftKey;
         } else if (std.mem.eql(u8, key_arg, "Meta")) {
             return self.metaKey;
+        } else if (std.mem.eql(u8, key_arg, "CapsLock")) {
+            return platform.getCapsLockState();
+        } else if (std.mem.eql(u8, key_arg, "NumLock")) {
+            return platform.getNumLockState();
+        } else if (std.mem.eql(u8, key_arg, "ScrollLock")) {
+            return platform.getScrollLockState();
         } else {
-            // TODO: CapsLock, NumLock, ScrollLock など
-            // これらのキーの状態はプラットフォーム固有の方法で取得する必要がある。
-            // 例: if (std.mem.eql(u8, key_arg, "CapsLock")) { return platform.getCapsLockState(); }
-            return false; 
+            // その他の修飾キーは未サポート
+            return false;
         }
     }
 
@@ -113,7 +186,7 @@ pub const UIEvent = struct {
 // テスト
 test "UIEvent creation" {
     const allocator = std.testing.allocator;
-    const init = UIEventInit {
+    const init = UIEventInit{
         .bubbles = true,
         .cancelable = false,
         .detail = 2,
@@ -127,14 +200,14 @@ test "UIEvent creation" {
     try std.testing.expectEqualStrings("dblclick", event.base.type);
     try std.testing.expect(event.base.bubbles == true);
     try std.testing.expect(event.base.concrete_type == .UI); // 型タグを確認
-    
+
     // UIEvent 固有のプロパティを確認
     try std.testing.expect(event.view == null);
     try std.testing.expect(event.detail == 2);
-    try std.testing.expect(event.ctrlKey == true); 
+    try std.testing.expect(event.ctrlKey == true);
     try std.testing.expect(event.metaKey == false);
 
     // getModifierState のテスト
     try std.testing.expect(event.getModifierState("Control"));
     try std.testing.expect(!event.getModifierState("Meta"));
-} 
+}

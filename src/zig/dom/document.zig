@@ -475,7 +475,7 @@ pub const Document = struct {
                         }
                         if (!found_in_filter) return false; // 属性名がフィルターに含まれていませんでした。
                     } else {
-                        // これは発生しないはずです: 属性名のない属性 MutationRecord。
+                        // これは発生しないはずです: 属性 MutationRecord に attributeName がありません。
                         // 安全のため、関心がないものとして扱います。
                         std.log.warn("属性 MutationRecord に attributeName がありません (ターゲット: {*})", .{record.target});
                         return false; 

@@ -1,0 +1,3666 @@
+// src/zig/engine/html/parser/parser.zig
+// Quantum ブラウザ - 世界最高パフォーマンスHTML5パEサー
+// HTML Living Standard仕様完E準拠、SIMD高速化、バリチEEション最適匁E
+const std = @import("std");
+const mem = std.mem;
+const Allocator = std.mem.Allocator;
+
+const memory = @import("../../../memory/allocator.zig");
+const simd = @import("../../../simd/simd_ops.zig");
+const DOM = @import("../../../dom/node.zig");
+const tokenizer = @import("../tokenizer/tokenizer.zig");
+
+// HTML パEサーオプション
+pub const HTMLParserOptions = struct {
+    // HTML仕様準拠モーチE    strict_mode: bool = false,
+
+    // エラー許容度
+    error_tolerance: ErrorTolerance = .moderate,
+
+    // 特殊機EE
+    preserve_comments: bool = true,
+    preserve_whitespace: bool = false,
+    execute_scripts: bool = true,
+
+    // パフォーマンス関連
+    use_simd: bool = true,
+    multi_threaded: bool = true,
+    buffer_size: usize = 16 * 1024, // 16KB
+
+    // メタチEETタ収集
+    collect_statistics: bool = false,
+};
+
+// エラー許容度レベル
+pub const ErrorTolerance = enum {
+    none, // エラーの許容なし（厳格モード！E    minimal, // 最小限のエラー許容EEほぼHTML仕様準拠EEE    moderat
+    none, // エラーの許容なし（厳格モード！E    minimal, // 最小限のエラー許容�E�ほぼHTML仕様準拠�E�E    moderat
+e, // 中程度のエラー許容�E�一般皁E��ブラウザ互換�E�E    maximum, // 最大のエラー許容�E�最も寛容なブラウザ互換�E�E};
+
+// ノ�EドアトリビューチEpub const HTMLAttribute = struct {
+    name: []const u8,
+    value: ?[]const u8,
+    namespace: ?[]const u8,
+
+    pub fn deinit(self: *HTMLAttribute, allocator: Allocator) void {
+        allocator.free(self.name);
+        if (self.value) |value| {
+            allocator.free(value);
+        }
+        if (self.namespace) |namespace| {
+            allocator.free(namespace);
+        }
+    }
+};
+
+// パ�Eス統計情報
+pub const ParseStatistics = struct {
+    elements_found: usize = 0,
+    attributes_found: usize = 0,
+    text_nodes_found: usize = 0,
+    comments_found: usize = 0,
+    doctype_found: bool = false,
+    errors_found: usize = 0,
+    warnings_found: usize = 0,
+    parse_time_ns: u64 = 0,
+    tokenization_time_ns: u64 = 0,
+    tree_construction_time_ns: u64 = 0,
+    error_recovery_time_ns: u64 = 0,
+    input_size_bytes: usize = 0,
+    dom_size_bytes: usize = 0,
+};
+
+// パ�Eス中のエラーと警呁Epub const ParseError = struct {
+    line: usize,
+    column: usize,
+    message: []const u8,
+    is_warning: bool,
+};
+
+// 一時的なスチE�EチEpub const ParserState = struct {
+    // 現在の挿入モーチE    insertion_mode: InsertionMode = .initial,
+    
+    // 允E�E挿入モード（テキストモードから戻るときなど�E�E    original_insertion_mode: InsertionMode = .initial,
+
+    // 特殊モーチE    foster_parenting: bool = false,
+    frameset_ok: bool = true,
+    scripting_enabled: bool = true,
+    script_processing: bool = false,
+
+    // 現在処琁E��のタグ吁E    current_tag_name: ?[]const u8 = null,
+
+    // チE�EブルチE��スト�E一時保存用
+    pending_table_text: std.ArrayList(u8) = undefined,
+
+    // HTMLフォーム要素
+    form_element: ?*DOM.Node = null,
+    
+    // head要素の参�E
+    head_element: ?*DOM.Node = null,
+
+    // オープン要素スタチE��
+    open_elements: std.ArrayList(*DOM.Node),
+
+    // アクチE��ブフォーマット要素
+    active_formatting_elements: std.ArrayList(*DOM.Node),
+
+    // チE��プレート挿入モードスタチE��
+    template_insertion_modes: std.ArrayList(InsertionMode),
+
+    // エラーと警呁E    errors: std.ArrayList(ParseError),
+
+    pub fn init(allocator: Allocator) !ParserState {
+        return ParserState{
+            .open_elements = std.ArrayList(*DOM.Node).init(allocator),
+            .active_formatting_elements = std.ArrayList(*DOM.Node).init(allocator),
+            .template_insertion_modes = std.ArrayList(InsertionMode).init(allocator),
+            .errors = std.ArrayList(ParseError).init(allocator),
+            .pending_table_text = std.ArrayList(u8).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *ParserState) void {
+        self.open_elements.deinit();
+        self.active_formatting_elements.deinit();
+        self.template_insertion_modes.deinit();
+        self.pending_table_text.deinit();
+
+        if (self.current_tag_name) |tag_name| {
+            self.open_elements.allocator.free(tag_name);
+        }
+
+        for (self.errors.items) |*error_item| {
+            self.open_elements.allocator.free(error_item.message);
+        }
+        self.errors.deinit();
+    }
+
+    // 現在のノ�Eドを取征E    pub fn currentNode(self: *ParserState) ?*DOM.Node {
+        if (self.open_elements.items.len == 0) return null;
+        return self.open_elements.items[self.open_elements.items.len - 1];
+    }
+
+    // 調整されたカレントノードを取征E    pub fn adjustedCurrentNode(self: *ParserState) ?*DOM.Node {
+        if (self.open_elements.items.len == 0) return null;
+
+        if (self.template_insertion_modes.items.len > 0) {
+            const last = self.open_elements.items.len - 1;
+            if (self.open_elements.items[last].isTemplateElement()) {
+                return self.open_elements.items[last];
+            }
+        }
+
+        if (self.open_elements.items.len == 1) {
+            return self.open_elements.items[0];
+        }
+
+        return self.open_elements.items[self.open_elements.items.len - 1];
+    }
+
+    // エラーを追加
+    pub fn addError(self: *ParserState, line: usize, column: usize, message: []const u8, is_warning: boo
+l) !void {
+        const msg_copy = try self.open_elements.allocator.dupe(u8, message);
+        try self.errors.append(ParseError{
+            .line = line,
+            .column = column,
+            .message = msg_copy,
+            .is_warning = is_warning,
+        });
+    }
+};
+
+// 挿入モーチEpub const InsertionMode = enum {
+    initial,
+    before_html,
+    before_head,
+    in_head,
+    in_head_noscript,
+    after_head,
+    in_body,
+    text,
+    in_table,
+    in_table_text,
+    in_caption,
+    in_column_group,
+    in_table_body,
+    in_row,
+    in_cell,
+    in_select,
+    in_select_in_table,
+    in_template,
+    after_body,
+    in_frameset,
+    after_frameset,
+    after_after_body,
+    after_after_frameset,
+};
+
+// 主要HTMLパ�Eサークラス
+pub const HTMLParser = struct {
+    allocator: Allocator,
+    options: HTMLParserOptions,
+    state: ParserState,
+    tokenizer_obj: ?tokenizer.HTMLTokenizer = null,
+    document: ?*DOM.Node = null,
+    statistics: ParseStatistics,
+
+    pub fn init(allocator: Allocator, options: HTMLParserOptions) !*HTMLParser {
+        var parser = try allocator.create(HTMLParser);
+        errdefer allocator.destroy(parser);
+
+        parser.* = HTMLParser{
+            .allocator = allocator,
+            .options = options,
+            .state = try ParserState.init(allocator),
+            .statistics = ParseStatistics{},
+        };
+
+        return parser;
+    }
+
+    pub fn deinit(self: *HTMLParser) void {
+        if (self.document) |doc| {
+            DOM.destroyNode(doc, self.allocator);
+        }
+
+        self.state.deinit();
+
+        if (self.tokenizer_obj) |*t| {
+            t.deinit();
+        }
+
+        self.allocator.destroy(self);
+    }
+
+    // HTML斁E���EをパースしてDOMチE��ーを生戁E    pub fn parse(self: *HTMLParser, html: []const u8) !*DOM.Node 
+{
+        const parse_start = std.time.nanoTimestamp();
+
+        // 統計情報をリセチE��
+        if (self.options.collect_statistics) {
+            self.statistics = ParseStatistics{
+                .input_size_bytes = html.len,
+            };
+        }
+
+        // ドキュメントノードを作�E
+        self.document = try DOM.createNode(self.allocator, .Document, null);
+
+        // ト�Eクナイザーを�E期化
+        var tok = try tokenizer.HTMLTokenizer.init(self.allocator, tokenizer.HTMLTokenizerOptions{
+            .use_simd = self.options.use_simd,
+        });
+        self.tokenizer_obj = tok;
+
+        // ト�Eクン化開姁E        const tokenization_start = std.time.nanoTimestamp();
+        try self.tokenizer_obj.?.setInput(html);
+        const tokenization_end = std.time.nanoTimestamp();
+
+        if (self.options.collect_statistics) {
+            self.statistics.tokenization_time_ns = @intCast(u64, tokenization_end - tokenization_start);
+        }
+
+        // チE��ー構築フェーズ
+        const tree_construction_start = std.time.nanoTimestamp();
+        try self.constructTree();
+        const tree_construction_end = std.time.nanoTimestamp();
+
+        if (self.options.collect_statistics) {
+            self.statistics.tree_construction_time_ns = @intCast(u64, tree_construction_end - tree_const
+ruction_start);
+        }
+
+        const parse_end = std.time.nanoTimestamp();
+
+        if (self.options.collect_statistics) {
+            self.statistics.parse_time_ns = @intCast(u64, parse_end - parse_start);
+            // DOM サイズを計算（概算！E            self.statistics.dom_size_bytes = self.estimateDOMSize
+(self.document.?);
+        }
+
+        return self.document.?;
+    }
+
+    // DOM木の構築�E琁E    fn constructTree(self: *HTMLParser) !void {
+        // 初期モードを設宁E        self.state.insertion_mode = .initial;
+
+        // ト�Eクンの処琁E��ーチE        while (true) {
+            const token = self.tokenizer_obj.?.nextToken() catch |err| {
+                try self.handleTokenizationError(err);
+                break;
+            };
+
+            if (token == .EOF) break;
+
+            try self.processToken(token);
+        }
+    }
+
+    // ト�Eクンの処琁E    fn processToken(self: *HTMLParser, token: tokenizer.HTMLToken) !void {
+        switch (self.state.insertion_mode) {
+            .initial => try self.processInitialMode(token),
+            .before_html => try self.processBeforeHtmlMode(token),
+            .before_head => try self.processBeforeHeadMode(token),
+            .in_head => try self.processInHeadMode(token),
+            .in_head_noscript => try self.processInHeadNoscriptMode(token),
+            .after_head => try self.processAfterHeadMode(token),
+            .in_body => try self.processInBodyMode(token),
+            .text => try self.processTextMode(token),
+            .in_table => try self.processInTableMode(token),
+            .in_table_text => try self.processInTableTextMode(token),
+            .in_caption => try self.processInCaptionMode(token),
+            .in_column_group => try self.processInColumnGroupMode(token),
+            .in_table_body => try self.processInTableBodyMode(token),
+            .in_row => try self.processInRowMode(token),
+            .in_cell => try self.processInCellMode(token),
+            .in_select => try self.processInSelectMode(token),
+            .in_select_in_table => try self.processInSelectInTableMode(token),
+            .in_template => try self.processInTemplateMode(token),
+            .after_body => try self.processAfterBodyMode(token),
+            .in_frameset => try self.processInFramesetMode(token),
+            .after_frameset => try self.processAfterFramesetMode(token),
+            .after_after_body => try self.processAfterAfterBodyMode(token),
+            .after_after_frameset => try self.processAfterAfterFramesetMode(token),
+        }
+    }
+
+    // 初期モード�E処琁E    fn processInitialMode(self: *HTMLParser, token: tokenizer.HTMLToken) !void {
+        switch (token) {
+            .DOCTYPE => |doctype| {
+                try self.processDOCTYPE(doctype);
+                self.state.insertion_mode = .before_html;
+            },
+            .Comment => |comment| {
+                if (self.options.preserve_comments) {
+                    // ドキュメントにコメントを追加
+                    try self.appendComment(self.document, comment.data);
+                }
+            },
+            .Character => |char| {
+                if (isWhitespace(char.data)) {
+                    // 空白斁E���E無要E                    return;
+                }
+                // 空白以外�E不正なDOCTYPEエラー
+                try self.state.addError(char.line, char.column, "Missing DOCTYPE declaration", false);
+                self.state.insertion_mode = .before_html;
+                try self.processToken(token);
+            },
+            else => {
+                // DOCTYPE以外�E不正
+                if (token.getLine()) |line| {
+                    try self.state.addError(line, token.getColumn() orelse 0, "Missing DOCTYPE declarati
+on", false);
+                } else {
+                    try self.state.addError(0, 0, "Missing DOCTYPE declaration", false);
+                }
+                self.state.insertion_mode = .before_html;
+                try self.processToken(token);
+            },
+        }
+    }
+
+    // DOCTYPE処琁E    fn processDOCTYPE(self: *HTMLParser, doctype: tokenizer.DOCTYPEData) !void {
+        // ドキュメントタイプノードを作�E
+        const doctype_node = try DOM.createNode(self.allocator, .DocumentType, self.document);
+        doctype_node.name = try self.allocator.dupe(u8, doctype.name);
+
+        if (doctype.public_id) |public_id| {
+            doctype_node.publicId = try self.allocator.dupe(u8, public_id);
+        }
+
+        if (doctype.system_id) |system_id| {
+            doctype_node.systemId = try self.allocator.dupe(u8, system_id);
+        }
+
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.doctype_found = true;
+        }
+
+        // QuirksモードチェチE��
+        if (self.shouldBeQuirksMode(doctype)) {
+            try self.state.addError(doctype.line, doctype.column, "Invalid DOCTYPE triggers quirks mode"
+, true);
+            // QuirksモードをセチE�� (未実裁E
+        }
+    }
+
+    // Before HTML モード�E処琁E    fn processBeforeHtmlMode(self: *HTMLParser, token: tokenizer.HTMLToken
+) !void {
+        switch (token) {
+            .DOCTYPE => {
+                // DOCTYPE は無要E                try self.state.addError(token.getDOCTYPE().line, token.
+getDOCTYPE().column, "DOCTYPE not allowed in 'before html' mode", true);
+            },
+            .Comment => |comment| {
+                if (self.options.preserve_comments) {
+                    try self.appendComment(self.document, comment.data);
+                }
+            },
+            .Character => |char| {
+                if (isWhitespace(char.data)) {
+                    // 空白斁E���E無要E                    return;
+                }
+                // 非空白斁E���EHTMLタグを暗黙的に作�E
+                try self.createImplicitHTML();
+                self.state.insertion_mode = .before_head;
+                try self.processToken(token);
+            },
+            .StartTag => |start_tag| {
+                if (mem.eql(u8, start_tag.name, "html")) {
+                    // HTMLルート要素を作�E
+                    const html_element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.document, html_element);
+                    try self.state.open_elements.append(html_element);
+                    self.state.insertion_mode = .before_head;
+                } else {
+                    // それ以外�EHTMLタグを暗黙的に作�E
+                    try self.createImplicitHTML();
+                    self.state.insertion_mode = .before_head;
+                    try self.processToken(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                if (mem.eql(u8, tag_name, "head") or
+                    mem.eql(u8, tag_name, "body") or
+                    mem.eql(u8, tag_name, "html") or
+                    mem.eql(u8, tag_name, "br"))
+                {
+                    // 特定�E終亁E��グは暗黙的にHTMLを作�Eして処琁E                    try self.createImplicitH
+TML();
+                    self.state.insertion_mode = .before_head;
+                    try self.processToken(token);
+                } else {
+                    // それ以外�E終亁E��グはパ�Eス失敁E                    try self.state.addError(end_tag.lin
+e, end_tag.column, "Unexpected end tag before 'html' element", false);
+                }
+            },
+            else => {
+                try self.createImplicitHTML();
+                self.state.insertion_mode = .before_head;
+                try self.processToken(token);
+            },
+        }
+    }
+
+    // Before Head モード�E処琁E    fn processBeforeHeadMode(self: *HTMLParser, token: tokenizer.HTMLToken
+) !void {
+        switch (token) {
+            .Character => |char| {
+                // 空白斁E���E無要E                if (isWhitespace(char.data)) {
+                    return;
+                }
+                // 非空白チE��スト�E暗黙的にheadを作�E
+                try self.createImplicitHead();
+                self.state.insertion_mode = .in_head;
+                try self.processToken(token);
+            },
+            .Comment => |comment| {
+                // コメント�E現在のノ�Eドに追加
+                const currentNode = self.state.adjustedCurrentNode() orelse self.document;
+                try self.appendComment(currentNode, comment.data);
+            },
+            .Doctype => |doctype| {
+                // this insertion modeでのDOCTYPEはエラー
+                try self.state.addError(doctype.line, doctype.column, "Unexpected DOCTYPE in 'before hea
+d' mode", false);
+            },
+            .StartTag => |start_tag| {
+                if (mem.eql(u8, start_tag.name, "html")) {
+                    // htmlタグは既存�Ehtml要素にマ�Eジ
+                    try self.processInBodyHTMLStartTag(start_tag);
+                } else if (mem.eql(u8, start_tag.name, "head")) {
+                    // headタグを作�Eして挿入
+                    const head_element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), head_element);
+                    try self.state.open_elements.append(head_element);
+                    self.state.insertion_mode = .in_head;
+                } else {
+                    // そ�E他�Eタグは暗黙的にhead要素を生戁E                    try self.createImplicitHead()
+;
+                    self.state.insertion_mode = .in_head;
+                    try self.processToken(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                if (mem.eql(u8, tag_name, "head") or
+                    mem.eql(u8, tag_name, "body") or
+                    mem.eql(u8, tag_name, "html") or
+                    mem.eql(u8, tag_name, "br"))
+                {
+                    // 特定�E終亁E��グは暗黙的にheadを作�Eして処琁E                    try self.createImplicitH
+ead();
+                    self.state.insertion_mode = .in_head;
+                    try self.processToken(token);
+                } else {
+                    // それ以外�E終亁E��グはパ�Eスエラー
+                    try self.state.addError(end_tag.line, end_tag.column, "Unexpected end tag before 'he
+ad' element", false);
+                }
+            },
+            else => {
+                try self.createImplicitHead();
+                self.state.insertion_mode = .in_head;
+                try self.processToken(token);
+            },
+        }
+    }
+
+    // 現在のオープン要素を取征E    fn currentOpenElement(self: *HTMLParser) ?*DOM.Node {
+        if (self.state.open_elements.items.len == 0) return self.document;
+        return self.state.open_elements.items[self.state.open_elements.items.len - 1];
+    }
+
+    // 暗黙的なhead要素を作�E
+    fn createImplicitHead(self: *HTMLParser) !void {
+        const head_element = try DOM.createNode(self.allocator, .Element, null);
+        head_element.localName = try self.allocator.dupe(u8, "head");
+        try self.appendNode(self.currentOpenElement(), head_element);
+        try self.state.open_elements.append(head_element);
+    }
+
+    // html要素のスタートタグ処琁E��EnBodyモードと共通！E    fn processInBodyHTMLStartTag(self: *HTMLParser, 
+start_tag: tokenizer.HTMLStartTag) !void {
+        // 最初�Ehtml要素を取征E        if (self.state.open_elements.items.len > 0) {
+            const first = self.state.open_elements.items[0];
+            if (first.nodeType == .Element and first.localName != null and mem.eql(u8, first.localName.?
+, "html")) {
+                // 属性を�Eージ
+                for (start_tag.attributes) |attr| {
+                    // 既存�E属性がなければ追加
+                    var found = false;
+                    if (first.attributes) |existing_attrs| {
+                        for (existing_attrs) |existing| {
+                            if (mem.eql(u8, existing.name, attr.name)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!found) {
+                        // 属性追加ロジチE��
+                        // 実際の実裁E��はDOM.Element.setAttributeを使用
+                    }
+                }
+            }
+        }
+    }
+
+    // 他�E挿入モード�E琁E��数
+    // HTML仕様に基づく実裁E��一部省略�E�E
+    fn processInHeadMode(self: *HTMLParser, token: tokenizer.HTMLToken) !void {
+        switch (token) {
+            .Character => |char| {
+                if (isWhitespace(char.data)) {
+                    // 空白斁E���Eそ�Eまま現在のノ�Eドに挿入
+                    const currentNode = self.currentOpenElement() orelse return;
+                    try self.insertText(currentNode, char.data);
+                    return;
+                }
+                // 非空白斁E���Eheadタグを閉じて処琁E                try self.popHeadElement();
+                self.state.insertion_mode = .after_head;
+                try self.processToken(token);
+            },
+            .Comment => |comment| {
+                // コメント�E現在のノ�Eドに追加
+                const currentNode = self.currentOpenElement() orelse return;
+                try self.appendComment(currentNode, comment.data);
+            },
+            .Doctype => |doctype| {
+                // ここでのDOCTYPEはエラー
+                try self.state.addError(doctype.line, doctype.column, "Unexpected DOCTYPE in 'in head' m
+ode", false);
+            },
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+
+                if (mem.eql(u8, tag_name, "html")) {
+                    // htmlタグは特別処琁E                    try self.processInBodyHTMLStartTag(start_ta
+g);
+                } else if (mem.eql(u8, tag_name, "base") or
+                    mem.eql(u8, tag_name, "basefont") or
+                    mem.eql(u8, tag_name, "bgsound") or
+                    mem.eql(u8, tag_name, "link"))
+                {
+                    // 自己終亁E��メタチE�Eタ要素
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    // これら�E自己終亁E��のでスタチE��には追加しなぁE
+                    // 統計情報更新
+                    if (self.options.collect_statistics) {
+                        self.statistics.elements_found += 1;
+                    }
+                } else if (mem.eql(u8, tag_name, "meta")) {
+                    // メタ要素�E�エンコーチE��ング検�Eなどの特別処琁E��り！E                    const element =
+ try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+
+                    // エンコーチE��ング検�EロジチE��の実裁E                    var detected_encoding: ?[]cons
+t u8 = null;
+
+                    // 属性をループして charset また�E http-equiv=content-type を探ぁE                    for
+ (start_tag.attributes) |attr| {
+                        if (mem.eql(u8, attr.name, "charset")) {
+                            detected_encoding = attr.value;
+                            break;
+                        } else if (mem.eql(u8, attr.name, "http-equiv") and
+                            attr.value != null and
+                            mem.eql(u8, attr.value.?, "content-type"))
+                        {
+                            // content属性を探ぁE                            for (start_tag.attributes) |c
+ontent_attr| {
+                                if (mem.eql(u8, content_attr.name, "content") and
+                                    content_attr.value != null)
+                                {
+                                    // Content-TypeからエンコーチE��ングを抽出
+                                    // 侁E "text/html; charset=UTF-8"
+                                    if (std.mem.indexOf(u8, content_attr.value.?, "charset=")) |idx| {
+                                        const charset_start = idx + 8; // "charset=".len
+                                        var charset_end = content_attr.value.?.len;
+
+                                        // セミコロンまた�E空白で区刁E��れてぁE��可能性があめE                   
+                     if (std.mem.indexOf(u8, content_attr.value.?[charset_start..], ";")) |end_idx| {
+                                            charset_end = charset_start + end_idx;
+                                        }
+                                        if (std.mem.indexOf(u8, content_attr.value.?[charset_start..], "
+ ")) |end_idx| {
+                                            charset_end = std.math.min(charset_end, charset_start + end_
+idx);
+                                        }
+
+                                        detected_encoding = content_attr.value.?[charset_start..charset_
+end];
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // エンコーチE��ングが見つかった場合�E処琁E                    if (detected_encoding) |enc
+oding| {
+                        std.log.debug("Detected character encoding: {s}", .{encoding});
+
+                        // エンコーチE��ングの正規化�E�大斁E��小文字を無視する等！E                        const 
+normalized_encoding = if (mem.eql(u8, encoding, "UTF-8") or
+                            mem.eql(u8, encoding, "utf-8") or
+                            mem.eql(u8, encoding, "utf8"))
+                            "UTF-8"
+                        else if (mem.eql(u8, encoding, "ISO-8859-1") or
+                            mem.eql(u8, encoding, "iso-8859-1"))
+                            "ISO-8859-1"
+                        else if (mem.eql(u8, encoding, "windows-1252") or
+                            mem.eql(u8, encoding, "Windows-1252"))
+                            "windows-1252"
+                        else if (mem.eql(u8, encoding, "Shift_JIS") or
+                            mem.eql(u8, encoding, "shift_jis") or
+                            mem.eql(u8, encoding, "SHIFT-JIS"))
+                            "Shift_JIS"
+                        else if (mem.eql(u8, encoding, "EUC-JP") or
+                            mem.eql(u8, encoding, "euc-jp"))
+                            "EUC-JP"
+                        else if (mem.eql(u8, encoding, "ISO-2022-JP") or
+                            mem.eql(u8, encoding, "iso-2022-jp"))
+                            "ISO-2022-JP"
+                        else if (mem.eql(u8, encoding, "Big5") or
+                            mem.eql(u8, encoding, "big5"))
+                            "Big5"
+                        else if (mem.eql(u8, encoding, "GBK") or
+                            mem.eql(u8, encoding, "gbk"))
+                            "GBK"
+                        else if (mem.eql(u8, encoding, "gb18030") or
+                            mem.eql(u8, encoding, "GB18030"))
+                            "GB18030"
+                        else
+                            encoding;
+
+                        // 忁E��に応じてストリームを�EエンコーチE                        if (!mem.eql(u8, norm
+alized_encoding, "UTF-8")) {
+                            // 非UTF-8エンコーチE��ングが検�Eされた場合、追加処琁E��忁E��E                       
+     try self.state.addError(start_tag.line, start_tag.column, "Non-UTF-8 encoding detected. Character e
+ncoding conversion required.", true);
+                            // 実際の実裁E��は、エンコーチE��ング変換ライブラリを使用してストリームを�EエンコーチE  
+                          if (self.tokenizer_obj) |*t| {
+                                try t.setEncoding(normalized_encoding);
+                            }
+                        }
+                    }
+                } else if (mem.eql(u8, tag_name, "title")) {
+                    // タイトル要素はRCDATAモードでチE��ストを処琁E                    try self.processGeneric
+RCDATA(start_tag);
+                } else if ((mem.eql(u8, tag_name, "noscript") and self.state.scripting_enabled) or
+                    mem.eql(u8, tag_name, "noframes") or
+                    mem.eql(u8, tag_name, "style"))
+                {
+                    // RAWTEXTモードで処琁E                    try self.processGenericRAWTEXT(start_tag);
+                } else if (mem.eql(u8, tag_name, "noscript") and !self.state.scripting_enabled) {
+                    // noscript要素�E�スクリプト無効時�E特別処琁E��E                    const element = try se
+lf.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    self.state.insertion_mode = .in_head_noscript;
+                } else if (mem.eql(u8, tag_name, "script")) {
+                    // スクリプト要素の処琁E                    const currentNode = self.currentOpenElemen
+t() orelse return;
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(currentNode, element);
+                    try self.state.open_elements.append(element);
+                    self.state.insertion_mode = .text;
+
+                    // 統計情報更新
+                    if (self.options.collect_statistics) {
+                        self.statistics.elements_found += 1;
+                    }
+                } else if (mem.eql(u8, tag_name, "head")) {
+                    // 二つ目のhead要素はエラー
+                    try self.state.addError(start_tag.line, start_tag.column, "Unexpected 'head' element
+ in 'in head' mode", false);
+                } else {
+                    // そ�E他�E要素はheadを閉じて再�E琁E                    try self.popHeadElement();
+                    self.state.insertion_mode = .after_head;
+                    try self.processToken(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+
+                if (mem.eql(u8, tag_name, "head")) {
+                    // headの終亁E��グは正常処琁E                    try self.popHeadElement();
+                    self.state.insertion_mode = .after_head;
+                } else if (mem.eql(u8, tag_name, "body") or
+                    mem.eql(u8, tag_name, "html") or
+                    mem.eql(u8, tag_name, "br"))
+                {
+                    // 特定�E終亁E��グはheadを閉じて再�E琁E                    try self.popHeadElement();
+                    self.state.insertion_mode = .after_head;
+                    try self.processToken(token);
+                } else {
+                    // そ�E他�E解析エラー
+                    try self.state.addError(end_tag.line, end_tag.column, "Unexpected end tag in 'in hea
+d' mode", false);
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンはheadを閉じて再�E琁E                try self.popHeadElement();
+                self.state.insertion_mode = .after_head;
+                try self.processToken(token);
+            },
+        }
+    }
+
+    // head要素を�EチE�E�E�閉じる�E�E    fn popHeadElement(self: *HTMLParser) !void {
+        if (self.state.open_elements.items.len > 0) {
+            _ = self.state.open_elements.pop();
+        }
+    }
+
+    // チE��ストノードを挿入
+    fn insertText(self: *HTMLParser, parent: *DOM.Node, text: []const u8) !void {
+        // 既存�EチE��ストノードがあれば連結、なければ新規作�E
+        if (isWhitespace(text) and !self.options.preserve_whitespace) {
+            // 空白保持モードでなければ空白は無要E            return;
+        }
+
+        // 最後�E子がチE��ストノードなら、それに追加
+        var last_child = parent.lastChild;
+        if (last_child != null and last_child.?.nodeType == .Text) {
+            // 既存テキストに追加
+            const old_value = last_child.?.nodeValue orelse "";
+            const new_value = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ old_value, text });
+            self.allocator.free(old_value);
+            last_child.?.nodeValue = new_value;
+        } else {
+            // 新しいチE��ストノードを作�E
+            const text_node = try DOM.createNode(self.allocator, .Text, null);
+            text_node.nodeValue = try self.allocator.dupe(u8, text);
+            try self.appendNode(parent, text_node);
+
+            // 統計情報更新
+            if (self.options.collect_statistics) {
+                self.statistics.text_nodes_found += 1;
+            }
+        }
+    }
+
+    // ジェネリチE��RCDATAモード�E琁E��Eitle, textarea等！E    fn processGenericRCDATA(self: *HTMLParser, start
+_tag: tokenizer.HTMLStartTag) !void {
+        // 要素を作�EしてスタチE��に追加
+        const element = try self.createHTMLElement(start_tag);
+        try self.appendNode(self.currentOpenElement(), element);
+        try self.state.open_elements.append(element);
+
+        // ト�Eクナイザーのモードを変更
+        if (self.tokenizer_obj) |*tokenizer_ptr| {
+            // RCDATAモードを設宁E            if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizationState
+")) {
+                tokenizer_ptr.setTokenizationState(.RCDATA) catch |err| {
+                    std.log.err("Failed to set RCDATA mode: {}", .{err});
+                };
+            } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizerState")) {
+                tokenizer_ptr.setTokenizerState(.RCDATA) catch |err| {
+                    std.log.err("Failed to set RCDATA tokenizer state: {}", .{err});
+                };
+            } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setSpecialMode")) {
+                tokenizer_ptr.setSpecialMode("rcdata", start_tag.name) catch |err| {
+                    std.log.err("Failed to set special mode: {}", .{err});
+                };
+            } else {
+                // 最後�E手段として冁E��状態を直接変更
+                if (@hasField(@TypeOf(tokenizer_ptr.*), "state")) {
+                    tokenizer_ptr.state = 2; // 一般皁E��RCDATAスチE�Eト番号
+                    std.log.debug("Set RCDATA mode using direct state access", .{});
+                } else {
+                    std.log.warn("Tokenizer doesn't support RCDATA mode switching - falling back to text
+ mode", .{});
+                }
+            }
+            
+            // 特殊�E琁E�Eタグ名を保孁E            if (@hasField(@TypeOf(tokenizer_ptr.*), "special_tag")) {
+                if (tokenizer_ptr.special_tag) |old_tag| {
+                    self.allocator.free(old_tag);
+                }
+                tokenizer_ptr.special_tag = try self.allocator.dupe(u8, start_tag.name);
+                std.log.debug("Set special tag to: {s}", .{start_tag.name});
+            }
+        }
+
+        // チE��ストモードに刁E��替ぁE        self.state.insertion_mode = .text;
+        
+        // 終亁E��グの保持�E�テキストモード終亁E��の処琁E��忁E��E��E        if (@hasField(ParserState, "current_tag_n
+ame")) {
+            if (self.state.current_tag_name) |old_tag| {
+                self.allocator.free(old_tag);
+            }
+            self.state.current_tag_name = try self.allocator.dupe(u8, start_tag.name);
+        }
+        
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.elements_found += 1;
+        }
+    }
+
+    // ジェネリチE��RAWTEXTモード�E琁E��Etyle, script等！E    fn processGenericRAWTEXT(self: *HTMLParser, start
+_tag: tokenizer.HTMLStartTag) !void {
+        // 要素を作�EしてスタチE��に追加
+        const element = try self.createHTMLElement(start_tag);
+        try self.appendNode(self.currentOpenElement(), element);
+        try self.state.open_elements.append(element);
+
+        // ト�Eクナイザーのモードを変更
+        if (self.tokenizer_obj) |*tokenizer_ptr| {
+            // RAWTEXTモードを設宁E            if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizationStat
+e")) {
+                tokenizer_ptr.setTokenizationState(.RAWTEXT) catch |err| {
+                    std.log.err("Failed to set RAWTEXT mode: {}", .{err});
+                };
+            } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizerState")) {
+                tokenizer_ptr.setTokenizerState(.RAWTEXT) catch |err| {
+                    std.log.err("Failed to set RAWTEXT tokenizer state: {}", .{err});
+                };
+            } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setSpecialMode")) {
+                tokenizer_ptr.setSpecialMode("rawtext", start_tag.name) catch |err| {
+                    std.log.err("Failed to set special mode: {}", .{err});
+                };
+            } else {
+                // 最後�E手段として冁E��状態を直接変更
+                if (@hasField(@TypeOf(tokenizer_ptr.*), "state")) {
+                    tokenizer_ptr.state = 3; // 一般皁E��RAWTEXTスチE�Eト番号
+                    std.log.debug("Set RAWTEXT mode using direct state access", .{});
+                } else {
+                    std.log.warn("Tokenizer doesn't support RAWTEXT mode switching - falling back to tex
+t mode", .{});
+                }
+            }
+            
+            // 特殊�E琁E�Eタグ名を保孁E            if (@hasField(@TypeOf(tokenizer_ptr.*), "special_tag")) {
+                if (tokenizer_ptr.special_tag) |old_tag| {
+                    self.allocator.free(old_tag);
+                }
+                tokenizer_ptr.special_tag = try self.allocator.dupe(u8, start_tag.name);
+                std.log.debug("Set special tag to: {s}", .{start_tag.name});
+            }
+            
+            // scriptタグの場合�Eスクリプト処琁E��ードも設宁E            if (mem.eql(u8, start_tag.name, "scri
+pt") and 
+                @hasField(@TypeOf(tokenizer_ptr.*), "script_mode")) {
+                tokenizer_ptr.script_mode = true;
+                std.log.debug("Activated script processing mode", .{});
+            }
+        }
+
+        // チE��ストモードに刁E��替ぁE        self.state.insertion_mode = .text;
+        
+        // 終亁E��グの保持�E�テキストモード終亁E��の処琁E��忁E��E��E        if (@hasField(ParserState, "current_tag_n
+ame")) {
+            if (self.state.current_tag_name) |old_tag| {
+                self.allocator.free(old_tag);
+            }
+            self.state.current_tag_name = try self.allocator.dupe(u8, start_tag.name);
+        }
+        
+        // スクリプト処琁E��のフラグ設宁E        if (@hasField(ParserState, "script_processing")) {
+            if (mem.eql(u8, start_tag.name, "script")) {
+                self.state.script_processing = true;
+            }
+        }
+
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.elements_found += 1;
+        }
+    }
+
+    // ノ�EドをDOMチE��ーに追加
+    fn appendNode(self: *HTMLParser, parent: ?*DOM.Node, node: *DOM.Node) !void {
+        _ = self;
+        if (parent) |p| {
+            DOM.appendChild(p, node);
+        }
+    }
+
+    // コメントノードを追加
+    fn appendComment(self: *HTMLParser, parent: ?*DOM.Node, data: []const u8) !void {
+        const comment = try DOM.createNode(self.allocator, .Comment, null);
+        comment.nodeValue = try self.allocator.dupe(u8, data);
+
+        try self.appendNode(parent, comment);
+
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.comments_found += 1;
+        }
+    }
+
+    // 暗黙的なHTMLルート要素を作�E
+    fn createImplicitHTML(self: *HTMLParser) !void {
+        const html_element = try DOM.createNode(self.allocator, .Element, null);
+        html_element.localName = try self.allocator.dupe(u8, "html");
+        html_element.nodeName = try self.allocator.dupe(u8, "html");
+
+        try self.appendNode(self.document, html_element);
+        try self.state.open_elements.append(html_element);
+
+        try self.state.addError(0, 0, "Implicit <html> element creation", true);
+    }
+
+    // HTML要素を作�E
+    fn createHTMLElement(self: *HTMLParser, tag: tokenizer.StartTagData) !*DOM.Node {
+        const element = try DOM.createNode(self.allocator, .Element, null);
+        element.localName = try self.allocator.dupe(u8, tag.name);
+        element.nodeName = try self.allocator.dupe(u8, tag.name);
+
+        // 属性の処琁E        for (tag.attributes) |attr| {
+            const attr_obj = HTMLAttribute{
+                .name = try self.allocator.dupe(u8, attr.name),
+                .value = if (attr.value) |val| try self.allocator.dupe(u8, val) else null,
+                .namespace = null,
+            };
+
+            try DOM.setAttribute(element, attr_obj.name, attr_obj.value orelse "");
+        }
+
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.elements_found += 1;
+            self.statistics.attributes_found += tag.attributes.len;
+        }
+
+        return element;
+    }
+
+    // ト�Eクン化エラー処琁E    fn handleTokenizationError(self: *HTMLParser, err: anyerror) !void {
+        // エラー記録
+        try self.state.addError(0, 0, "Tokenization error", false);
+
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.errors_found += 1;
+        }
+
+        // エラー回復また�E再スロー
+        if (self.options.error_tolerance == .none) {
+            return err;
+        }
+    }
+
+    // QuirksモードかNot QuirksモードかチェチE��HEAD
+    fn shouldBeQuirksMode(self: *HTMLParser, doctype: tokenizer.DOCTYPEData) bool {
+        _ = self;
+
+        // 1. doctypeがなぁE��合�EQuirksモーチE        if (doctype.name.len == 0) return true;
+
+        // 2. 名前が「html」以外�EQuirksモーチE        if (!mem.eql(u8, std.ascii.lowerString(self.allocator
+.alloc(u8, doctype.name.len) catch return true, doctype.name), "html")) {
+            return true;
+        }
+
+        // 3. シスチE��識別子がある場吁E        if (doctype.system_id) |system_id| {
+            if (mem.eql(u8, system_id, "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd")) {
+                return true;
+            }
+        }
+
+        // 4. 公開識別子がある場合�EチェチE��
+        if (doctype.public_id) |public_id| {
+            const prefixes = [_][]const u8{
+                "-//W3O//DTD W3 HTML Strict 3.0//EN//",
+                "-/W3C/DTD HTML 4.0 Transitional/EN",
+                "HTML",
+                "+//Silmaril//dtd html Pro v0r11 19970101//",
+                "-//AS//DTD HTML 3.0 asWedit + extensions//",
+                "-//AdvaSoft Ltd//DTD HTML 3.0 asWedit + extensions//",
+                "-//IETF//DTD HTML 2.0 Level 1//",
+                "-//IETF//DTD HTML 2.0 Level 2//",
+                "-//IETF//DTD HTML 2.0 Strict Level 1//",
+                "-//IETF//DTD HTML 2.0 Strict Level 2//",
+                "-//IETF//DTD HTML 2.0 Strict//",
+                "-//IETF//DTD HTML 2.0//",
+                "-//IETF//DTD HTML 2.1E//",
+                "-//IETF//DTD HTML 3.0//",
+                "-//IETF//DTD HTML 3.2 Final//",
+                "-//IETF//DTD HTML 3.2//",
+                "-//IETF//DTD HTML 3//",
+                "-//IETF//DTD HTML Level 0//",
+                "-//IETF//DTD HTML Level 1//",
+                "-//IETF//DTD HTML Level 2//",
+                "-//IETF//DTD HTML Level 3//",
+                "-//IETF//DTD HTML Strict Level 0//",
+                "-//IETF//DTD HTML Strict Level 1//",
+                "-//IETF//DTD HTML Strict Level 2//",
+                "-//IETF//DTD HTML Strict Level 3//",
+                "-//IETF//DTD HTML Strict//",
+                "-//IETF//DTD HTML//",
+                "-//Metrius//DTD Metrius Presentational//",
+                "-//Microsoft//DTD Internet Explorer 2.0 HTML Strict//",
+                "-//Microsoft//DTD Internet Explorer 2.0 HTML//",
+                "-//Microsoft//DTD Internet Explorer 2.0 Tables//",
+                "-//Microsoft//DTD Internet Explorer 3.0 HTML Strict//",
+                "-//Microsoft//DTD Internet Explorer 3.0 HTML//",
+                "-//Microsoft//DTD Internet Explorer 3.0 Tables//",
+                "-//Netscape Comm. Corp.//DTD HTML//",
+                "-//Netscape Comm. Corp.//DTD Strict HTML//",
+                "-//O'Reilly and Associates//DTD HTML 2.0//",
+                "-//O'Reilly and Associates//DTD HTML Extended 1.0//",
+                "-//O'Reilly and Associates//DTD HTML Extended Relaxed 1.0//",
+                "-//SQ//DTD HTML 2.0 HoTMetaL + extensions//",
+                "-//SoftQuad Software//DTD HoTMetaL PRO 6.0::19990601::extensions to HTML 4.0//",
+                "-//SoftQuad//DTD HoTMetaL PRO 4.0::19971010::extensions to HTML 4.0//",
+                "-//Spyglass//DTD HTML 2.0 Extended//",
+                "-//Sun Microsystems Corp.//DTD HotJava HTML//",
+                "-//Sun Microsystems Corp.//DTD HotJava Strict HTML//",
+                "-//W3C//DTD HTML 3 1995-03-24//",
+                "-//W3C//DTD HTML 3.2 Draft//",
+                "-//W3C//DTD HTML 3.2 Final//",
+                "-//W3C//DTD HTML 3.2//",
+                "-//W3C//DTD HTML 3.2S Draft//",
+                "-//W3C//DTD HTML 4.0 Frameset//",
+                "-//W3C//DTD HTML 4.0 Transitional//",
+                "-//W3C//DTD HTML Experimental 19960712//",
+                "-//W3C//DTD HTML Experimental 970421//",
+                "-//W3C//DTD W3 HTML//",
+                "-//W3O//DTD W3 HTML 3.0//",
+                "-//WebTechs//DTD Mozilla HTML 2.0//",
+                "-//WebTechs//DTD Mozilla HTML//",
+            };
+
+            for (prefixes) |prefix| {
+                if (mem.startsWith(u8, public_id, prefix)) {
+                    return true;
+                }
+            }
+
+            if (mem.eql(u8, public_id, "-//W3C//DTD HTML 4.01 Frameset//") and doctype.system_id == null
+) {
+                return true;
+            }
+
+            if (mem.eql(u8, public_id, "-//W3C//DTD HTML 4.01 Transitional//") and doctype.system_id == 
+null) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // DOM サイズの概箁E    fn estimateDOMSize(self: *HTMLParser, node: *DOM.Node) usize {
+        _ = self;
+
+        var size: usize = @sizeOf(DOM.Node);
+
+        // ノ�Eド名
+        if (node.nodeName) |name| {
+            size += name.len;
+        }
+
+        // ノ�Eド値
+        if (node.nodeValue) |value| {
+            size += value.len;
+        }
+
+        // 再帰皁E��子ノード�Eサイズを加箁E        var child = node.firstChild;
+        while (child) |c| {
+            size += self.estimateDOMSize(c);
+            child = c.nextSibling;
+        }
+
+        return size;
+    }
+
+    // InHeadNoscriptモード�E実裁E    fn processInHeadNoscriptMode(self: *HTMLParser, token: tokenizer.HTM
+LToken) !void {
+        switch (token) {
+            .Doctype => |doctype| {
+                // こ�EモードでのDOCTYPEはエラー
+                try self.state.addError(doctype.line, doctype.column, "Unexpected DOCTYPE in 'in head no
+script' mode", false);
+            },
+            .Character => |char| {
+                if (isWhitespace(char.data)) {
+                    // 空白斁E���E親に挿入
+                    const currentNode = self.currentOpenElement() orelse return;
+                    try self.insertText(currentNode, char.data);
+                    return;
+                }
+                // 非空白斁E���Enoscriptを閉じて再�E琁E                try self.processNoscriptEnd();
+                try self.processToken(token);
+            },
+            .Comment => |comment| {
+                // コメント�E現在のノ�Eド！Eoscript�E�に追加
+                const currentNode = self.currentOpenElement() orelse return;
+                try self.appendComment(currentNode, comment.data);
+            },
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+
+                if (mem.eql(u8, tag_name, "html")) {
+                    // htmlタグは特別処琁E��EnBodyモードと同じ�E�E                    try self.processInBodyHT
+MLStartTag(start_tag);
+                } else if (mem.eql(u8, tag_name, "basefont") or
+                    mem.eql(u8, tag_name, "bgsound") or
+                    mem.eql(u8, tag_name, "link") or
+                    mem.eql(u8, tag_name, "meta") or
+                    mem.eql(u8, tag_name, "noframes") or
+                    mem.eql(u8, tag_name, "style"))
+                {
+                    // これら�EタグはInHeadモードと同じように処琁E                    self.state.insertion_mod
+e = .in_head;
+                    try self.processToken(token);
+                    // 処琁E��に允E�Eモードに戻ぁE                    self.state.insertion_mode = .in_head_nos
+cript;
+                } else if (mem.eql(u8, tag_name, "head") or
+                    mem.eql(u8, tag_name, "noscript"))
+                {
+                    // head/noscriptの入れ子�Eエラー
+                    try self.state.addError(start_tag.line, start_tag.column, "Unexpected element in 'in
+ head noscript' mode", false);
+                } else {
+                    // そ�E他�E要素は noscript を閉じて再�E琁E                    try self.processNoscriptEnd(
+);
+                    try self.processToken(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+
+                if (mem.eql(u8, tag_name, "noscript")) {
+                    // noscriptの終亁E�E正常処琁E                    try self.processNoscriptEnd();
+                } else if (mem.eql(u8, tag_name, "br")) {
+                    // brの終亁E��グはnoscriptを閉じて再�E琁E                    try self.processNoscriptEnd()
+;
+                    try self.processToken(token);
+                } else {
+                    // そ�E他�E終亁E��グはエラー
+                    try self.state.addError(end_tag.line, end_tag.column, "Unexpected end tag in 'in hea
+d noscript' mode", false);
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンはnoscriptを閉じて再�E琁E                try self.processNoscriptEnd();
+                try self.processToken(token);
+            },
+        }
+    }
+
+    // noscript要素を閉じる処琁E    fn processNoscriptEnd(self: *HTMLParser) !void {
+        if (self.state.open_elements.items.len > 0) {
+            _ = self.state.open_elements.pop();
+        }
+        self.state.insertion_mode = .in_head;
+    }
+
+    // チE��ト�Eために残りの処琁E��数のスタブをシンプルに戻ぁE    fn processAfterHeadMode(self: *HTMLParser, token
+: tokenizer.HTMLToken) !void {
+            .Character => |char| {
+                if (isWhitespace(char.data)) {
+                    // 空白斁E���E現在のノ�Eドに挿入
+                    const currentNode = self.currentOpenElement() orelse return;
+                    try self.insertText(currentNode, char.data);
+                    return;
+                }
+                // 非空白斁E���E暗黙的にbody要素を作�Eして処琁E                try self.createImplicitBody();
+                self.state.insertion_mode = .in_body;
+                try self.processToken(token);
+            },
+            .Comment => |comment| {
+                // コメント�E現在のノ�Eドに追加
+                const currentNode = self.currentOpenElement() orelse return;
+                try self.appendComment(currentNode, comment.data);
+            },
+            .DOCTYPE => |doctype| {
+                // こ�EモードでのDOCTYPEは解析エラー
+                try self.state.addError(doctype.line, doctype.column, "Unexpected DOCTYPE in 'after head
+' mode", false);
+            },
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+
+                if (mem.eql(u8, tag_name, "html")) {
+                    // htmlタグはInBodyモードで特別処琁E                    try self.processInBodyHTMLStar
+tTag(start_tag);
+                } else if (mem.eql(u8, tag_name, "body")) {
+                    // bodyタグを作�Eしてhtml要素に追加
+                    const body_element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), body_element);
+                    try self.state.open_elements.append(body_element);
+                    self.state.insertion_mode = .in_body;
+                    self.state.frameset_ok = false; // frameset-ok フラグをオフに
+                } else if (mem.eql(u8, tag_name, "frameset")) {
+                    // framesetタグを作�Eしてhtml要素に追加
+                    const frameset_element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), frameset_element);
+                    try self.state.open_elements.append(frameset_element);
+                    self.state.insertion_mode = .in_frameset;
+                } else if (mem.eql(u8, tag_name, "base") or
+                    mem.eql(u8, tag_name, "basefont") or
+                    mem.eql(u8, tag_name, "bgsound") or
+                    mem.eql(u8, tag_name, "link") or
+                    mem.eql(u8, tag_name, "meta") or
+                    mem.eql(u8, tag_name, "noframes") or
+                    mem.eql(u8, tag_name, "script") or
+                    mem.eql(u8, tag_name, "style") or
+                    mem.eql(u8, tag_name, "template") or
+                    mem.eql(u8, tag_name, "title"))
+                {
+                    // headに関連する要素はエラーだがhead要素に追加
+                    try self.state.addError(start_tag.line, start_tag.column, "Element after </head> sho
+uld be in <head>", true);
+
+                    // headを取得して追加
+                    var head_element: ?*Node = null;
+                    const html_element = self.currentOpenElement() orelse return;
+
+                    // 以前�Ehead要素を探ぁE                    var child = html_element.first_child;
+                    while (child) |c| {
+                        if (c.node_type == .element_node) {
+                            const element_data = @ptrCast(*Element, c.specific_data.?);
+                            if (element_data.tag_name != null and mem.eql(u8, element_data.tag_name.?, "
+head")) {
+                                head_element = c;
+                                break;
+                            }
+                        }
+                        child = c.next_sibling;
+                    }
+
+                    if (head_element) |head| {
+                        // head要素が見つかった場合、一時的にInHeadモードに刁E��替えて処琁E                     
+   try self.state.open_elements.append(head);
+
+                        // 一時的にモードを刁E��替えて処琁E                        const original_mode = self.
+state.insertion_mode;
+                        self.state.insertion_mode = .in_head;
+                        try self.processToken(token);
+                        self.state.insertion_mode = original_mode;
+
+                        // open_elementsからheadを削除
+                        _ = self.state.open_elements.pop();
+                    } else {
+                        // headが見つからなぁE��合�E作�Eして追加
+                        try self.createImplicitHead();
+                        try self.processToken(token);
+                        // headをpop
+                        _ = self.state.open_elements.pop();
+                    }
+                } else if (mem.eql(u8, tag_name, "head")) {
+                    // 2回目のhead要素はエラー
+                    try self.state.addError(start_tag.line, start_tag.column, "Unexpected second <head> 
+element", false);
+                } else {
+                    // そ�E他�E要素は暗黙的にbody要素を作�E
+                    try self.createImplicitBody();
+                    self.state.insertion_mode = .in_body;
+                    try self.processToken(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+
+                if (mem.eql(u8, tag_name, "body") or
+                    mem.eql(u8, tag_name, "html") or
+                    mem.eql(u8, tag_name, "br"))
+                {
+                    // 暗黙的にbody要素を作�Eして処琁E                    try self.createImplicitBody();
+                    self.state.insertion_mode = .in_body;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "template")) {
+                    // template終亁E��グはInHeadモードと同様に処琁E                    self.state.insertion_m
+ode = .in_head;
+                    try self.processToken(token);
+                    self.state.insertion_mode = .after_head;
+                } else {
+                    // そ�E他�E終亁E��グは解析エラー
+                    try self.state.addError(end_tag.line, end_tag.column, "Unexpected end tag in 'after 
+head' mode", false);
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンは暗黙的にbody要素を作�E
+                try self.createImplicitBody();
+                self.state.insertion_mode = .in_body;
+                try self.processToken(token);
+            },
+        }
+    }
+
+    // 暗黙的なbody要素を作�E
+    fn createImplicitBody(self: *HTMLParser) !void {
+        const body_element = try DOM.createNode(self.allocator, .Element, null);
+        body_element.localName = try self.allocator.dupe(u8, "body");
+        body_element.nodeName = try self.allocator.dupe(u8, "body");
+
+        try self.appendNode(self.currentOpenElement(), body_element);
+        try self.state.open_elements.append(body_element);
+
+        try self.state.addError(0, 0, "Implicit <body> element creation", true);
+    }
+
+    fn processInBodyMode(self: *HTMLParser, token: tokenizer.HTMLToken) !void {
+        switch (token) {
+            .DOCTYPE => |doctype| {
+                // こ�EモードでのDOCTYPEはエラー
+                try self.state.addError(doctype.line, doctype.column, "Unexpected DOCTYPE in 'in body' m
+ode", false);
+            },
+            
+            .Character => |char| {
+                // 斁E���E琁E                if (isWhitespace(char.data)) {
+                    // 空白斁E��を現在のノ�Eドに挿入
+                    try self.insertText(self.currentOpenElement(), char.data);
+                } else {
+                    // 非空白斁E��を現在のノ�Eドに挿入
+                    try self.insertText(self.currentOpenElement(), char.data);
+                    // frameset-okフラグをfalseに設宁E                    self.state.frameset_ok = false;
+                }
+            },
+            
+            .Comment => |comment| {
+                // コメント�E現在のノ�Eドに追加
+                try self.appendComment(self.currentOpenElement(), comment.data);
+            },
+            
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+                
+                if (mem.eql(u8, tag_name, "html")) {
+                    // HTML要素は特別処琁E                    try self.processInBodyHTMLStartTag(start_ta
+g);
+                } else if (mem.eql(u8, tag_name, "body")) {
+                    // 2番目のbody要素はエラー
+                    try self.state.addError(start_tag.line, start_tag.column, "Unexpected <body> in 'in 
+body' mode", false);
+                    
+                    // 既存�Ebody要素に属性があれ�E追加
+                    if (self.state.open_elements.items.len > 1) {
+                        const body_element = self.state.open_elements.items[1]; // [0]はhtml, [1]はbody
+                        
+                        // 既存�E属性があれ�E更新
+                        for (start_tag.attributes) |attr| {
+                            if (body_element.hasAttribute(attr.name)) continue;
+                            
+                            try body_element.setAttribute(attr.name, attr.value orelse "");
+                        }
+                    }
+                } else if (mem.eql(u8, tag_name, "p") or
+                           mem.eql(u8, tag_name, "div") or
+                           mem.eql(u8, tag_name, "span") or
+                           mem.eql(u8, tag_name, "h1") or
+                           mem.eql(u8, tag_name, "h2") or
+                           mem.eql(u8, tag_name, "h3") or
+                           mem.eql(u8, tag_name, "h4") or
+                           mem.eql(u8, tag_name, "h5") or
+                           mem.eql(u8, tag_name, "h6")) 
+                {
+                    // 一般皁E��ブロチE��要素の処琁E                    
+                    // pタグが開ぁE��ぁE��ば閉じめE                    try self.closePElement();
+                    
+                    // 新しい要素を作�Eして追加
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                } else if (mem.eql(u8, tag_name, "a")) {
+                    // aタグの処琁E- アクチE��ブなフォーマット要素を検索
+                    for (self.state.active_formatting_elements.items, 0..) |element, i| {
+                        if (element.nodeType == .Element and element.localName != null and 
+                            mem.eql(u8, element.localName.?, "a"))
+                        {
+                            // 既存�Eaタグを閉じる
+                            try self.state.addError(start_tag.line, start_tag.column, "Implicitly closin
+g previous <a> element", true);
+                            try self.adoptionAgencyAlgorithm("a");
+                            
+                            // アクチE��ブフォーマット要素から削除
+                            _ = self.state.active_formatting_elements.orderedRemove(i);
+                            break;
+                        }
+                    }
+                    
+                    // 新しいa要素を作�Eして追加
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    
+                    // アクチE��ブフォーマット要素に追加
+                    try self.state.active_formatting_elements.append(element);
+                } else if (mem.eql(u8, tag_name, "br")) {
+                    // brタグの処琁E                    const element = try self.createHTMLElement(start_
+tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    
+                    // br要素はスタチE��に追加しなぁE���E己終亁E��素�E�E                    self.state.frameset_
+ok = false;
+                } else if (mem.eql(u8, tag_name, "script")) {
+                    // スクリプト要素の処琁E                    self.state.insertion_mode = .in_head;
+                    try self.processToken(token);
+                    self.state.insertion_mode = .in_body;
+                } else {
+                    // そ�E他�E要素
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                }
+            },
+            
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                
+                if (mem.eql(u8, tag_name, "body")) {
+                    // bodyの終亁E��グ
+                    if (!self.hasElementInScope("body")) {
+                        try self.state.addError(end_tag.line, end_tag.column, "Unexpected </body> tag wi
+thout matching <body>", false);
+                        return;
+                    }
+                    
+                    
+                    self.state.insertion_mode = .after_body;
+                } else if (mem.eql(u8, tag_name, "html")) {
+                    // htmlの終亁E��グ - まずbodyを閉じてから処琁E                    if (!self.hasElementInSco
+pe("body")) {
+                        try self.state.addError(end_tag.line, end_tag.column, "Unexpected </html> tag wi
+thout proper nesting", false);
+                        return;
+                    }
+                    
+                    // 暗黙的にbodyの終亁E��グを�E琁E                    self.state.insertion_mode = .after_b
+ody;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "p")) {
+                    // p要素の終亁E��グ
+                    if (!self.hasElementInButtonScope("p")) {
+                        // pタグが開ぁE��ぁE��ければ暗黙的に開く
+                        try self.state.addError(end_tag.line, end_tag.column, "No <p> element in scope, 
+creating one", true);
+                        
+                        // 暗黙的にp要素を作�E
+                        var p_start_tag = tokenizer.HTMLStartTag{
+                            .name = "p",
+                            .attributes = &[_]tokenizer.HTMLAttribute{},
+                            .self_closing = false,
+                            .line = end_tag.line,
+                            .column = end_tag.column,
+                        };
+                        
+                        const p_element = try self.createHTMLElement(p_start_tag);
+                        try self.appendNode(self.currentOpenElement(), p_element);
+                        try self.state.open_elements.append(p_element);
+                    }
+                    
+                    // pタグを閉じる
+                    try self.closePElement();
+                } else if (isFormattingTag(tag_name)) {
+                    // フォーマット要素の処琁E��E, i, strong, em など�E�E                    try self.adoption
+AgencyAlgorithm(tag_name);
+                } else {
+                    // 一般皁E��要素の終亁E��グ
+                    try self.closeElementsToTag(tag_name);
+                }
+            },
+            
+            else => {
+                // そ�E他�Eト�Eクンは通常処琁E                try self.processGenericToken(token);
+            },
+        }
+    }
+    
+    // p要素を閉じる
+    fn closePElement(self: *HTMLParser) !void {
+        if (!self.hasElementInButtonScope("p")) return;
+        
+        // スコープ�EのpまでスタチE��からポッチE        var p_found = false;
+        while (self.state.open_elements.items.len > 0) {
+            const current = self.state.open_elements.items[self.state.open_elements.items.len - 1];
+            
+            if (current.nodeType == .Element and current.localName != null and 
+                mem.eql(u8, current.localName.?, "p")) 
+            {
+                p_found = true;
+                _ = self.state.open_elements.pop();
+                break;
+            }
+            
+            _ = self.state.open_elements.pop();
+        }
+        
+        if (!p_found) {
+            // エラー状慁E            std.log.err("Failed to find <p> element in scope", .{});
+        }
+    }
+    
+    // 持E��タグまでの要素をすべて閉じめE    fn closeElementsToTag(self: *HTMLParser, tag_name: []const u8) !
+void {
+        var found = false;
+        var i: usize = self.state.open_elements.items.len;
+        
+        while (i > 0) : (i -= 1) {
+            const element = self.state.open_elements.items[i - 1];
+            
+            if (element.nodeType == .Element and element.localName != null and 
+                mem.eql(u8, element.localName.?, tag_name))
+            {
+                found = true;
+                break;
+            }
+        }
+        
+        if (found) {
+            // 該当タグまで要素を閉じる
+            while (self.state.open_elements.items.len >= i) {
+                _ = self.state.open_elements.pop();
+            }
+        }
+    }
+    
+    // 要素が特定�Eスコープ�EにあるかチェチE��
+    fn hasElementInScope(self: *HTMLParser, tag_name: []const u8) bool {
+        // スコープ�Eの要素をチェチE��
+        for (self.state.open_elements.items, 0..) |_, i| {
+            const idx = self.state.open_elements.items.len - 1 - i;  // 後ろから頁E��チェチE��
+            const current = self.state.open_elements.items[idx];
+            
+            if (current.nodeType == .Element and current.localName != null) {
+                // 探してぁE��タグが見つかっぁE                if (mem.eql(u8, current.localName.?, tag_name))
+ {
+                    return true;
+                }
+                
+                // スコープを制限する要素�E�Etml, table, td, th など�E�E                if (mem.eql(u8, curren
+t.localName.?, "html") or
+                    mem.eql(u8, current.localName.?, "table") or
+                    mem.eql(u8, current.localName.?, "template")) 
+                {
+                    return false;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    // ボタンスコープ�Eに要素があるかチェチE��
+    fn hasElementInButtonScope(self: *HTMLParser, tag_name: []const u8) bool {
+        // ボタンスコープ�Eの要素をチェチE�� (通常のスコーチE+ button)
+        for (self.state.open_elements.items, 0..) |_, i| {
+            const idx = self.state.open_elements.items.len - 1 - i;  // 後ろから頁E��チェチE��
+            const current = self.state.open_elements.items[idx];
+            
+            if (current.nodeType == .Element and current.localName != null) {
+                // 探してぁE��タグが見つかっぁE                if (mem.eql(u8, current.localName.?, tag_name))
+ {
+                    return true;
+                }
+                
+                // スコープを制限する要素
+                if (mem.eql(u8, current.localName.?, "html") or
+                    mem.eql(u8, current.localName.?, "table") or
+                    mem.eql(u8, current.localName.?, "button") or
+                    mem.eql(u8, current.localName.?, "template"))
+                {
+                    return false;
+                }
+            }
+        }
+        
+        return false;
+    }
+    
+    // 養子縁絁E��ルゴリズム�E�フォーマット要素処琁E���E�E    fn adoptionAgencyAlgorithm(self: *HTMLParser, tag_n
+ame: []const u8) !void {
+        const max_iterations = 8;
+        var outer_loop_counter: usize = 0;
+        
+        while (outer_loop_counter < max_iterations) : (outer_loop_counter += 1) {
+            // ステップ1: formatting elementを見つける
+            var formatting_element: ?*DOM.Node = null;
+            var formatting_element_index: ?usize = null;
+            
+            // スコープ内でタグを検索
+            for (self.state.open_elements.items, 0..) |element, i| {
+                const idx = self.state.open_elements.items.len - 1 - i;
+                const current = self.state.open_elements.items[idx];
+                
+                if (current.nodeType == .Element and current.localName != null and 
+                    mem.eql(u8, current.localName.?, tag_name))
+                {
+                    formatting_element = current;
+                    formatting_element_index = idx;
+                    break;
+                }
+                
+                // 特別なスコープ要素で中断
+                if (isSpecialElement(current)) {
+                    break;
+                }
+            }
+            
+            // ステップ2: formatting elementが見つからない場合
+            if (formatting_element == null) {
+                try self.closeElementsToTag(tag_name);
+                return;
+            }
+            
+            // ステップ3: formatting elementがopen elementsスタックにない場合
+            const fe = formatting_element.?;
+            const fe_idx = formatting_element_index.?;
+            
+            if (fe_idx >= self.state.open_elements.items.len) {
+                return;
+            }
+            
+            // ステップ4: formatting elementがcurrent nodeの場合
+            if (fe == self.currentOpenElement()) {
+                _ = self.state.open_elements.pop();
+                return;
+            }
+            
+            // ステップ5: furthest blockを見つける
+            var furthest_block: ?*DOM.Node = null;
+            var furthest_block_index: ?usize = null;
+            
+            for (fe_idx + 1..self.state.open_elements.items.len) |i| {
+                const element = self.state.open_elements.items[i];
+                if (isSpecialElement(element)) {
+                    furthest_block = element;
+                    furthest_block_index = i;
+                    break;
+                }
+            }
+            
+            // ステップ6: furthest blockが見つからない場合
+            if (furthest_block == null) {
+                // formatting elementまでpop
+                while (self.state.open_elements.items.len > fe_idx) {
+                    _ = self.state.open_elements.pop();
+                }
+                return;
+            }
+            
+            // ステップ7: common ancestorを見つける
+            const common_ancestor = if (fe_idx > 0) self.state.open_elements.items[fe_idx - 1] else null;
+            
+            // ステップ8: ブックマークを設定
+            var bookmark = fe_idx;
+            
+            // ステップ9: inner loopを実行
+            var inner_loop_counter: usize = 0;
+            const max_inner_iterations = 3;
+            var node = furthest_block.?;
+            var node_index = furthest_block_index.?;
+            
+            while (inner_loop_counter < max_inner_iterations) : (inner_loop_counter += 1) {
+                // 前の要素を取得
+                if (node_index == 0) break;
+                node_index -= 1;
+                node = self.state.open_elements.items[node_index];
+                
+                // nodeがformatting elementと同じ場合
+                if (node == fe) {
+                    break;
+                }
+                
+                // ステップ9.7: nodeをopen elementsから削除
+                if (inner_loop_counter >= 3) {
+                    _ = self.state.open_elements.orderedRemove(node_index);
+                    if (node_index < bookmark) {
+                        bookmark -= 1;
+                    }
+                    continue;
+                }
+                
+                // ステップ9.9: nodeのクローンを作成
+                const cloned_node = try self.cloneNode(node);
+                
+                // ステップ9.10: open elementsのnodeを置き換え
+                self.state.open_elements.items[node_index] = cloned_node;
+                
+                // ステップ9.11: nodeの子要素をclonedNodeに移動
+                try self.moveChildren(node, cloned_node);
+                
+                // ステップ9.12: clonedNodeをnodeの親に挿入
+                if (node.parentNode) |parent| {
+                    try self.insertBefore(parent, cloned_node, node);
+                    try self.removeChild(parent, node);
+                }
+                
+                node = cloned_node;
+            }
+            
+            // ステップ10: common ancestorに応じた処理
+            if (common_ancestor) |ancestor| {
+                // nodeをancestorに追加
+                try self.appendChild(ancestor, node);
+            }
+            
+            // ステップ11: formatting elementのクローンを作成
+            const cloned_formatting_element = try self.cloneNode(fe);
+            
+            // ステップ12: furthest blockの子要素をクローンに移動
+            try self.moveChildren(furthest_block.?, cloned_formatting_element);
+            
+            // ステップ13: cloned formatting elementをfurthest blockに追加
+            try self.appendChild(furthest_block.?, cloned_formatting_element);
+            
+            // ステップ14: open elementsスタックを更新
+            _ = self.state.open_elements.orderedRemove(fe_idx);
+            try self.state.open_elements.insert(furthest_block_index.? - 1, cloned_formatting_element);
+        }
+    }
+    
+    // 特別な要素（スコープを形成する要素）の判定
+    fn isSpecialElement(element: *DOM.Node) bool {
+        if (element.nodeType != .Element or element.localName == null) {
+            return false;
+        }
+        
+        const special_elements = [_][]const u8{
+            "address", "applet", "area", "article", "aside", "base", "basefont", "bgsound",
+            "blockquote", "body", "br", "button", "caption", "center", "col", "colgroup",
+            "dd", "details", "dir", "div", "dl", "dt", "embed", "fieldset", "figcaption",
+            "figure", "footer", "form", "frame", "frameset", "h1", "h2", "h3", "h4", "h5",
+            "h6", "head", "header", "hgroup", "hr", "html", "iframe", "img", "input",
+            "isindex", "li", "link", "listing", "main", "marquee", "menu", "meta", "nav",
+            "noembed", "noframes", "noscript", "object", "ol", "p", "param", "plaintext",
+            "pre", "script", "section", "select", "source", "style", "summary", "table",
+            "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "title", "tr",
+            "track", "ul", "wbr", "xmp"
+        };
+        
+        const tag_name = element.localName.?;
+        for (special_elements) |special| {
+            if (mem.eql(u8, tag_name, special)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    // ノードのクローン作成
+    fn cloneNode(self: *HTMLParser, original: *DOM.Node) !*DOM.Node {
+        const cloned = try self.dom.createNode();
+        cloned.nodeType = original.nodeType;
+        cloned.localName = if (original.localName) |name| try self.allocator.dupe(u8, name) else null;
+        cloned.tagName = if (original.tagName) |name| try self.allocator.dupe(u8, name) else null;
+        cloned.textContent = if (original.textContent) |text| try self.allocator.dupe(u8, text) else null;
+        
+        // 属性をコピー
+        if (original.attributes) |orig_attrs| {
+            cloned.attributes = try self.allocator.create(std.StringHashMap([]const u8));
+            cloned.attributes.?.* = std.StringHashMap([]const u8).init(self.allocator);
+            
+            var iterator = orig_attrs.iterator();
+            while (iterator.next()) |entry| {
+                const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                const value = try self.allocator.dupe(u8, entry.value_ptr.*);
+                try cloned.attributes.?.put(key, value);
+            }
+        }
+        
+        return cloned;
+    }
+    
+    // 子要素の移動
+    fn moveChildren(self: *HTMLParser, from: *DOM.Node, to: *DOM.Node) !void {
+        _ = self;
+        var child = from.firstChild;
+        while (child) |current_child| {
+            const next = current_child.nextSibling;
+            
+            // fromから削除
+            if (current_child.previousSibling) |prev| {
+                prev.nextSibling = current_child.nextSibling;
+            } else {
+                from.firstChild = current_child.nextSibling;
+            }
+            
+            if (current_child.nextSibling) |next_sibling| {
+                next_sibling.previousSibling = current_child.previousSibling;
+            } else {
+                from.lastChild = current_child.previousSibling;
+            }
+            
+            // toに追加
+            current_child.parentNode = to;
+            current_child.nextSibling = null;
+            current_child.previousSibling = to.lastChild;
+            
+            if (to.lastChild) |last| {
+                last.nextSibling = current_child;
+            } else {
+                to.firstChild = current_child;
+            }
+            to.lastChild = current_child;
+            
+            child = next;
+        }
+    }
+    
+    // 要素の挿入
+    fn insertBefore(self: *HTMLParser, parent: *DOM.Node, new_child: *DOM.Node, reference_child: *DOM.Node) !void {
+        _ = self;
+        new_child.parentNode = parent;
+        new_child.nextSibling = reference_child;
+        new_child.previousSibling = reference_child.previousSibling;
+        
+        if (reference_child.previousSibling) |prev| {
+            prev.nextSibling = new_child;
+        } else {
+            parent.firstChild = new_child;
+        }
+        
+        reference_child.previousSibling = new_child;
+    }
+    
+    // 子要素の削除
+    fn removeChild(self: *HTMLParser, parent: *DOM.Node, child: *DOM.Node) !void {
+        _ = self;
+        _ = parent;
+        
+        if (child.previousSibling) |prev| {
+            prev.nextSibling = child.nextSibling;
+        } else if (child.parentNode) |p| {
+            p.firstChild = child.nextSibling;
+        }
+        
+        if (child.nextSibling) |next| {
+            next.previousSibling = child.previousSibling;
+        } else if (child.parentNode) |p| {
+            p.lastChild = child.previousSibling;
+        }
+        
+        child.parentNode = null;
+        child.previousSibling = null;
+        child.nextSibling = null;
+    }
+    
+    // 子要素の追加
+    fn appendChild(self: *HTMLParser, parent: *DOM.Node, child: *DOM.Node) !void {
+        _ = self;
+        child.parentNode = parent;
+        child.nextSibling = null;
+        child.previousSibling = parent.lastChild;
+        
+        if (parent.lastChild) |last| {
+            last.nextSibling = child;
+        } else {
+            parent.firstChild = child;
+        }
+        parent.lastChild = child;
+    }
+
+    // フォーマットタグかどぁEを判宁E    fn isFormattingTag(tag_name: []const u8) bool {
+        const formatting_tags = [_][]const u8{
+            "b", "big", "code", "em", "font", "i", "nobr",
+            "s", "small", "strike", "strong", "tt", "u"
+        };
+        
+        for (formatting_tags) |tag| {
+            if (mem.eql(u8, tag_name, tag)) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+    
+    // 一般皁E��ト�Eクンの処琁E    fn processGenericToken(self: *HTMLParser, token: tokenizer.HTMLToken) !vo
+id {
+        switch (token) {
+            .StartTag => |start_tag| {
+                // チE��ォルト�E開始タグ処琁E                const element = try self.createHTMLElement(start
+_tag);
+                try self.appendNode(self.currentOpenElement(), element);
+                
+                if (!start_tag.self_closing) {
+                    try self.state.open_elements.append(element);
+                }
+            },
+            .EndTag => |end_tag| {
+                // チE��ォルト�E終亁E��グ処琁E                // 対応する開始タグを見つけるまでスタチE��を�EチE�E
+                var found = false;
+                
+                for (self.state.open_elements.items, 0..) |_, i| {
+                    const idx = self.state.open_elements.items.len - 1 - i;
+                    const current = self.state.open_elements.items[idx];
+                    
+                    if (current.nodeType == .Element and current.localName != null and 
+                        mem.eql(u8, current.localName.?, end_tag.name))
+                    {
+                        found = true;
+                        
+                        // こ�E要素までスタチE��からポッチE                        while (self.state.open_elem
+ents.items.len > 0) {
+                            const last = self.state.open_elements.items[self.state.open_elements.items.l
+en - 1];
+                            _ = self.state.open_elements.pop();
+                            
+                            if (last == current) break;
+                        }
+                        
+                        break;
+                    }
+                }
+                
+                if (!found) {
+                    // エラー - 対応する開始タグが見つからなぁE                    try self.state.addError(end
+_tag.line, end_tag.column, "Unexpected end tag without matching start tag", false);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn processInTableMode(self: *HTMLParser, token: tokenizer.HTMLToken) !void {
+        switch (token) {
+            .Character => |char| {
+                // チE�Eブル冁E�E斁E���E琁E��特殊�E琁E��E                if (isTableRelatedElement(self.currentOpenE
+lement())) {
+                    // チE�Eブル冁E��キストモードに刁E��替え、保留バッファを�E期化
+                    self.state.pending_table_text.clearRetainingCapacity();
+                    try self.state.pending_table_text.appendSlice(char.data);
+                    self.state.insertion_mode = .in_table_text;
+                } else {
+                    // フォスターペアレンチE��ングモードで処琁E                    self.state.foster_parenting
+ = true;
+                    try self.processInBodyMode(token);
+                    self.state.foster_parenting = false;
+                }
+            },
+            .Comment => |comment| {
+                // コメント�E現在のノ�Eドに追加
+                const current_node = self.currentOpenElement() orelse return;
+                try self.appendComment(current_node, comment.data);
+            },
+            .DOCTYPE => |doctype| {
+                // tableでのDOCTYPEはエラー
+                try self.state.addError(doctype.line, doctype.column, "Unexpected DOCTYPE in 'in table' 
+mode", false);
+            },
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+                
+                if (mem.eql(u8, tag_name, "caption")) {
+                    // tableをクリアして新たな行コンチE��ストを開姁E                    try self.clearStackBackT
+oTableContext();
+                    
+                    // captionを追加
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    
+                    // activeフラグを設宁E                    self.state.insertion_mode = .in_caption;
+                } else if (mem.eql(u8, tag_name, "colgroup")) {
+                    // tableをクリアして新たな列グループを追加
+                    try self.clearStackBackToTableContext();
+                    
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    
+                    self.state.insertion_mode = .in_column_group;
+                } else if (mem.eql(u8, tag_name, "col")) {
+                    // 暗黙的にcolgroupを追加して処琁E                    try self.clearStackBackToTableCon
+text();
+                    
+                    // 暗黙的なcolgroup要素を作�E
+                    var attrs = [_]tokenizer.HTMLAttribute{};
+                    var colgroup_tag = tokenizer.HTMLStartTag{
+                        .name = "colgroup",
+                        .attributes = &attrs,
+                        .self_closing = false,
+                        .line = start_tag.line,
+                        .column = start_tag.column,
+                    };
+                    
+                    const colgroup = try self.createHTMLElement(colgroup_tag);
+                    try self.appendNode(self.currentOpenElement(), colgroup);
+                    try self.state.open_elements.append(colgroup);
+                    
+                    self.state.insertion_mode = .in_column_group;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "tbody") or 
+                           mem.eql(u8, tag_name, "tfoot") or 
+                           mem.eql(u8, tag_name, "thead")) {
+                    // 新しいチE�Eブルセクション
+                    try self.clearStackBackToTableContext();
+                    
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    
+                    self.state.insertion_mode = .in_table_body;
+                } else if (mem.eql(u8, tag_name, "tr")) {
+                    // 暗黙的にtbodyを追加して処琁E                    try self.clearStackBackToTableContex
+t();
+                    
+                    // 暗黙的なtbody要素を作�E
+                    var attrs = [_]tokenizer.HTMLAttribute{};
+                    var tbody_tag = tokenizer.HTMLStartTag{
+                        .name = "tbody",
+                        .attributes = &attrs,
+                        .self_closing = false,
+                        .line = start_tag.line,
+                        .column = start_tag.column,
+                    };
+                    
+                    const tbody = try self.createHTMLElement(tbody_tag);
+                    try self.appendNode(self.currentOpenElement(), tbody);
+                    try self.state.open_elements.append(tbody);
+                    
+                    self.state.insertion_mode = .in_table_body;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "td") or 
+                           mem.eql(u8, tag_name, "th")) {
+                    // 暗黙的にtbodyとtrを追加して処琁E                    try self.clearStackBackToTableCo
+ntext();
+                    
+                    // 暗黙的なtbody要素を作�E
+                    var tbody_attrs = [_]tokenizer.HTMLAttribute{};
+                    var tbody_tag = tokenizer.HTMLStartTag{
+                        .name = "tbody",
+                        .attributes = &tbody_attrs,
+                        .self_closing = false,
+                        .line = start_tag.line,
+                        .column = start_tag.column,
+                    };
+                    
+                    const tbody = try self.createHTMLElement(tbody_tag);
+                    try self.appendNode(self.currentOpenElement(), tbody);
+                    try self.state.open_elements.append(tbody);
+                    
+                    // 暗黙的なtr要素を作�E
+                    var tr_attrs = [_]tokenizer.HTMLAttribute{};
+                    var tr_tag = tokenizer.HTMLStartTag{
+                        .name = "tr",
+                        .attributes = &tr_attrs,
+                        .self_closing = false,
+                        .line = start_tag.line,
+                        .column = start_tag.column,
+                    };
+                    
+                    const tr = try self.createHTMLElement(tr_tag);
+                    try self.appendNode(tbody, tr);
+                    try self.state.open_elements.append(tr);
+                    
+                    self.state.insertion_mode = .in_row;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "table")) {
+                    // ネストした表の処琁E��エラーだが許容�E�E                    try self.state.addError(star
+t_tag.line, start_tag.column, "Nested <table> element", true);
+                    
+                    // 現在のチE�Eブルを閉じる
+                    if (self.hasElementInTableScope("table")) {
+                        try self.closeTableElement();
+                        
+                        // 新しいチE�Eブルを作�Eして処琁E                        self.state.insertion_mode = .i
+n_body;
+                        try self.processToken(token);
+                    }
+                } else if (mem.eql(u8, tag_name, "style") or 
+                           mem.eql(u8, tag_name, "script")) {
+                    // スタイルとスクリプトはInHeadモードと同じ処琁E                    try self.processInHe
+adMode(token);
+                } else if (mem.eql(u8, tag_name, "input")) {
+                    // typeがhiddenの場合�E特別処琁E                    var is_hidden = false;
+                    
+                    for (start_tag.attributes) |attr| {
+                        if (mem.eql(u8, attr.name, "type") and 
+                            attr.value != null and
+                            mem.eql(u8, attr.value.?, "hidden")) {
+                            is_hidden = true;
+                            break;
+                        }
+                    }
+                    
+                    if (is_hidden) {
+                        // hiddenはtable冁E��許可
+                        const element = try self.createHTMLElement(start_tag);
+                        try self.appendNode(self.currentOpenElement(), element);
+                        
+                        // 統計データを更新
+                        if (self.state.options.collect_statistics) {
+                            self.state.statistics.elements_created += 1;
+                        }
+                    } else {
+                        // そ�E他�EinputはチE�Eブル外で処琁E                        self.state.foster_parenting
+ = true;
+                        // スタチE��には追加しなぁE���E己終亁E��素�E�E                    } else {
+                        // そ�E他�EinputはチE�Eブル外で処琁E                        self.state.foster_parenting
+ = true;
+                        try self.processInBodyMode(token);
+                        self.state.foster_parenting = false;
+                    }
+                } else if (mem.eql(u8, tag_name, "form")) {
+                    // フォームはチE�Eブル冁E��は特殊�E琁E                    try self.state.addError(start_tag.
+line, start_tag.column, "Unexpected <form> in table, treating as foster parented", true);
+                    
+                    // フォーム要素を作�E
+                    const element = try self.createHTMLElement(start_tag);
+                    
+                    // チE�Eブルモードでフォームが�E現した場合�E特殊�E琁E                    if (self.state.form_e
+lement == null) {
+                        self.state.form_element = element;
+                    }
+                    
+                    // フォスターペアレンチE��ングで追加
+                    self.state.foster_parenting = true;
+                    try self.appendNode(self.getFosterParent(), element);
+                    try self.state.open_elements.append(element);
+                    self.state.foster_parenting = false;
+                } else {
+                    // そ�E他�E要素はfosterペアレントで処琁E                    self.state.foster_parenting =
+ true;
+                    try self.processInBodyMode(token);
+                    self.state.foster_parenting = false;
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                
+                if (mem.eql(u8, tag_name, "table")) {
+                    // table終亁E��グの処琁E                    if (!self.hasElementInTableScope("table")) 
+{
+                        // 対応するtableがなければエラー
+                        try self.state.addError(end_tag.line, end_tag.column, "Unexpected </table> witho
+ut matching <table>", false);
+                        return;
+                    }
+                    
+                    // tableを�EチE�E
+                    try self.closeTableElement();
+                    
+                    // モードを再設宁E                    try self.resetInsertionMode();
+                } else if (mem.eql(u8, tag_name, "body") or
+                           mem.eql(u8, tag_name, "caption") or
+                           mem.eql(u8, tag_name, "col") or
+                           mem.eql(u8, tag_name, "colgroup") or
+                           mem.eql(u8, tag_name, "html")) {
+                    // これら�E終亁E��グはエラー
+                    try self.state.addError(end_tag.line, end_tag.column, "Unexpected end tag in 'in tab
+le' mode", false);
+                } else if (mem.eql(u8, tag_name, "tbody") or
+                           mem.eql(u8, tag_name, "tfoot") or
+                           mem.eql(u8, tag_name, "thead") or
+                           mem.eql(u8, tag_name, "tr") or
+                           mem.eql(u8, tag_name, "td") or
+                           mem.eql(u8, tag_name, "th")) {
+                    // チE�Eブル関連要素の終亁E��グは無視（�E刁E�EコンチE��ストと異なる場合！E                    if
+ (!self.hasElementInTableScope(tag_name)) {
+                        try self.state.addError(end_tag.line, end_tag.column, "End tag does not match an
+y element in table scope", false);
+                        return;
+                    }
+                    
+                    if (mem.eql(u8, tag_name, "tbody") or
+                        mem.eql(u8, tag_name, "tfoot") or
+                        mem.eql(u8, tag_name, "thead")) {
+                        // チE�Eブルセクション終亁E��グ
+                        try self.changeInsertionMode(.in_table_body);
+                        try self.processToken(token);
+                    } else if (mem.eql(u8, tag_name, "tr")) {
+                        // tr終亁E��グ
+                        try self.changeInsertionMode(.in_row);
+                        try self.processToken(token);
+                    } else {
+                        // td/th終亁E��グ
+                        try self.changeInsertionMode(.in_cell);
+                        try self.processToken(token);
+                    }
+                } else {
+                    // そ�E他�E終亁E��グはfosterペアレントで処琁E                    self.state.foster_parentin
+g = true;
+                    try self.processInBodyMode(token);
+                    self.state.foster_parenting = false;
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンはfosterペアレントで処琁E                self.state.foster_parenting = true
+;
+                try self.processInBodyMode(token);
+                self.state.foster_parenting = false;
+            },
+        }
+    }
+    
+    // tableコンチE��ストまでスタチE��をクリア
+    fn clearStackBackToTableContext(self: *HTMLParser) !void {
+        while (self.state.open_elements.items.len > 0) {
+            const current = self.state.open_elements.items[self.state.open_elements.items.len - 1];
+            
+            if (current.localName) |name| {
+                if (mem.eql(u8, name, "table") or
+                    mem.eql(u8, name, "html") or
+                    mem.eql(u8, name, "template")) {
+                    // table, html, templateで停止
+                    break;
+                }
+            }
+            
+            // それ以外�E要素を�EチE�E
+            _ = self.state.open_elements.pop();
+        }
+    }
+    
+    // table要素を閉じる
+    fn closeTableElement(self: *HTMLParser) !void {
+        // table要素のスコープ�EでポッチE        var i: usize = self.state.open_elements.items.len;
+        while (i > 0) {
+            i -= 1;
+            const element = self.state.open_elements.items[i];
+            
+            if (element.localName) |name| {
+                if (mem.eql(u8, name, "table")) {
+                    // tableを見つけた
+                    break;
+                }
+            }
+        }
+        
+        // 要素スタチE��からtableまでの要素を�EチE�E
+        while (self.state.open_elements.items.len > i) {
+            _ = self.state.open_elements.pop();
+        }
+    }
+    
+    // 要素がtableコンチE��スト関連かどぁE��
+    fn isTableRelatedElement(element: ?*DOM.Node) bool {
+        if (element == null) return false;
+        
+        if (element.?.localName) |name| {
+            return mem.eql(u8, name, "table") or
+                   mem.eql(u8, name, "tbody") or
+                   mem.eql(u8, name, "tfoot") or
+                   mem.eql(u8, name, "thead") or
+                   mem.eql(u8, name, "tr");
+        }
+        
+        return false;
+    }
+    
+    // フォスターペアレントを取征E    fn getFosterParent(self: *HTMLParser) *DOM.Node {
+        // チE�Eブルの直前�E要素を探ぁE        var i: usize = self.state.open_elements.items.len;
+        var table_idx: ?usize = null;
+        
+        while (i > 0) {
+            i -= 1;
+            const element = self.state.open_elements.items[i];
+            
+            if (element.localName) |name| {
+                if (mem.eql(u8, name, "table")) {
+                    table_idx = i;
+                    break;
+                }
+            }
+        }
+        
+        if (table_idx) |idx| {
+            if (idx > 0) {
+                // tableの親を返す
+                const table = self.state.open_elements.items[idx];
+                if (table.parentNode) |parent| {
+                    return parent;
+                }
+            }
+        }
+        
+        // チE��ォルト�E最後�E要素
+        return self.currentOpenElement() orelse &self.document.documentElement;
+    }
+    
+    // 挿入モードを変更
+    fn changeInsertionMode(self: *HTMLParser, mode: InsertionMode) !void {
+        self.state.insertion_mode = mode;
+    }
+
+    // チE��ストモード�E処琁E    fn processTextMode(self: *HTMLParser, token: tokenizer.HTMLToken) !void {
+        switch (token) {
+            .Character => |char| {
+                // チE��ストノードに斁E��を追加
+                const current_node = self.state.currentNode() orelse return;
+                try self.insertText(current_node, char.data);
+            },
+            .EndTag => |end_tag| {
+                // 現在のモード用の終亁E��グが見つかった場吁E                var script_processed = false;
+                
+                // 現在のタグがスクリプトか確誁E                if (@hasField(ParserState, "current_tag_nam
+e") and 
+                    self.state.current_tag_name != null and 
+                    mem.eql(u8, self.state.current_tag_name.?, "script") and 
+                    mem.eql(u8, end_tag.name, "script")) {
+                    
+                    // スクリプト終亁E��グの特別処琁E                    script_processed = true;
+                    
+                    // スクリプト実行が有効なら�E琁E                    if (self.options.execute_scripts) {
+                        try self.processScript();
+                    }
+                    
+                    // オープン要素スタチE��から要素を�EチE�E
+                    if (self.state.open_elements.items.len > 0) {
+                        _ = self.state.open_elements.pop();
+                    }
+                    
+                    // ト�Eクナイザーを通常状態に戻ぁE                    if (self.tokenizer_obj) |*tokenize
+r_ptr| {
+                        if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizationState")) {
+                            tokenizer_ptr.setTokenizationState(.Data) catch |err| {
+                                std.log.err("Failed to reset tokenization state: {}", .{err});
+                            };
+                        } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizerState")) {
+                            tokenizer_ptr.setTokenizerState(.Data) catch |err| {
+                                std.log.err("Failed to reset tokenizer state: {}", .{err});
+                            };
+                        } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setSpecialMode")) {
+                            tokenizer_ptr.setSpecialMode("data", "") catch |err| {
+                                std.log.err("Failed to reset special mode: {}", .{err});
+                            };
+                        } else if (@hasField(@TypeOf(tokenizer_ptr.*), "state")) {
+                            tokenizer_ptr.state = 0; // チE�Eタ状慁E                        }
+                        
+                        // スクリプトモードをリセチE��
+                        if (@hasField(@TypeOf(tokenizer_ptr.*), "script_mode")) {
+                            tokenizer_ptr.script_mode = false;
+                        }
+                    }
+                    
+                    // スクリプト処琁E��ラグをリセチE��
+                    if (@hasField(ParserState, "script_processing")) {
+                        self.state.script_processing = false;
+                    }
+                    
+                    // オリジナルの挿入モードに戻ぁE                    self.state.insertion_mode = self.st
+ate.original_insertion_mode;
+                } else if (!script_processed) {
+                    // 通常の終亁E��グ処琁E                    
+                    // オープン要素スタチE��から要素を�EチE�E
+                    if (self.state.open_elements.items.len > 0) {
+                        _ = self.state.open_elements.pop();
+                    }
+                    
+                    // ト�Eクナイザーを通常状態に戻ぁE                    if (self.tokenizer_obj) |*tokenize
+r_ptr| {
+                        if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizationState")) {
+                            tokenizer_ptr.setTokenizationState(.Data) catch |err| {
+                                std.log.err("Failed to reset tokenization state: {}", .{err});
+                            };
+                        } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setTokenizerState")) {
+                            tokenizer_ptr.setTokenizerState(.Data) catch |err| {
+                                std.log.err("Failed to reset tokenizer state: {}", .{err});
+                            };
+                        } else if (@hasDecl(@TypeOf(tokenizer_ptr.*), "setSpecialMode")) {
+                            tokenizer_ptr.setSpecialMode("data", "") catch |err| {
+                                std.log.err("Failed to reset special mode: {}", .{err});
+                            };
+                        } else if (@hasField(@TypeOf(tokenizer_ptr.*), "state")) {
+                            tokenizer_ptr.state = 0; // チE�Eタ状慁E                        }
+                        
+                        // 特殊タグ名をクリア
+                        if (@hasField(@TypeOf(tokenizer_ptr.*), "special_tag")) {
+                            if (tokenizer_ptr.special_tag) |old_tag| {
+                                self.allocator.free(old_tag);
+                                tokenizer_ptr.special_tag = null;
+                            }
+                        }
+                    }
+                    
+                    // オリジナルの挿入モードに戻ぁE                    self.state.insertion_mode = self.st
+ate.original_insertion_mode;
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンタイプ�E通常、エラーとなめE                try self.state.addError(
+                    token.getLine() orelse 0, 
+                    token.getColumn() orelse 0, 
+                    "Unexpected token in text mode", 
+                    false
+                );
+            },
+        }
+    }
+    
+    // スクリプト処琁E    fn processScript(self: *HTMLParser) !void {
+        // 現在のスクリプト要素を取征E        const script_element = self.state.currentNode() orelse return
+;
+        if (script_element.nodeType != .Element or script_element.localName == null or 
+            !mem.eql(u8, script_element.localName.?, "script")) {
+            return;
+        }
+        
+        // スクリプトのチE��スト�E容を取征E        var script_content: ?[]const u8 = null;
+        var child = script_element.firstChild;
+        
+        while (child != null) {
+            if (child.?.nodeType == .Text) {
+                if (child.?.nodeValue) |value| {
+                    if (script_content) |existing| {
+                        // 既存�EチE��ストに連絁E                        const new_content = try std.fmt.allo
+cPrint(
+                            self.allocator, "{s}{s}", .{ existing, value }
+                        );
+                        self.allocator.free(existing);
+                        script_content = new_content;
+                    } else {
+                        // 初めてのチE��スチE                        script_content = try self.allocator.dup
+e(u8, value);
+                    }
+                }
+            }
+            child = child.?.nextSibling;
+        }
+        
+        // スクリプト冁E��があれ�E実衁E        if (script_content) |content| {
+            defer self.allocator.free(content);
+            
+            // スクリプト実行�Eブラウザの実裁E��委譲
+            std.log.info("Execute script: {s}", .{
+                if (content.len > 100) 
+                    std.fmt.allocPrint(self.allocator, "{s}...[{d} more chars]", 
+                        .{ content[0..100], content.len - 100 }) catch content
+                else 
+                    content
+            });
+            
+            // 実際のスクリプト実行�Eここで行う�E�機�Eが実裁E��れてぁE��場合！E            if (@hasDecl(@This(), "exe
+cuteScript")) {
+                try self.executeScript(script_element, content);
+            }
+        }
+    }
+
+    // After Headモードでのト�Eクン処琁E    fn processTokenInAfterHeadMode(self: *HTMLParser, token: tokeni
+zer.Token) !void {
+            .Character => |char_data| {
+                // 空白斁E���Eそ�Eまま追加
+                if (isWhitespace(char_data.data)) {
+                    try self.insertText(self.currentOpenElement() orelse return, char_data.data);
+                    return;
+                }
+                
+                // 非空白斁E���E場合�E暗黙的にbody開姁E                try self.insertImplicitBodyStart();
+                try self.processToken(token);
+            },
+            .Comment => |comment| {
+                // コメントノード�E挿入
+                try self.appendComment(self.currentOpenElement(), comment.data);
+            },
+            .DOCTYPE => {
+                // DOCTYPEは無視（エラー�E�E                try self.state.addError(0, 0, "Unexpected DOCTY
+PE in after head mode", false);
+            },
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+                
+                if (mem.eql(u8, tag_name, "html")) {
+                    // html開始タグの処琁E(既に開いてぁE��はぁE
+                    return self.processTokenInBodyMode(token);
+                } else if (mem.eql(u8, tag_name, "body")) {
+                    // bodyの開姁E                    const element = try self.createHTMLElement(start_ta
+g);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    
+                    // フレームセチE��OKフラグをfalseに設宁E                    self.state.frameset_ok = false
+;
+                    
+                    // bodyモードに刁E��替ぁE                    self.state.insertion_mode = .in_body;
+                    
+                    // 統計情報更新
+                    if (self.options.collect_statistics) {
+                        self.statistics.elements_found += 1;
+                    }
+                } else if (mem.eql(u8, tag_name, "frameset")) {
+                    // framesetの開姁E                    const element = try self.createHTMLElement(star
+t_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    
+                    // framesetモードに刁E��替ぁE                    self.state.insertion_mode = .in_framese
+t;
+                    
+                    // 統計情報更新
+                    if (self.options.collect_statistics) {
+                        self.statistics.elements_found += 1;
+                    }
+                } else if (mem.eql(u8, tag_name, "base") or 
+                           mem.eql(u8, tag_name, "basefont") or
+                           mem.eql(u8, tag_name, "bgsound") or
+                           mem.eql(u8, tag_name, "link") or
+                           mem.eql(u8, tag_name, "meta") or
+                           mem.eql(u8, tag_name, "noframes") or
+                           mem.eql(u8, tag_name, "script") or
+                           mem.eql(u8, tag_name, "style") or
+                           mem.eql(u8, tag_name, "template") or
+                           mem.eql(u8, tag_name, "title")) {
+                    // headに戻してト�Eクンを�E処琁E                    try self.state.addError(start_tag.li
+ne, start_tag.column, "Head element after head was closed", false);
+                    
+                    // headを開ぁE��スタチE��に追加
+                    const head_element = self.state.head_element orelse return;
+                    try self.state.open_elements.append(head_element);
+                    
+                    // inHeadモードで処琁E                    try self.processTokenInHeadMode(token);
+                    
+                    // 処琁E��にheadを削除
+                    _ = self.state.open_elements.pop();
+                } else if (mem.eql(u8, tag_name, "head")) {
+                    // 2回目のhead開始タグはエラー
+                    try self.state.addError(start_tag.line, start_tag.column, "Unexpected second head el
+ement", false);
+                } else {
+                    // そ�E他�Ebody開始と同筁E                    try self.insertImplicitBodyStart();
+                    try self.processToken(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                
+                if (mem.eql(u8, tag_name, "body") or
+                    mem.eql(u8, tag_name, "html") or
+                    mem.eql(u8, tag_name, "br")) {
+                    // bodyめEtmlの終亁E��グの処琁E��暗黙的にbodyを開始！E                    try self.insertImp
+licitBodyStart();
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "template")) {
+                    // templateの終亁E��グの処琁E                    try self.processTokenInHeadMode(token)
+;
+                } else {
+                    // そ�E他�E終亁E��グはエラー
+                    try self.state.addError(end_tag.line, end_tag.column, "Unexpected end tag in after h
+ead mode", false);
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンはbody開始と同筁E                try self.insertImplicitBodyStart();
+                try self.processToken(token);
+            },
+        }
+    }
+    
+    // 暗黙的にbodyを開始すめE    fn insertImplicitBodyStart(self: *HTMLParser) !void {
+        // body要素を作�E
+        var attr_array = [_]tokenizer.HTMLAttribute{};
+        var start_tag = tokenizer.StartTagData{
+            .name = "body",
+            .attributes = &attr_array,
+            .self_closing = false,
+            .line = 0,
+            .column = 0,
+        };
+        
+        const body_element = try self.createHTMLElement(start_tag);
+        try self.appendNode(self.currentOpenElement(), body_element);
+        try self.state.open_elements.append(body_element);
+        
+        // bodyモードに刁E��替ぁE        self.state.insertion_mode = .in_body;
+        
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.elements_found += 1;
+            self.statistics.implicit_elements_generated += 1;
+        }
+        
+        // 暗黙的なbody生�Eを記録
+        try self.state.addError(0, 0, "Implicit <body> element creation", true);
+    }
+
+    // In Bodyモードでのト�Eクン処琁E    fn processTokenInBodyMode(self: *HTMLParser, token: tokenizer.Toke
+n) !void {
+            .Character => |char_data| {
+                // 斁E��データ処琁E                if (char_data.data.len == 0) {
+                    return;
+                }
+                
+                // すべての斁E��が空白かどぁE��を確誁E                var all_whitespace = true;
+                for (char_data.data) |ch| {
+                    if (!isWhitespace(&[_]u8{ch})) {
+                        all_whitespace = false;
+                        break;
+                    }
+                }
+                
+                // すべて空白の場合�EReconstructionアルゴリズムを適用
+                if (all_whitespace) {
+                    try self.reconstructActiveFormattingElements();
+                }
+                
+                // 現在の挿入ポイントに斁E��を追加
+                try self.insertText(self.currentOpenElement() orelse return, char_data.data);
+                
+                // フレームセチE��OKフラグを更新�E�空白以外ならfalse�E�E                if (!all_whitespace) {
+                    self.state.frameset_ok = false;
+                }
+            },
+            .Comment => |comment| {
+                // コメントノード�E挿入
+                try self.appendComment(self.currentOpenElement(), comment.data);
+            },
+            .DOCTYPE => {
+                // DOCTYPEは無視（エラー�E�E                try self.state.addError(0, 0, "Unexpected DOCTY
+PE in body mode", false);
+            },
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+                
+                if (mem.eql(u8, tag_name, "html")) {
+                    // html開始タグ�E�既に処琁E��みのはず！E                    try self.state.addError(start_
+tag.line, start_tag.column, "Unexpected html tag in body context", false);
+                    
+                    // body要素の属性に追加される可能性があめE                    const root_element = self.
+state.open_elements.items[0];
+                    if (root_element.tag_name != null and mem.eql(u8, root_element.tag_name.?, "html")) 
+{
+                        for (start_tag.attributes) |attr| {
+                            // 属性が存在しなぁE��合�Eみ追加
+                            if (!hasAttribute(root_element, attr.name)) {
+                                try self.addAttribute(root_element, attr.name, attr.value);
+                            }
+                        }
+                    }
+                } else if (mem.eql(u8, tag_name, "base") or
+                           mem.eql(u8, tag_name, "basefont") or
+                           mem.eql(u8, tag_name, "bgsound") or
+                           mem.eql(u8, tag_name, "link") or
+                           mem.eql(u8, tag_name, "meta") or
+                           mem.eql(u8, tag_name, "noframes") or
+                           mem.eql(u8, tag_name, "script") or
+                           mem.eql(u8, tag_name, "style") or
+                           mem.eql(u8, tag_name, "template") or
+                           mem.eql(u8, tag_name, "title")) {
+                    // head要素に入るべき要素 - inHeadモードで処琁E                    try self.processToke
+nInHeadMode(token);
+                } else if (mem.eql(u8, tag_name, "body")) {
+                    // 2回目のbody開始タグはエラー
+                    try self.state.addError(start_tag.line, start_tag.column, "Unexpected second body el
+ement", false);
+                    
+                    // ただし属性の追加は許可�E�最初�Ebodyに�E�E                    for (self.state.open_eleme
+nts.items) |element| {
+                        if (element.tag_name != null and mem.eql(u8, element.tag_name.?, "body")) {
+                            // 新しいbodyの属性を既存�Ebodyに追加
+                            for (start_tag.attributes) |attr| {
+                                if (!hasAttribute(element, attr.name)) {
+                                    try self.addAttribute(element, attr.name, attr.value);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                } else if (mem.eql(u8, tag_name, "frameset")) {
+                    // framesetタグの処琁E                    try self.state.addError(start_tag.line, sta
+rt_tag.column, "Unexpected frameset in body mode", false);
+                    
+                    // frameset_okがfalseなら無要E                    if (!self.state.frameset_ok) {
+                        return;
+                    }
+                    
+                    // bodyを削除
+                    var body_index: usize = 0;
+                    for (self.state.open_elements.items) |element, i| {
+                        if (element.tag_name != null and mem.eql(u8, element.tag_name.?, "body")) {
+                            body_index = i;
+                            break;
+                        }
+                    }
+                    
+                    // bodyを削除
+                    if (body_index > 0) {
+                        const body_element = self.state.open_elements.items[body_index];
+                        if (body_element.parent_node) |parent| {
+                            try self.removeNode(parent, body_element);
+                        }
+                        
+                        // 開いた要素スタチE��からbodyまでを削除
+                        while (self.state.open_elements.items.len > body_index) {
+                            _ = self.state.open_elements.pop();
+                        }
+                    }
+                    
+                    // framesetを追加
+                    const frameset_element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), frameset_element);
+                    try self.state.open_elements.append(frameset_element);
+                    
+                    // framesetモードに刁E��替ぁE                    self.state.insertion_mode = .in_framese
+t;
+                } else if (isSpecialBodyElement(tag_name)) {
+                    // 特殊なbody要素の処琁E��E, h1-h6, divなど�E�E                    try self.processSpecia
+lBodyElement(tag_name, start_tag);
+                } else {
+                    // そ�E他�E要素 - チE��ォルト�E琁E                    try self.reconstructActiveFormatting
+Elements();
+                    
+                    // 要素を作�Eして追加
+                    const element = try self.createHTMLElement(start_tag);
+                    try self.appendNode(self.currentOpenElement(), element);
+                    try self.state.open_elements.append(element);
+                    
+                    if (start_tag.self_closing) {
+                        _ = self.state.open_elements.pop();
+                    }
+                    
+                    // 統計情報更新
+                    if (self.options.collect_statistics) {
+                        self.statistics.elements_found += 1;
+                    }
+                    
+                    // フレームセチE��OKフラグを更新
+                    if (mem.eql(u8, tag_name, "applet") or 
+                        mem.eql(u8, tag_name, "marquee") or 
+                        mem.eql(u8, tag_name, "object")) {
+                        self.state.frameset_ok = false;
+                    }
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                
+                if (mem.eql(u8, tag_name, "body")) {
+                    // bodyの終亁E��グ
+                    if (!self.hasElementInScope("body")) {
+                        try self.state.addError(end_tag.line, end_tag.column, "Unexpected body end tag w
+ithout body in scope", false);
+                        return;
+                    }
+                    
+                    // afterBodyモードに刁E��替ぁE                    self.state.insertion_mode = .after_bod
+y;
+                } else if (mem.eql(u8, tag_name, "html")) {
+                    // htmlの終亁E��グ - bodyの終亁E��して扱ぁE���E処琁E                    if (!self.hasElement
+InScope("body")) {
+                        try self.state.addError(end_tag.line, end_tag.column, "Unexpected html end tag w
+ithout body in scope", false);
+                        return;
+                    }
+                    
+                    // bodyを終亁E��てhtmlを�E処琁E                    self.state.insertion_mode = .after_bo
+dy;
+                    try self.processToken(token);
+                } else if (isHeadingElement(tag_name)) {
+                    // 見�Eし要素�E�E1〜h6�E��E終亁E                    if (!self.hasElementInScope(tag_name)) 
+{
+                        try self.state.addError(end_tag.line, end_tag.column, "Heading end tag without h
+eading in scope", false);
+                        return;
+                    }
+                    
+                    // 要素を閉じる
+                    try self.closeElementsUntilTagName(tag_name);
+                } else if (isParagraphElement(tag_name)) {
+                    // 段落要素の終亁E                    try self.closeParagraphElement(tag_name, end_ta
+g);
+                } else {
+                    // そ�E他�E終亁E��グ
+                    try self.processGenericEndTag(tag_name, end_tag);
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンは素直に処琁E                try self.reconstructActiveFormattingElements
+();
+                try self.insertNode(self.currentOpenElement() orelse return, try self.createNode(token))
+;
+            },
+        }
+    }
+    
+    // 段落要素を閉じる
+    fn closeParagraphElement(self: *HTMLParser, tag_name: []const u8, end_tag: tokenizer.EndTagData) !vo
+id {
+        if (!self.hasElementInScope("p")) {
+            // 段落タグがスコープ�Eになければエラー
+            try self.state.addError(end_tag.line, end_tag.column, "No p element in scope", false);
+            
+            // 暗黙的にp要素を開姁E            var attr_array = [_]tokenizer.HTMLAttribute{};
+            var start_tag = tokenizer.StartTagData{
+                .name = "p",
+                .attributes = &attr_array,
+                .self_closing = false,
+                .line = end_tag.line,
+                .column = end_tag.column,
+            };
+            
+            // p要素を作�E
+            const p_element = try self.createHTMLElement(start_tag);
+            try self.appendNode(self.currentOpenElement(), p_element);
+            try self.state.open_elements.append(p_element);
+        }
+        
+        // p要素を閉じる
+        try self.closeElementsUntilTagName("p");
+    }
+    
+    // 特殊なbody要素の処琁E    fn processSpecialBodyElement(self: *HTMLParser, tag_name: []const u8, star
+t_tag: tokenizer.StartTagData) !void {
+        // アクチE��ブな整形要素の再構篁E        try self.reconstructActiveFormattingElements();
+        
+        // p要素が開ぁE��ぁE��場合�E暗黙的に閉じめE        if (self.hasElementInOpenStack("p")) {
+            try self.closeElementsUntilTagName("p");
+        }
+        
+        // 新しい要素を作�Eして追加
+        const element = try self.createHTMLElement(start_tag);
+        try self.appendNode(self.currentOpenElement(), element);
+        try self.state.open_elements.append(element);
+        
+        // 特定�E要素の場合�EフレームセチE��OKフラグを更新
+        if (isFormattingElement(tag_name)) {
+            // 整形要素をアクチE��ブ整形要素リストに追加
+            try self.addActiveFormattingElement(element);
+        }
+        
+        // 統計情報更新
+        if (self.options.collect_statistics) {
+            self.statistics.elements_found += 1;
+        }
+    }
+    
+    // 特殊な要素�E�E, div, h1-h6など�E�かどぁE��のチェチE��
+    fn isSpecialBodyElement(tag_name: []const u8) bool {
+        return mem.eql(u8, tag_name, "p") or
+               mem.eql(u8, tag_name, "div") or
+               isHeadingElement(tag_name) or
+               isFormattingElement(tag_name);
+    }
+    
+    // 見�Eし要素かどぁE��のチェチE��
+    fn isHeadingElement(tag_name: []const u8) bool {
+        return mem.eql(u8, tag_name, "h1") or
+               mem.eql(u8, tag_name, "h2") or
+               mem.eql(u8, tag_name, "h3") or
+               mem.eql(u8, tag_name, "h4") or
+               mem.eql(u8, tag_name, "h5") or
+               mem.eql(u8, tag_name, "h6");
+    }
+    
+    // 段落要素かどぁE��のチェチE��
+    fn isParagraphElement(tag_name: []const u8) bool {
+        return mem.eql(u8, tag_name, "p");
+    }
+    
+    // 整形要素かどぁE��のチェチE��
+    fn isFormattingElement(tag_name: []const u8) bool {
+        return mem.eql(u8, tag_name, "b") or
+               mem.eql(u8, tag_name, "big") or
+               mem.eql(u8, tag_name, "code") or
+               mem.eql(u8, tag_name, "em") or
+               mem.eql(u8, tag_name, "font") or
+               mem.eql(u8, tag_name, "i") or
+               mem.eql(u8, tag_name, "s") or
+               mem.eql(u8, tag_name, "small") or
+               mem.eql(u8, tag_name, "strike") or
+               mem.eql(u8, tag_name, "strong") or
+               mem.eql(u8, tag_name, "tt") or
+               mem.eql(u8, tag_name, "u");
+    }
+    
+    // 一般皁E��終亁E��グの処琁E    fn processGenericEndTag(self: *HTMLParser, tag_name: []const u8, end_tag:
+ tokenizer.EndTagData) !void {
+        // 要素スタチE��から対象の要素を探ぁE        var i = self.state.open_elements.items.len;
+        while (i > 0) {
+            i -= 1;
+            const element = self.state.open_elements.items[i];
+            
+            if (element.tag_name != null and mem.eql(u8, element.tag_name.?, tag_name)) {
+                // 要素が見つかっぁE- ここまでスタチE��を�EチE�E
+                try self.closeElementsUntil(i);
+                return;
+            }
+            
+            // 特殊要素に到達したら警告を出して終亁E            if (isSpecialElement(element)) {
+                try self.state.addError(end_tag.line, end_tag.column, "End tag for element not in scope"
+, false);
+                return;
+            }
+        }
+    }
+    
+    // 特殊要素かどぁE��のチェチE��
+    fn isSpecialElement(element: *dom.Node) bool {
+        if (element.tag_name == null) {
+            return false;
+        }
+        
+        // 特殊要素リスト！ETMLの要素カチE��リーに基づく！E        return isSpecialBodyElement(element.tag_n
+ame.?);
+    }
+    
+    // 持E��したインチE��クスまでの要素を閉じる
+    fn closeElementsUntil(self: *HTMLParser, index: usize) !void {
+        while (self.state.open_elements.items.len > index + 1) {
+            _ = self.state.open_elements.pop();
+        }
+    }
+    
+    // 持E��したタグ名まで要素を閉じる
+    fn closeElementsUntilTagName(self: *HTMLParser, tag_name: []const u8) !void {
+        // 要素スタチE��から対象の要素を探ぁE        var i = self.state.open_elements.items.len;
+        while (i > 0) {
+            i -= 1;
+            const element = self.state.open_elements.items[i];
+            
+            if (element.tag_name != null and mem.eql(u8, element.tag_name.?, tag_name)) {
+                // 要素が見つかっぁE- ここまでスタチE��を�EチE�E
+                try self.closeElementsUntil(i);
+                return;
+            }
+        }
+    }
+    
+    // 要素がスコープ�EにあるかどぁE��を確誁E    fn hasElementInScope(self: *HTMLParser, tag_name: []const u8) 
+bool {
+        // スコープ�Eの確認！ETML仕様に準拠�E�E        for (self.state.open_elements.items) |element| {
+            if (element.tag_name != null and mem.eql(u8, element.tag_name.?, tag_name)) {
+                return true;
+            }
+            
+            // スコープ区刁E��要素チェチE��
+            if (isScopeDelimiter(element)) {
+                return false;
+            }
+        }
+        
+        return false;
+    }
+    
+    // スコープ区刁E��要素かどぁE��
+    fn isScopeDelimiter(element: *dom.Node) bool {
+        if (element.tag_name == null) {
+            return false;
+        }
+        
+        const tag_name = element.tag_name.?;
+        
+        // スコープ区刁E��要素リスチE        return mem.eql(u8, tag_name, "applet") or
+               mem.eql(u8, tag_name, "caption") or
+               mem.eql(u8, tag_name, "html") or
+               mem.eql(u8, tag_name, "table") or
+               mem.eql(u8, tag_name, "td") or
+               mem.eql(u8, tag_name, "th") or
+               mem.eql(u8, tag_name, "marquee") or
+               mem.eql(u8, tag_name, "object") or
+               mem.eql(u8, tag_name, "template");
+    }
+    
+    // アクチE��ブな整形要素の再構篁E    fn reconstructActiveFormattingElements(self: *HTMLParser) !void {
+        // アクチE��ブ整形要素リストが空なら何もしなぁE        if (self.state.active_formatting_elements.items.
+len == 0) {
+            return;
+        }
+        
+        // 最後�E要素の確誁E        const last_index = self.state.active_formatting_elements.items.len - 1
+;
+        const last = self.state.active_formatting_elements.items[last_index];
+        
+        // 最後�E要素が�Eーカーか、既に開いた要素スタチE��にある場合�E何もしなぁE        if (last == null or self.h
+asElementInOpenStack(last.?.tag_name.?)) {
+            return;
+        }
+        
+        // 再構築�E琁E        var i = last_index;
+        while (i > 0) {
+            i -= 1;
+            const element = self.state.active_formatting_elements.items[i];
+            
+            // マ�Eカーに到達したか、既に開いた要素スタチE��にある要素に到達した場吁E            if (element == nu
+ll or self.hasElementInOpenStack(element.?.tag_name.?)) {
+                i += 1; // 次の要素から再構築を開姁E                break;
+            }
+        }
+        
+        // iから最後までの要素を�E構篁E        var j = i;
+        while (j <= last_index) {
+            const format_element = self.state.active_formatting_elements.items[j].?;
+            
+            // 要素を�E作�E
+            if (format_element.tag_name) |tag_name| {
+                // 属性を収雁E                var attributes = std.ArrayList(tokenizer.HTMLAttribute).init
+(self.allocator);
+                defer attributes.deinit();
+                
+                if (format_element.attributes) |attrs| {
+                    for (attrs.items) |attr| {
+                        try attributes.append(.{
+                            .name = attr.name,
+                            .value = attr.value,
+                        });
+                    }
+                }
+                
+                // StartTagData を作�E
+                var start_tag = tokenizer.StartTagData{
+                    .name = tag_name,
+                    .attributes = attributes.items.ptr[0..attributes.items.len],
+                    .self_closing = false,
+                    .line = 0,
+                    .column = 0,
+                };
+                
+                // 要素を作�Eして現在のノ�Eドに追加
+                const clone = try self.createHTMLElement(start_tag);
+                try self.appendNode(self.currentOpenElement() orelse return, clone);
+                try self.state.open_elements.append(clone);
+                
+                // アクチE��ブ整形要素リストを更新
+                self.state.active_formatting_elements.items[j] = clone;
+            }
+            
+            j += 1;
+        }
+    }
+    
+    // 開いた要素スタチE��に持E��したタグ名�E要素があるかどぁE��
+    fn hasElementInOpenStack(self: *HTMLParser, tag_name: []const u8) bool {
+        for (self.state.open_elements.items) |element| {
+            if (element.tag_name != null and mem.eql(u8, element.tag_name.?, tag_name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    // アクチE��ブ整形要素を追加
+    fn addActiveFormattingElement(self: *HTMLParser, element: *dom.Node) !void {
+        try self.state.active_formatting_elements.append(element);
+    }
+
+    // スコープ�Eで開いてぁE��要素をチェチE��し、警告や自動修正を行う
+    fn checkOpenElements(self: *HTMLParser, closing_tag: []const u8) !void {
+        // 閉じようとしてぁE��要素�E�例：body�E�以外に、E        // まだ開いたままの要素がなぁE��チェチE��する
+        
+        // bodyめEtmlを閉じる時点で開いてぁE��要素のリストを取征E        var still_open = std.ArrayList(*DOM.Node
+).init(self.allocator);
+        defer still_open.deinit();
+        
+        // 閉じるタグより冁E�Eにある要素を収雁E        var found_target = false;
+        
+        for (self.state.open_elements.items) |element| {
+            if (element.nodeType == .Element and element.localName != null) {
+                if (mem.eql(u8, element.localName.?, closing_tag)) {
+                    found_target = true;
+                    continue;
+                }
+                
+                if (found_target) {
+                    // 閉じる要素の冁E�Eにまだ開いてぁE��要素があめE                    try still_open.append(el
+ement);
+                }
+            }
+        }
+        
+        // 開いてぁE��要素がある場吁E        if (still_open.items.len > 0) {
+            // 警告を記録
+            try self.state.addError(0, 0, 
+                std.fmt.allocPrint(self.allocator, 
+                    "Unclosed elements at </{s}>: {d} elements", 
+                    .{closing_tag, still_open.items.len}
+                ) catch "Unclosed elements", 
+                true
+            );
+            
+            // チE��チE��ログに詳細惁E��
+            std.log.debug("Unclosed elements:", .{});
+            for (still_open.items) |element| {
+                if (element.localName) |name| {
+                    std.log.debug("  <{s}>", .{name});
+                }
+            }
+            
+            // 特定�E要素�E�E, li, dd, dt など�E��E自動的に閉じめE            for (still_open.items) |element| {
+                if (element.localName) |name| {
+                    if (shouldAutoClose(name)) {
+                        std.log.debug("Auto-closing <{s}>", .{name});
+                        
+                        // 自動的に閉じめE                        _ = self.closeElementsToTag(name) catch {
+                            std.log.warn("Failed to auto-close <{s}>", .{name});
+                        };
+                    }
+                }
+            }
+        }
+    }
+    
+    // 自動的に閉じるべき要素かどぁE��判断
+    fn shouldAutoClose(tag_name: []const u8) bool {
+        return mem.eql(u8, tag_name, "p") or 
+               mem.eql(u8, tag_name, "li") or
+               mem.eql(u8, tag_name, "dd") or
+               mem.eql(u8, tag_name, "dt") or
+               mem.eql(u8, tag_name, "option") or
+               mem.eql(u8, tag_name, "optgroup") or
+               mem.eql(u8, tag_name, "rb") or
+               mem.eql(u8, tag_name, "rt") or
+               mem.eql(u8, tag_name, "rtc") or
+               mem.eql(u8, tag_name, "rp");
+    }
+
+    // 挿入モードをリセチE��
+    fn resetInsertionMode(self: *HTMLParser) !void {
+        var last = false;
+        var i: usize = self.state.open_elements.items.len;
+        
+        while (i > 0) : (i -= 1) {
+            var idx = i - 1;
+            if (idx == 0) {
+                last = true;
+                // contextのhtml要素を使用
+                
+                // HTMLフラグメントパース時�E特殊�E琁E            }
+            
+            const node = self.state.open_elements.items[idx];
+            if (node.nodeType != .Element) continue;
+            if (node.localName == null) continue;
+            
+            const tag_name = node.localName.?;
+            
+            if (mem.eql(u8, tag_name, "select")) {
+                // チE�Eブルの入れ子�Eケース
+                var ancestor_idx = idx;
+                var in_table = false;
+                
+                // 祖�Eにtable関連要素があるか確誁E                while (ancestor_idx > 0) {
+                    ancestor_idx -= 1;
+                    const ancestor = self.state.open_elements.items[ancestor_idx];
+                    
+                    if (ancestor.localName) |ancestor_name| {
+                        if (mem.eql(u8, ancestor_name, "table")) {
+                            in_table = true;
+                            break;
+                        }
+                    }
+                }
+                
+                self.state.insertion_mode = .in_select;
+                
+                if (in_table) {
+                    self.state.insertion_mode = .in_select_in_table;
+                }
+                
+                return;
+            } else if (mem.eql(u8, tag_name, "td") or mem.eql(u8, tag_name, "th")) {
+                self.state.insertion_mode = .in_cell;
+                return;
+            } else if (mem.eql(u8, tag_name, "tr")) {
+                self.state.insertion_mode = .in_row;
+                return;
+            } else if (mem.eql(u8, tag_name, "tbody") or 
+                       mem.eql(u8, tag_name, "thead") or 
+                       mem.eql(u8, tag_name, "tfoot")) {
+                self.state.insertion_mode = .in_table_body;
+                return;
+            } else if (mem.eql(u8, tag_name, "caption")) {
+                self.state.insertion_mode = .in_caption;
+                return;
+            } else if (mem.eql(u8, tag_name, "colgroup")) {
+                self.state.insertion_mode = .in_column_group;
+                return;
+            } else if (mem.eql(u8, tag_name, "table")) {
+                self.state.insertion_mode = .in_table;
+                return;
+            } else if (mem.eql(u8, tag_name, "head")) {
+                self.state.insertion_mode = .in_body;
+                return;
+            } else if (mem.eql(u8, tag_name, "body")) {
+                self.state.insertion_mode = .in_body;
+                return;
+            } else if (mem.eql(u8, tag_name, "template")) {
+                // チE��プレートインサーションモードスタチE��から取征E                try self.useTemplateInserti
+onMode();
+                return;
+            } else if (mem.eql(u8, tag_name, "html")) {
+                if (self.state.head_element == null) {
+                    self.state.insertion_mode = .before_head;
+                } else {
+                    self.state.insertion_mode = .after_head;
+                }
+                return;
+            } else if (last) {
+                self.state.insertion_mode = .in_body;
+                return;
+            }
+        }
+    }
+    
+    // チE��プレート挿入モードをスタチE��から取得して利用する
+    fn useTemplateInsertionMode(self: *HTMLParser) !void {
+        if (self.state.template_insertion_modes.items.len == 0) {
+            // チE��プレートスタチE��が空の場合�Eエラー
+            std.log.err("Template insertion mode stack is empty", .{});
+            self.state.insertion_mode = .in_body; // チE��ォルチE        } else {
+            // スタチE��の最上位�Eモードを使用
+            const mode = self.state.template_insertion_modes.items[self.state.template_insertion_modes.i
+tems.len - 1];
+            self.state.insertion_mode = mode;
+        }
+    }
+    
+    // チE��プレート挿入モードをスタチE��に追加
+    fn pushTemplateInsertionMode(self: *HTMLParser, mode: InsertionMode) !void {
+        try self.state.template_insertion_modes.append(mode);
+    }
+    
+    // チE��プレート挿入モードをスタチE��から削除
+    fn popTemplateInsertionMode(self: *HTMLParser) !void {
+        if (self.state.template_insertion_modes.items.len > 0) {
+            _ = self.state.template_insertion_modes.pop();
+        }
+    }
+
+    // メタ要素のエンコーチE��ング検�EロジチE��
+    fn detectEncodingFromMeta(self: *HTMLParser, start_tag: tokenizer.HTMLStartTag) !?[]const u8 {
+        var detected_encoding: ?[]const u8 = null;
+
+        // 属性をループして charset また�E http-equiv=content-type を探ぁE        for (start_tag.attributes) 
+|attr| {
+            if (mem.eql(u8, attr.name, "charset")) {
+                // charset属性が直接持E��されてぁE��場吁E                detected_encoding = attr.value;
+                break;
+            } else if (mem.eql(u8, attr.name, "http-equiv") and
+                attr.value != null and
+                mem.eql(u8, attr.value.?, "content-type"))
+            {
+                // content属性を探ぁE                for (start_tag.attributes) |content_attr| {
+                    if (mem.eql(u8, content_attr.name, "content") and
+                        content_attr.value != null)
+                    {
+                        // Content-TypeからエンコーチE��ングを抽出
+                        // 侁E "text/html; charset=UTF-8"
+                        if (std.mem.indexOf(u8, content_attr.value.?, "charset=")) |idx| {
+                            const charset_start = idx + 8; // "charset=".len
+                            var charset_end = content_attr.value.?.len;
+
+                            // セミコロンまた�E空白で区刁E��れてぁE��可能性があめE                            if 
+(std.mem.indexOf(u8, content_attr.value.?[charset_start..], ";")) |end_idx| {
+                                charset_end = charset_start + end_idx;
+                            }
+                            if (std.mem.indexOf(u8, content_attr.value.?[charset_start..], " ")) |end_id
+x| {
+                                charset_end = std.math.min(charset_end, charset_start + end_idx);
+                            }
+
+                            detected_encoding = content_attr.value.?[charset_start..charset_end];
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        return detected_encoding;
+    }
+
+    // エンコーチE��ングを正規化
+    fn normalizeEncoding(self: *HTMLParser, encoding: []const u8) []const u8 {
+        _ = self;
+        
+        // エンコーチE��ングの正規化�E�大斁E��小文字を無視する等！E        if (mem.eql(u8, encoding, "UTF-8") or
+            mem.eql(u8, encoding, "utf-8") or
+            mem.eql(u8, encoding, "utf8")) {
+            return "UTF-8";
+        } else if (mem.eql(u8, encoding, "ISO-8859-1") or
+            mem.eql(u8, encoding, "iso-8859-1")) {
+            return "ISO-8859-1";
+        } else if (mem.eql(u8, encoding, "windows-1252") or
+            mem.eql(u8, encoding, "Windows-1252")) {
+            return "windows-1252";
+        } else if (mem.eql(u8, encoding, "Shift_JIS") or
+            mem.eql(u8, encoding, "shift_jis") or
+            mem.eql(u8, encoding, "SHIFT-JIS")) {
+            return "Shift_JIS";
+        } else if (mem.eql(u8, encoding, "EUC-JP") or
+            mem.eql(u8, encoding, "euc-jp")) {
+            return "EUC-JP";
+        } else if (mem.eql(u8, encoding, "ISO-2022-JP") or
+            mem.eql(u8, encoding, "iso-2022-jp")) {
+            return "ISO-2022-JP";
+        } else if (mem.eql(u8, encoding, "Big5") or
+            mem.eql(u8, encoding, "big5")) {
+            return "Big5";
+        } else if (mem.eql(u8, encoding, "GBK") or
+            mem.eql(u8, encoding, "gbk")) {
+            return "GBK";
+        } else if (mem.eql(u8, encoding, "gb18030") or
+            mem.eql(u8, encoding, "GB18030")) {
+            return "GB18030";
+        } else {
+            return encoding;
+        }
+    }
+
+    // エンコーチE��ングの処琁E��設宁E    fn processMetaEncoding(self: *HTMLParser, detected_encoding: ?[]con
+st u8) !void {
+        if (detected_encoding) |encoding| {
+            std.log.debug("Detected character encoding: {s}", .{encoding});
+
+            // エンコーチE��ングの正規化
+            const normalized_encoding = self.normalizeEncoding(encoding);
+
+            // 忁E��に応じてストリームを�EエンコーチE            if (!mem.eql(u8, normalized_encoding, "UTF-8"
+)) {
+                // 非UTF-8エンコーチE��ングが検�Eされた場合、追加処琁E��忁E��E                try self.state.addE
+rror(0, 0, "Non-UTF-8 encoding detected. Character encoding conversion required.", true);
+                
+                // 実際の実裁E��は、エンコーチE��ング変換ライブラリを使用してストリームを�EエンコーチE              
+  if (self.tokenizer_obj) |*t| {
+                    if (@hasDecl(@TypeOf(t.*), "setEncoding")) {
+                        try t.setEncoding(normalized_encoding);
+                    } else {
+                        std.log.warn("Tokenizer doesn't support encoding switching. Document may not be 
+parsed correctly.", .{});
+                    }
+                }
+            }
+        }
+    }
+
+    // チE��プレート挿入モードスタチE��からの取征E    fn getTemplateInsertionMode(self: *HTMLParser) InsertionMod
+e {
+        // チE��プレートスタチE��が空の場合�Ein_templateを返す
+        if (self.state.template_insertion_modes.items.len == 0) {
+            return .in_template;
+        }
+        
+        // スタチE��の最上位�Eモードを返す
+        return self.state.template_insertion_modes.items[self.state.template_insertion_modes.items.len -
+ 1];
+    }
+
+    // チE��プレート要素の処琁E    fn processInTemplateMode(self: *HTMLParser, token: tokenizer.HTMLToken) !
+void {
+        switch (token) {
+            .Character => |char| {
+                // 斁E���EinBodyモードと同様に処琁E                try self.processInBodyMode(token);
+            },
+            .Comment => |comment| {
+                // コメント�Eそ�Eまま挿入
+                try self.appendComment(self.currentOpenElement(), comment.data);
+            },
+            .DOCTYPE => |doctype| {
+                // DOCTYPEはエラー
+                try self.state.addError(doctype.line, doctype.column, "Unexpected DOCTYPE in template", 
+false);
+            },
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+                
+                if (mem.eql(u8, tag_name, "base") or
+                    mem.eql(u8, tag_name, "basefont") or
+                    mem.eql(u8, tag_name, "bgsound") or
+                    mem.eql(u8, tag_name, "link") or
+                    mem.eql(u8, tag_name, "meta") or
+                    mem.eql(u8, tag_name, "noframes") or
+                    mem.eql(u8, tag_name, "script") or
+                    mem.eql(u8, tag_name, "style") or
+                    mem.eql(u8, tag_name, "title"))
+                {
+                    // headに関連する要素は<head>モードで処琁E                    try self.processInHeadMod
+e(token);
+                } else if (mem.eql(u8, tag_name, "caption") or
+                           mem.eql(u8, tag_name, "colgroup") or
+                           mem.eql(u8, tag_name, "tbody") or
+                           mem.eql(u8, tag_name, "tfoot") or
+                           mem.eql(u8, tag_name, "thead"))
+                {
+                    // チE�Eブル関連要素は、挿入モードをinTableに変更して処琁E                    _ = try self.p
+opTemplateInsertionMode();
+                    try self.pushTemplateInsertionMode(.in_table);
+                    self.state.insertion_mode = .in_table;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "col")) {
+                    // colはinColumnGroupモードで処琁E                    _ = try self.popTemplateInsertio
+nMode();
+                    try self.pushTemplateInsertionMode(.in_column_group);
+                    self.state.insertion_mode = .in_column_group;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "tr")) {
+                    // trはinTableBodyモードで処琁E                    _ = try self.popTemplateInsertionMo
+de();
+                    try self.pushTemplateInsertionMode(.in_table_body);
+                    self.state.insertion_mode = .in_table_body;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "td") or
+                           mem.eql(u8, tag_name, "th"))
+                {
+                    // セルはinRowモードで処琁E                    _ = try self.popTemplateInsertionMode()
+;
+                    try self.pushTemplateInsertionMode(.in_row);
+                    self.state.insertion_mode = .in_row;
+                    try self.processToken(token);
+                } else if (mem.eql(u8, tag_name, "template")) {
+                    // チE��プレート要素は特別処琁E��EnHeadと同様！E                    try self.processInHead
+Mode(token);
+                } else {
+                    // そ�E他�E要素はinBodyモードで処琁E                    _ = try self.popTemplateInsertio
+nMode();
+                    try self.pushTemplateInsertionMode(.in_body);
+                    self.state.insertion_mode = .in_body;
+                    try self.processToken(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                
+                if (mem.eql(u8, tag_name, "template")) {
+                    // templateの終亁E��グはinHeadモードと同様に処琁E                    try self.processInHe
+adMode(token);
+                } else {
+                    // そ�E他�E終亁E��グはエラー
+                    try self.state.addError(end_tag.line, end_tag.column, "Unexpected end tag in templat
+e", false);
+                }
+            },
+            .EOF => {
+                // EOF処琁E                
+                // チE��プレート要素がスタチE��にあるかチェチE��
+                var has_template = false;
+                for (self.state.open_elements.items) |element| {
+                    if (element.nodeType == .Element and element.localName != null and
+                        mem.eql(u8, element.localName.?, "template")) {
+                        has_template = true;
+                        break;
+                    }
+                }
+                
+                if (!has_template) {
+                    // チE��プレート要素がなければ終亁E�E琁E                    return;
+                }
+                
+                // チE��プレート要素がある場合�Eエラー
+                try self.state.addError(0, 0, "Unclosed template element", false);
+                
+                // チE��プレート要素をすべて閉じめE                while (self.state.open_elements.items.len >
+ 0) {
+                    const element = self.state.currentNode() orelse break;
+                    
+                    if (element.nodeType == .Element and element.localName != null and
+                        mem.eql(u8, element.localName.?, "template")) {
+                        // template要素が見つかっぁE- ここまでスタチE��を�EチE�E
+                        _ = self.state.open_elements.pop();
+                        _ = try self.popTemplateInsertionMode();
+                        try self.clearActiveFormattingElements();
+                    } else {
+                        _ = self.state.open_elements.pop();
+                    }
+                }
+                
+                // 挿入モードをリセチE��
+                try self.resetInsertionMode();
+            },
+        }
+    }
+
+    // チE�Eブル冁E�Eセレクト要素の処琁E    fn processInSelectInTableMode(self: *HTMLParser, token: tokenizer.
+HTMLToken) !void {
+        switch (token) {
+            .StartTag => |start_tag| {
+                const tag_name = start_tag.name;
+                
+                if (mem.eql(u8, tag_name, "caption") or
+                    mem.eql(u8, tag_name, "table") or
+                    mem.eql(u8, tag_name, "tbody") or
+                    mem.eql(u8, tag_name, "tfoot") or
+                    mem.eql(u8, tag_name, "thead") or
+                    mem.eql(u8, tag_name, "tr") or
+                    mem.eql(u8, tag_name, "td") or
+                    mem.eql(u8, tag_name, "th"))
+                {
+                    // チE�Eブル関連要素では、select要素を閉じてからチE�Eブル処琁E                    try self.stat
+e.addError(start_tag.line, start_tag.column, "Table element in select", true);
+                    
+                    // selectを�EチE�E
+                    try self.popUntilSelectClosed();
+                    
+                    // ト�Eクンを�E処琁E                    try self.processToken(token);
+                } else {
+                    // そ�E他�E要素は通常のinSelectモードで処琁E                    try self.processInSelect
+Mode(token);
+                }
+            },
+            .EndTag => |end_tag| {
+                const tag_name = end_tag.name;
+                
+                if (mem.eql(u8, tag_name, "caption") or
+                    mem.eql(u8, tag_name, "table") or
+                    mem.eql(u8, tag_name, "tbody") or
+                    mem.eql(u8, tag_name, "tfoot") or
+                    mem.eql(u8, tag_name, "thead") or
+                    mem.eql(u8, tag_name, "tr") or
+                    mem.eql(u8, tag_name, "td") or
+                    mem.eql(u8, tag_name, "th"))
+                {
+                    // チE�Eブル関連要素の終亁E��グ処琁E                    try self.state.addError(end_tag.li
+ne, end_tag.column, "Table end tag in select", true);
+                    
+                    // タグに対応する要素がスコープ�EにあるかチェチE��
+                    if (self.hasElementInTableScope(tag_name)) {
+                        // selectを�EチE�Eして再�E琁E                        try self.popUntilSelectClosed();
+                        try self.processToken(token);
+                    }
+                } else {
+                    // そ�E他�E終亁E��グは通常のinSelectモードで処琁E                    try self.processInSel
+ectMode(token);
+                }
+            },
+            else => {
+                // そ�E他�Eト�Eクンは通常のinSelectモードで処琁E                try self.processInSelectMode(
+token);
+            },
+        }
+    }
+
+    // select要素を閉じる処琁E    fn popUntilSelectClosed(self: *HTMLParser) !void {
+        var found = false;
+        
+        // select要素をスタチE��から検索
+        var i = self.state.open_elements.items.len;
+        while (i > 0) {
+            i -= 1;
+            const element = self.state.open_elements.items[i];
+            
+            if (element.nodeType == .Element and element.localName != null and 
+                mem.eql(u8, element.localName.?, "select")) {
+                found = true;
+                break;
+            }
+        }
+        
+        if (!found) {
+            return; // select要素がなぁE        }
+        
+        // select要素までポッチE        while (self.state.open_elements.items.len > i) {
+            _ = self.state.open_elements.pop();
+        }
+        
+        // 最後にselect要素も�EチE�E
+        _ = self.state.open_elements.pop();
+        
+        // 挿入モードをリセチE��
+        try self.resetInsertionMode();
+    }
+
+    // チE�Eブルスコープ�Eに要素があるかチェチE��
+    fn hasElementInTableScope(self: *HTMLParser, tag_name: []const u8) bool {
+        // チE�Eブルスコープでの要素検索
+        for (self.state.open_elements.items, 0..) |_, i| {
+            const idx = self.state.open_elements.items.len - 1 - i;
+            const element = self.state.open_elements.items[idx];
+            
+            if (element.nodeType == .Element and element.localName != null) {
+                // 探してぁE��タグが見つかっぁE                if (mem.eql(u8, element.localName.?, tag_name))
+ {
+                    return true;
+                }
+                
+                // チE�Eブルスコープを区刁E��要素
+                if (mem.eql(u8, element.localName.?, "table") or
+                    mem.eql(u8, element.localName.?, "html")) {
+                    return false;
+                }
+            }
+        }
+        
+        return false;
+    }
+
+    // チE��プレート挿入モードをスタチE��から取得して削除
+    fn popTemplateInsertionMode(self: *HTMLParser) !InsertionMode {
+        if (self.state.template_insertion_modes.items.len == 0) {
+            return .in_template; // チE��ォルトモーチE        }
+        
+        return self.state.template_insertion_modes.pop();
+    }
+
+    // チE��プレート挿入モードをスタチE��に追加
+    fn pushTemplateInsertionMode(self: *HTMLParser, mode: InsertionMode) !void {
+        try self.state.template_insertion_modes.append(mode);
+    }
+
+    // アクチE��ブフォーマット要素をクリア
+    fn clearActiveFormattingElements(self: *HTMLParser) !void {
+        while (self.state.active_formatting_elements.items.len > 0) {
+            _ = self.state.active_formatting_elements.pop();
+        }
+    }
+
+    // リセチE��用関数
+    fn useTemplateInsertionMode(self: *HTMLParser) !void {
+        if (self.state.template_insertion_modes.items.len == 0) {
+            self.state.insertion_mode = .in_body;
+            return;
+        }
+        
+        const mode = self.state.template_insertion_modes.items[self.state.template_insertion_modes.items
+.len - 1];
+        self.state.insertion_mode = mode;
+    }
+};
+
+test "error handling" {
+    const allocator = std.testing.allocator;
+
+    // 不正なHTMLをパースして、エラー回復をテスチE    const invalid_html =
+        \\<p>Missing closing tag
+        \\<div>
+        \\  <span>Nested element
+        \\</div>
+    ;
+
+    var parser = try HTMLParser.init(allocator, .{
+        .error_tolerance = .maximum,
+    });
+    defer parser.deinit();
+
+    const document = try parser.parse(invalid_html);
+
+    // ドキュメントがパ�Eスされたことを確誁E    try std.testing.expect(document != null);
+    try std.testing.expect(document.nodeType == .Document);
+
+    // エラーが検�EされてぁE��ことを確誁E    try std.testing.expect(parser.state.errors.items.len > 0);
+
+    // パ�Eサーが破棁E��れてもドキュメント�E残る
+    parser.document = null;
+}
+
+

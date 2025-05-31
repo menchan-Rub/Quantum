@@ -20,6 +20,12 @@ import std/[
   locks
 ]
 
+import ../compression/common/compression_base
+import ../compression/zstd/zstd
+import ../compression/brotli/brotli
+import ../compression/deflate
+import nimcrypto/[aes, gcm, pbkdf2, sysrand, base64]
+
 # 型定義
 type
   MessageType* = enum
@@ -419,11 +425,20 @@ proc sendMessage*(channel: IpcChannel, message: Message): Future[void] {.async.}
   # 送信前の状態更新
   message.status = msSending
   
-  # 圧縮処理
+  # 圧縮処理（本物の実装）
   if channel.config.compression and message.size >= channel.config.compressionThreshold:
-    # 実際の実装では圧縮処理を行う
-    # message.payload = compress(message.payload)
+    let dataStr = $message.payload
+    let format = selectBestCompressionFormat(dataStr)
+    var compressed: string
+    case format:
+      of cfZstd: compressed = zstd.compress(dataStr)
+      of cfBrotli: compressed = brotli.compress(dataStr)
+      of cfDeflate: compressed = compress(dataStr)
+      else: compressed = dataStr
+    message.payload = %compressed
     message.isCompressed = true
+    message.headers["Content-Encoding"] = getContentEncoding(format)
+    message.size = compressed.len
   
   # シリアライズ
   var serializedData: string
@@ -615,10 +630,29 @@ proc sendMessage*(channel: IpcChannel, message: Message): Future[void] {.async.}
     
     serializedData = packer.getBytes()
   
-  # 暗号化（実際の実装では適切な暗号化処理）
+  # 暗号化（本物のAES-GCM実装）
   if channel.config.encryptionEnabled:
-    # serializedData = encrypt(serializedData)
-    discard
+    # 鍵とIVの生成・管理
+    var key = newSeq[byte](32)
+    var iv = newSeq[byte](12)
+    if channel.encryptionKey.len == 32:
+      key = channel.encryptionKey
+    else:
+      discard randomBytes(key)
+      channel.encryptionKey = key
+    discard randomBytes(iv)
+    channel.iv = iv
+    var gcmCtx: GCM[aes256]
+    gcmCtx.init(key, iv)
+    let plainBytes = serializedData.toBytes
+    let cipherBytes = gcmCtx.encrypt(plainBytes)
+    let tag = gcmCtx.getTag()
+    # IV + タグ + 暗号文をBase64でまとめる
+    var encrypted = newSeq[byte](iv.len + tag.len + cipherBytes.len)
+    encrypted[0..<iv.len] = iv
+    encrypted[iv.len..<iv.len+tag.len] = tag
+    encrypted[iv.len+tag.len..^1] = cipherBytes
+    serializedData = base64.encode(encrypted)
   
   # トランスポート種別に応じた送信処理
   case channel.config.transport

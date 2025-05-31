@@ -172,5 +172,81 @@ test "Event methods" {
     try std.testing.expect(event.getCurrentTarget() == null);
     try std.testing.expect(event.getCurrentTargetAsTarget() == null);
 
-    // TODO: ターゲット設定後のヘルパーメソッドのテスト (他のファイル変更後に実施)
-} 
+    // ターゲット設定後のヘルパーメソッドのテスト
+    const NodeType = @import("node.zig").Node;
+    const EventTargetType = @import("../events/event_target.zig").EventTarget;
+
+    // モックターゲットの準備
+    // 注: 実際のEventTargetとNodeを使用するより、テストのためのモック実装
+    const MockNode = struct {
+        node_base: Node = undefined,
+
+        pub fn init(allocator: Allocator) !*@This() {
+            var self = try allocator.create(@This());
+            self.node_base = Node.init(allocator);
+            return self;
+        }
+
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
+            allocator.destroy(self);
+        }
+    };
+
+    const MockEventTarget = struct {
+        event_target_base: EventTarget = undefined,
+
+        pub fn init(allocator: Allocator) !*@This() {
+            var self = try allocator.create(@This());
+            self.event_target_base = EventTarget.init();
+            return self;
+        }
+
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
+            allocator.destroy(self);
+        }
+    };
+
+    // モックオブジェクトの作成
+    var mock_node = try MockNode.init(allocator);
+    defer mock_node.deinit(allocator);
+
+    var mock_target = try MockEventTarget.init(allocator);
+    defer mock_target.deinit(allocator);
+
+    // テスト用イベント
+    var target_event = try Event.create(allocator, "target-test", true, true, false);
+    defer target_event.destroy();
+
+    // FFI関数の代わりにテスト用の関数を設定
+    const original_getTarget = quantum_Event_getTarget;
+    const original_getCurrentTarget = quantum_Event_getCurrentTarget;
+
+    // テスト用の一時的な実装
+    quantum_Event_getTarget = (struct {
+        fn mock(_: *anyopaque) ?*anyopaque {
+            return @ptrCast(mock_node);
+        }
+    }).mock;
+
+    quantum_Event_getCurrentTarget = (struct {
+        fn mock(_: *anyopaque) ?*anyopaque {
+            return @ptrCast(mock_target);
+        }
+    }).mock;
+
+    // ヘルパーメソッドのテスト
+    const target = target_event.getTarget();
+    try std.testing.expect(target != null);
+    try std.testing.expectEqual(@ptrCast(mock_node), target.?);
+
+    const current_target_node = target_event.getCurrentTarget();
+    try std.testing.expect(current_target_node != null);
+
+    const current_target_event_target = target_event.getCurrentTargetAsTarget();
+    try std.testing.expect(current_target_event_target != null);
+    try std.testing.expectEqual(@ptrCast(mock_target), current_target_event_target.?);
+
+    // 元のFFI関数を復元
+    quantum_Event_getTarget = original_getTarget;
+    quantum_Event_getCurrentTarget = original_getCurrentTarget;
+}

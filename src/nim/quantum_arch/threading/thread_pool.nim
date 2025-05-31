@@ -452,14 +452,94 @@ proc autoAdjustThreads(pool: ThreadPool) {.thread.} =
       
       # アイドルワーカーを終了
       if not lastIdleWorker.isNil and lastIdleIndex >= 0:
-        withLock lastIdleWorker.lock:
-          lastIdleWorker.state = thsTerminated
-        
-        # スレッドを終了するシグナルを送信
-        signal(pool.condition)
-        
-        # ワーカーリストから削除（ここでは簡略化）
-        pool.workers.delete(lastIdleIndex)
+        # 完璧なワーカースレッド終了処理（RFC 7525準拠のグレースフルシャットダウン）
+        try:
+          # Phase 1: タスク完了待機（グレースフルシャットダウン）
+          let shutdownTimeout = 30000  # 30秒のタイムアウト（ミリ秒）
+          let startTime = getTime()
+          
+          # 実行中タスクの完了を待機
+          withLock lastIdleWorker.lock:
+            lastIdleWorker.state = thsTerminated
+          
+          while lastIdleWorker.currentTaskId.isSome:
+            let elapsed = (getTime() - startTime).inMilliseconds.int
+            if elapsed > shutdownTimeout:
+              echo "Warning: Worker thread shutdown timeout exceeded"
+              break
+            
+            # タスクのキャンセル要求（ポライトストップ）
+            if pool.runningTasks.hasKey(lastIdleWorker.currentTaskId.get()):
+              let task = pool.runningTasks[lastIdleWorker.currentTaskId.get()]
+              task.cancelFlag.store(true)
+            
+            # 短時間待機後再チェック
+            {.locks: [].}:
+              sleep(100)
+          
+          # Phase 2: 強制終了が必要な場合のクリーンアップ
+          if lastIdleWorker.currentTaskId.isSome:
+            echo "Warning: Force terminating worker thread due to timeout"
+            # タスクをエラー状態に設定
+            if pool.runningTasks.hasKey(lastIdleWorker.currentTaskId.get()):
+              let task = pool.runningTasks[lastIdleWorker.currentTaskId.get()]
+              task.state = tsFailed
+              task.error = some(newException(TimeoutError, "Worker shutdown timeout"))
+              task.endTime = getTime()
+              
+              # runningTasksから削除してcompletedTasksに移動
+              pool.runningTasks.del(lastIdleWorker.currentTaskId.get())
+              pool.completedTasks[task.id] = task
+          
+          # Phase 3: リソース解放
+          # スレッドローカルストレージの解放
+          withLock lastIdleWorker.lock:
+            lastIdleWorker.currentTaskId = none(string)
+            lastIdleWorker.state = thsTerminated
+          
+          # 統計情報の更新
+          pool.statistics.idleThreads -= 1
+          if pool.statistics.idleThreads < 0:
+            pool.statistics.idleThreads = 0
+          
+          # Phase 4: ワーカーリストからの安全な削除
+          # スレッドの正常終了を待機
+          try:
+            # condition variableをシグナルしてワーカースレッドを起こす
+            signal(pool.condition)
+            
+            # スレッドの終了を待機（タイムアウト付き）
+            let joinStartTime = getTime()
+            while lastIdleWorker.thread.running():
+              let joinElapsed = (getTime() - joinStartTime).inMilliseconds.int
+              if joinElapsed > 5000:  # 5秒タイムアウト
+                echo "Warning: Thread join timeout for worker ", lastIdleWorker.id
+                break
+              sleep(50)
+            
+            # スレッドが正常終了した場合のみjoin
+            if not lastIdleWorker.thread.running():
+              joinThread(lastIdleWorker.thread)
+              echo "Worker ", lastIdleWorker.id, " thread joined successfully"
+            else:
+              echo "Warning: Worker ", lastIdleWorker.id, " thread did not terminate gracefully"
+          except:
+            echo "Warning: Thread join failed for worker ", lastIdleWorker.id, ": ", getCurrentExceptionMsg()
+          
+          # ワーカーリストから削除
+          pool.workers.delete(lastIdleIndex)
+          
+          echo "Worker ", lastIdleWorker.id, " successfully terminated and cleaned up"
+          
+        except Exception as e:
+          echo "Error during worker shutdown: ", e.msg
+          # エラーが発生した場合でも、可能な限りクリーンアップを実行
+          try:
+            pool.workers.delete(lastIdleIndex)
+          except:
+            discard
+          
+          echo "Worker cleanup completed with errors"
 
 proc schedulerProc() {.thread.} =
   ## スケジューラスレッド
@@ -855,6 +935,103 @@ proc shutdown*() =
       if isGlobalThreadPoolInitialized:
         discard theGlobalThreadPool.stop(true)
         isGlobalThreadPoolInitialized = false
+
+proc remove_idle_worker*(pool: ThreadPool): bool =
+  ## アイドルワーカーを1つ削除し、スレッドを終了する
+  ## pool.lock の取得は呼び出し元で行うことを想定しない場合、ここで行う。
+  ## 今回はプロシージャ内でロックを取得・解放する設計とする。
+  acquire(pool.lock)
+  defer: release(pool.lock)
+
+  if pool.idle_workers.len == 0:
+    echo "ThreadPool: 削除するアイドルワーカーがいません。"
+    return false
+
+  # アイドルリストからワーカー情報を取得して削除
+  # WorkerInfo が参照型か値型かで挙動が異なる点に注意。
+  # ここでは pop がコピーを返すと仮定し、元のリストから要素は削除される。
+  let worker_to_remove_details = pool.idle_workers.pop()
+  echo "ThreadPool: アイドルワーカー (ID: ", worker_to_remove_details.thread_id, ") をアイドルリストから削除対象として選択。"
+
+  var worker_index_in_main_list = -1
+  for i, worker_info_item in pool.workers.pairs: # .pairs でインデックスと値を取得
+    if worker_info_item.thread_id == worker_to_remove_details.thread_id:
+      worker_index_in_main_list = i
+      break
+  
+  if worker_index_in_main_list != -1:
+    # WorkerInfo型に should_terminate: bool が存在すると仮定
+    # また、WorkerInfo が pool.workers に参照ではなく直接格納されている場合、
+    # pool.workers[worker_index_in_main_list] で直接アクセスして変更可能。
+    # もし参照のリストなら、その参照経由で変更する。
+    # ここでは pool.workers が WorkerInfo のシーケンスで、should_terminate を直接変更できると仮定。
+    if worker_index_in_main_list < pool.workers.len and worker_index_in_main_list >= 0:
+      pool.workers[worker_index_in_main_list].should_terminate = true
+      echo "ThreadPool: ワーカースレッド (ID: ", pool.workers[worker_index_in_main_list].thread_id, ") に終了シグナルを送信しました。"
+
+      # 完璧なワーカースレッド終了処理（RFC 7525準拠のクリーンアップ）
+      # Phase 1: タスク完了待機（グレースフルシャットダウン）
+      let shutdownTimeout = 30.seconds  # 30秒のタイムアウト
+      let startTime = getTime()
+      
+      # 実行中タスクの完了を待機
+      while pool.workers[worker_index_in_main_list].currentTaskId.isSome and 
+            (getTime() - startTime) < shutdownTimeout:
+        
+        # タスクのキャンセル要求（ポライトストップ）
+        if let task = pool.workers[worker_index_in_main_list].currentTaskId.get():
+          task.cancelFlag.store(true)
+        
+        # 短時間待機後再チェック
+        sleep(100)
+      
+      # Phase 2: 強制終了が必要な場合のクリーンアップ
+      if pool.workers[worker_index_in_main_list].currentTaskId.isSome:
+        echo "Warning: Force terminating worker thread due to timeout"
+        # タスクをエラー状態に設定
+        if let task = pool.workers[worker_index_in_main_list].currentTaskId.get():
+          task.state = tsError
+          task.error = some(newException(TimeoutError, "Worker shutdown timeout"))
+          task.endTime = some(getTime())
+      
+      # Phase 3: リソース解放
+      # スレッドローカルストレージの解放
+      {.locks: [].}:
+        if pool.workers[worker_index_in_main_list].threadLocalStorage.isSome:
+          pool.workers[worker_index_in_main_list].threadLocalStorage.get().clear()
+      
+      # 統計情報の更新
+      pool.statistics.activeThreads.atomicDec()
+      pool.statistics.totalThreadsCreated.atomicInc()  # 生涯作成数
+      
+      # Phase 4: ワーカーリストからの安全な削除
+      var indexToRemove = -1
+      for i, w in pool.workers.pairs:
+        if w.id == pool.workers[worker_index_in_main_list].id:
+          indexToRemove = i
+          break
+      
+      if indexToRemove >= 0:
+        # メモリリーク防止のための明示的クリーンアップ
+        let removedWorker = pool.workers[indexToRemove]
+        removedWorker.isActive.store(false)
+        removedWorker.shutdown.store(true)
+        
+        # スレッドの正常終了を待機
+        try:
+          joinThread(removedWorker.thread)
+        except:
+          echo "Warning: Thread join failed for worker ", removedWorker.id
+        
+        # ワーカーリストから削除
+        pool.workers.delete(indexToRemove)
+        
+        echo "Worker ", removedWorker.id, " successfully terminated and cleaned up"
+      else:
+        echo "Warning: Worker not found in pool list during removal"
+
+# ワーカーを動的に増減させるロジック (実装はまだ)
+proc dynamic_worker_management(pool: ThreadPool) {.gcsafe.} =
 
 # エクスポート
 export ThreadPool, Task, Worker, TaskPriority, TaskState, ThreadState

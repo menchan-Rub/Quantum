@@ -291,8 +291,19 @@ proc computeJA3Fingerprint*(tlsProfile: TlsProfile): string =
   
   let ja3String = [tlsVersionStr, cipherSuitesStr, extensionsStr, curvesStr, pointFormatsStr].join(",")
   
-  # 実際の実装ではMD5ハッシュを計算するが、簡略化のためにここでは文字列ハッシュを使用
-  result = $hashString(ja3String)
+  # MD5ハッシュを計算して返す
+  var ctx: MD5Context
+  md5Init(ctx)
+  md5Update(ctx, ja3String)
+  
+  # ハッシュ結果をHEX文字列として返す
+  var digest: MD5Digest
+  md5Final(ctx, digest)
+  
+  # MD5ダイジェストを16進数文字列に変換
+  result = ""
+  for i in 0..<16:
+    result.add(fmt"{digest[i]:02x}")
 
 # メインのTlsFingerprintProtectorの実装
 proc newTlsFingerprintProtector*(): TlsFingerprintProtector =
@@ -508,20 +519,291 @@ proc getProtectionStatus*(protector: TlsFingerprintProtector): JsonNode =
 # エンジン特性への影響を最小化するための関数
 proc applyClientHelloModifications*(
   protector: TlsFingerprintProtector,
-  clientHello: var string
+  clientHello: var seq[byte]
 ): bool =
-  ## ClientHelloパケットを修正（実際の実装ではバイナリデータを操作）
-  ## この実装は模擬的なものであり、実際の使用例を示すためのものです
+  ## ClientHelloパケットを修正する実装
+  ## TLSハンドシェイクパケットの構造に基づいてバイナリデータを直接操作
   if not protector.enabled:
     return false
   
-  # 実際の実装では、ここでClientHelloバイナリデータの操作を行う
-  # 例えば、暗号スイートの順序変更、拡張の追加/削除など
+  # 最小限のバリデーション
+  if clientHello.len < 43:  # TLSハンドシェイクの最小長: Record(5) + Handshake(4) + ClientHello(34)
+    protector.logger.log(lvlError, "ClientHelloデータ長が不足しています")
+    return false
   
-  # シミュレーション：ClientHelloに何らかの修正を加えたと仮定
-  clientHello = clientHello & " [Modified by TLS Fingerprint Protector]"
+  # TLSレコードヘッダを確認
+  if clientHello[0] != 0x16:  # Handshake
+    protector.logger.log(lvlError, "TLSレコードタイプがHandshakeではありません")
+    return false
   
-  return true
+  # TLSバージョン: index 1-2
+  # クライアントハンドシェイクは通常、TLS 1.0以上を示すため0x0301以上を期待
+  if clientHello[1] < 0x03 or (clientHello[1] == 0x03 and clientHello[2] == 0x00):
+    protector.logger.log(lvlError, "非対応TLSバージョン")
+    return false
+  
+  # ハンドシェイクタイプを確認: 0x01 = ClientHello
+  let handshakeType = clientHello[5]
+  if handshakeType != 0x01:  # ClientHello
+    protector.logger.log(lvlError, "ハンドシェイクタイプがClientHelloではありません")
+    return false
+  
+  # ClientHelloの作業コピーを作成
+  var modifiedClientHello = clientHello.toSeq()
+  var modified = false
+  
+  # レコード層のTLSバージョンを修正
+  if protector.tlsProfile.tlsVersion == tlsv12:
+    modifiedClientHello[1] = 0x03
+    modifiedClientHello[2] = 0x03  # TLS 1.2
+    modified = true
+  elif protector.tlsProfile.tlsVersion == tlsv13:
+    modifiedClientHello[1] = 0x03
+    modifiedClientHello[2] = 0x03  # TLS 1.3も1.2として表現されることに注意
+    modified = true
+  
+  # ClientHello本体の位置を特定
+  var pos = 9  # TLSレコードヘッダ(5) + ハンドシェイクヘッダ(4)
+  
+  # ClientHelloバージョン
+  let clientHelloVersionPos = pos + 0  # ClientHelloの先頭
+  modifiedClientHello[clientHelloVersionPos] = 0x03
+  
+  if protector.tlsProfile.tlsVersion == tlsv12:
+    modifiedClientHello[clientHelloVersionPos+1] = 0x03  # TLS 1.2
+    modified = true
+  elif protector.tlsProfile.tlsVersion == tlsv13:
+    modifiedClientHello[clientHelloVersionPos+1] = 0x03  # TLS 1.3も1.2として表現されることに注意
+    modified = true
+  
+  # ランダム値の位置をスキップ (pos + 2) + 32バイト
+  pos += 34
+  
+  # セッションIDの長さ
+  let sessionIdLen = modifiedClientHello[pos].int
+  pos += 1 + sessionIdLen
+  
+  # 暗号スイートの位置 - これが最も重要な修正対象
+  let cipherSuitesLenPos = pos
+  let cipherSuitesLen = (modifiedClientHello[pos].int shl 8) or modifiedClientHello[pos+1].int
+  pos += 2
+  
+  # 暗号スイートの順序を修正
+  if protector.tlsProfile.cipherSuites.len > 0:
+    var newCipherSuites: seq[byte] = @[]
+    for cs in protector.tlsProfile.cipherSuites:
+      newCipherSuites.add((cs shr 8).byte)
+      newCipherSuites.add((cs and 0xFF).byte)
+    
+    # 新しい暗号スイートリストの長さをバイト数に変換
+    let newCipherSuitesLen = newCipherSuites.len
+    
+    # 新しい暗号スイートを適用
+    if newCipherSuitesLen > 0 and newCipherSuitesLen != cipherSuitesLen:
+      # 長さが異なる場合、パケット全体を再構築
+      var newClientHello: seq[byte] = modifiedClientHello[0..<cipherSuitesLenPos]
+      
+      # 新しい長さを追加
+      newClientHello.add((newCipherSuitesLen shr 8).byte)
+      newClientHello.add((newCipherSuitesLen and 0xFF).byte)
+      
+      # 新しい暗号スイートリストを追加
+      newClientHello.add(newCipherSuites)
+      
+      # 残りのデータを追加
+      newClientHello.add(modifiedClientHello[pos + cipherSuitesLen..^1])
+      
+      # ハンドシェイクの長さフィールドを更新
+      let lengthDiff = newCipherSuitesLen - cipherSuitesLen
+      let handshakeLenPos = 6  # ハンドシェイク長さフィールドの位置
+      let handshakeLen = (newClientHello[handshakeLenPos].int shl 16) or
+                         (newClientHello[handshakeLenPos+1].int shl 8) or
+                          newClientHello[handshakeLenPos+2].int
+      let newHandshakeLen = handshakeLen + lengthDiff
+      
+      newClientHello[handshakeLenPos] = ((newHandshakeLen shr 16) and 0xFF).byte
+      newClientHello[handshakeLenPos+1] = ((newHandshakeLen shr 8) and 0xFF).byte
+      newClientHello[handshakeLenPos+2] = (newHandshakeLen and 0xFF).byte
+      
+      # レコードの長さフィールドも更新
+      let recordLenPos = 3  # レコード長さフィールドの位置
+      let recordLen = (newClientHello[recordLenPos].int shl 8) or newClientHello[recordLenPos+1].int
+      let newRecordLen = recordLen + lengthDiff
+      
+      newClientHello[recordLenPos] = ((newRecordLen shr 8) and 0xFF).byte
+      newClientHello[recordLenPos+1] = (newRecordLen and 0xFF).byte
+      
+      modifiedClientHello = newClientHello
+      modified = true
+    elif newCipherSuitesLen == cipherSuitesLen:
+      # 長さが同じ場合、既存のスロットに上書き
+      var suitePos = pos
+      for i in 0..<(newCipherSuitesLen div 2):
+        let highByte = newCipherSuites[i*2]
+        let lowByte = newCipherSuites[i*2+1]
+        modifiedClientHello[suitePos] = highByte
+        modifiedClientHello[suitePos+1] = lowByte
+        suitePos += 2
+      modified = true
+  
+  pos += cipherSuitesLen
+  
+  # 圧縮メソッドをスキップ
+  let compressionMethodsLen = modifiedClientHello[pos].int
+  pos += 1 + compressionMethodsLen
+  
+  # 拡張フィールドがあるか確認
+  if pos + 2 <= modifiedClientHello.len:
+    let extensionsLenPos = pos
+    let extensionsLen = (modifiedClientHello[pos].int shl 8) or modifiedClientHello[pos+1].int
+    pos += 2
+    
+    # 拡張フィールドの処理
+    var extensionsEndPos = pos + extensionsLen
+    if extensionsEndPos <= modifiedClientHello.len:
+      var newExtensions: seq[byte] = @[]
+      
+      # supported_groupsとec_point_formatsの拡張を修正
+      var currentPos = pos
+      while currentPos < extensionsEndPos:
+        let extType = (modifiedClientHello[currentPos].int shl 8) or modifiedClientHello[currentPos+1].int
+        let extLen = (modifiedClientHello[currentPos+2].int shl 8) or modifiedClientHello[currentPos+3].int
+        
+        if extType == 0x000a:  # supported_groups（旧elliptic_curves）
+          # サポートされた楕円曲線グループの拡張を修正
+          let curvesPos = currentPos + 4
+          
+          # 置換するグループリストを構築
+          var newCurves: seq[byte] = @[]
+          
+          # 内部リストの長さフィールドを考慮（先頭2バイト）
+          newCurves.add(0)  # 長さ上位バイト（後で更新）
+          newCurves.add(0)  # 長さ下位バイト（後で更新）
+          
+          # 設定された曲線を追加
+          for curve in protector.tlsProfile.curves:
+            newCurves.add((curve shr 8).byte)
+            newCurves.add((curve and 0xFF).byte)
+          
+          # 内部リストの長さを更新
+          let newCurvesLen = newCurves.len - 2  # 長さフィールド自体を除く
+          newCurves[0] = ((newCurvesLen shr 8) and 0xFF).byte
+          newCurves[1] = (newCurvesLen and 0xFF).byte
+          
+          # 新しい拡張を作成
+          var newExt: seq[byte] = @[]
+          newExt.add(0x00)  # supported_groups拡張タイプ上位バイト
+          newExt.add(0x0a)  # supported_groups拡張タイプ下位バイト
+          newExt.add(((newCurves.len) shr 8).byte)  # 拡張長さ上位バイト
+          newExt.add(((newCurves.len) and 0xFF).byte)  # 拡張長さ下位バイト
+          newExt.add(newCurves)
+          
+          newExtensions.add(newExt)
+          modified = true
+          
+        elif extType == 0x000b:  # ec_point_formats
+          # 点フォーマットの拡張を修正
+          if protector.tlsProfile.pointFormats.len > 0:
+            var newFormats: seq[byte] = @[]
+            
+            # フォーマットリストの長さ（1バイト）
+            newFormats.add(protector.tlsProfile.pointFormats.len.byte)
+            
+            # 設定されたポイントフォーマットを追加
+            for format in protector.tlsProfile.pointFormats:
+              newFormats.add(format.byte)
+            
+            # 新しい拡張を作成
+            var newExt: seq[byte] = @[]
+            newExt.add(0x00)  # ec_point_formats拡張タイプ上位バイト
+            newExt.add(0x0b)  # ec_point_formats拡張タイプ下位バイト
+            newExt.add(((newFormats.len) shr 8).byte)  # 拡張長さ上位バイト
+            newExt.add(((newFormats.len) and 0xFF).byte)  # 拡張長さ下位バイト
+            newExt.add(newFormats)
+            
+            newExtensions.add(newExt)
+            modified = true
+          else:
+            # 既存の拡張をコピー
+            var existingExt: seq[byte] = modifiedClientHello[currentPos..currentPos+3+extLen-1]
+            newExtensions.add(existingExt)
+          
+        elif extType == 0x002b:  # supported_versions（TLS 1.3）
+          # TLS 1.3の場合に対応するサポートバージョンを修正
+          if protector.tlsProfile.tlsVersion == tlsv13:
+            var supportedVersions: seq[byte] = @[]
+            
+            # バージョンリストの長さ（1バイト）
+            supportedVersions.add((2 * 1).byte)  # 2バイト * バージョン数
+            
+            # TLS 1.3のバージョン値
+            supportedVersions.add(0x03)  # メジャーバージョン
+            supportedVersions.add(0x04)  # マイナーバージョン（TLS 1.3）
+            
+            # 新しい拡張を作成
+            var newExt: seq[byte] = @[]
+            newExt.add(0x00)  # supported_versions拡張タイプ上位バイト
+            newExt.add(0x2b)  # supported_versions拡張タイプ下位バイト
+            newExt.add(((supportedVersions.len) shr 8).byte)  # 拡張長さ上位バイト
+            newExt.add(((supportedVersions.len) and 0xFF).byte)  # 拡張長さ下位バイト
+            newExt.add(supportedVersions)
+            
+            newExtensions.add(newExt)
+            modified = true
+          else:
+            # TLS 1.3以外の場合は拡張を削除（存在する場合）
+            # newExtensionsに追加しないことで削除される
+            modified = true
+            
+        else:
+          # その他の拡張をそのままコピー
+          var existingExt: seq[byte] = modifiedClientHello[currentPos..currentPos+3+extLen-1]
+          newExtensions.add(existingExt)
+        
+        currentPos += 4 + extLen
+      
+      # 拡張部分を置き換え
+      var newClientHello: seq[byte] = modifiedClientHello[0..<extensionsLenPos]
+      
+      # 新しい拡張の長さを追加
+      let newExtensionsLen = newExtensions.len
+      newClientHello.add((newExtensionsLen shr 8).byte)
+      newClientHello.add((newExtensionsLen and 0xFF).byte)
+      
+      # 新しい拡張データを追加
+      newClientHello.add(newExtensions)
+      
+      # ハンドシェイクの長さを更新
+      let lengthDiff = newExtensionsLen - extensionsLen
+      let handshakeLenPos = 6  # ハンドシェイク長さフィールドの位置
+      let handshakeLen = (newClientHello[handshakeLenPos].int shl 16) or
+                         (newClientHello[handshakeLenPos+1].int shl 8) or
+                          newClientHello[handshakeLenPos+2].int
+      let newHandshakeLen = handshakeLen + lengthDiff
+      
+      newClientHello[handshakeLenPos] = ((newHandshakeLen shr 16) and 0xFF).byte
+      newClientHello[handshakeLenPos+1] = ((newHandshakeLen shr 8) and 0xFF).byte
+      newClientHello[handshakeLenPos+2] = (newHandshakeLen and 0xFF).byte
+      
+      # レコードの長さを更新
+      let recordLenPos = 3  # レコード長さフィールドの位置
+      let recordLen = (newClientHello[recordLenPos].int shl 8) or newClientHello[recordLenPos+1].int
+      let newRecordLen = recordLen + lengthDiff
+      
+      newClientHello[recordLenPos] = ((newRecordLen shr 8) and 0xFF).byte
+      newClientHello[recordLenPos+1] = (newRecordLen and 0xFF).byte
+      
+      modifiedClientHello = newClientHello
+      modified = true
+  
+  # 修正が行われた場合、新しいClientHelloを返す
+  if modified:
+    clientHello = modifiedClientHello
+    protector.logger.log(lvlInfo, "ClientHello修正適用完了: 新しいJA3指紋=" & protector.tlsProfile.ja3Fingerprint)
+  else:
+    protector.logger.log(lvlDebug, "ClientHello修正は不要でした")
+  
+  return modified
 
 proc getJA3Fingerprint*(protector: TlsFingerprintProtector): string =
   ## 現在のJA3フィンガープリントを取得

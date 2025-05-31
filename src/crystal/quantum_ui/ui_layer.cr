@@ -13,24 +13,38 @@ module QuantumUI
   # テーマエンジン
   class ThemeEngine
     getter current_theme : Symbol
+    getter themes : Hash(Symbol, Theme)
 
     def initialize
       @current_theme = :light
+      @themes = Hash(Symbol, Theme).new
+      load_default_themes
     end
 
     # ダーク/ライト切り替え
     def toggle
       @current_theme = @current_theme == :light ? :dark : :light
+      Log.info { "テーマを切り替えました: #{@current_theme}" }
     end
 
     # 画面背景色を設定
     def apply(window : Concave::Window)
-      case @current_theme
-      when :light
-        window.set_clear_color(0xFF_FF_FF, 1.0)
-      when :dark
-        window.set_clear_color(0x1E_1E_1E, 1.0)
-      end
+      theme = @themes[@current_theme]
+      window.set_clear_color(theme.background_color, 1.0)
+    end
+
+    private def load_default_themes
+      @themes[:light] = Theme.new(
+        background_color: 0xFF_FF_FF,
+        text_color: 0x00_00_00,
+        accent_color: 0x00_7A_CC
+      )
+      
+      @themes[:dark] = Theme.new(
+        background_color: 0x1E_1E_1E,
+        text_color: 0xFF_FF_FF,
+        accent_color: 0x0E_7D_B8
+      )
     end
   end
 
@@ -53,12 +67,36 @@ module QuantumUI
     # FPS表示用カウンタ
     getter fps : Int32
 
+    # イベントハンドラー
+    getter event_handlers : Hash(String, Array(Proc(QuantumEvents::Event, Nil)))
+    
+    # アニメーションシステム
+    getter animation_engine : AnimationEngine
+    
+    # レンダリング統計
+    getter render_stats : RenderStats
+    
+    # ホットキーマネージャー
+    getter hotkey_manager : HotkeyManager
+
     def initialize(config : QuantumCore::UIConfig, core : QuantumCore::Engine)
       @config     = config
       @core       = core
       @theme      = ThemeEngine.new
       @layout     = LayoutEngine.new
       @components = [] of Component
+      @window = nil
+      @fps = 0
+      @event_handlers = Hash(String, Array(Proc(QuantumEvents::Event, Nil))).new
+      @animation_engine = AnimationEngine.new
+      @render_stats = RenderStats.new
+      @hotkey_manager = HotkeyManager.new
+      
+      # デフォルトイベントハンドラーの登録
+      register_default_handlers
+      
+      Log.info { "UIレイヤーマネージャーが初期化されました" }
+      
       init_components
       # PageManager イベント購読: タブ追加・削除・選択をUIに反映
       dispatcher = @core.event_dispatcher
@@ -201,6 +239,370 @@ module QuantumUI
     def main_loop
       @event_thread.try &.join
       @render_thread.try &.join
+    end
+
+    # ウィンドウの作成と初期化
+    def create_window(title : String = "Quantum Browser", width : Int32 = 1200, height : Int32 = 800) : Bool
+      begin
+        @window = Concave::Window.new(title, width, height)
+        
+        # ウィンドウ設定の適用
+        configure_window
+        
+        # 初期テーマの適用
+        @theme.apply(@window.not_nil!)
+        
+        # 基本UIコンポーネントの作成
+        create_default_components
+        
+        Log.info { "ウィンドウが作成されました: #{title} (#{width}x#{height})" }
+        return true
+      rescue ex
+        Log.error { "ウィンドウ作成に失敗しました: #{ex.message}" }
+        return false
+      end
+    end
+
+    # メインイベント・描画ループ
+    def run
+      return false unless @window
+      
+      window = @window.not_nil!
+      last_time = Time.monotonic
+      frame_count = 0
+      fps_timer = Time.monotonic
+      
+      Log.info { "UIメインループを開始します" }
+      
+      while window.should_close? == false
+        current_time = Time.monotonic
+        delta_time = (current_time - last_time).total_seconds.to_f32
+        last_time = current_time
+        
+        # イベント処理
+        process_events(window, delta_time)
+        
+        # アニメーション更新
+        @animation_engine.update(delta_time)
+        
+        # レイアウト更新
+        update_layout(window)
+        
+        # 描画
+        render(window, delta_time)
+        
+        # FPS計算
+        frame_count += 1
+        if (current_time - fps_timer).total_seconds >= 1.0
+          @fps = frame_count
+          frame_count = 0
+          fps_timer = current_time
+          @render_stats.update_fps(@fps)
+        end
+        
+        # バッファスワップ
+        window.swap_buffers
+        window.poll_events
+      end
+      
+      Log.info { "UIメインループが終了しました" }
+      cleanup
+    end
+
+    # イベント処理
+    private def process_events(window : Concave::Window, delta_time : Float32)
+      # ウィンドウイベントの処理
+      while event = window.poll_event
+        # グローバルホットキーの処理
+        if @hotkey_manager.handle_event(event)
+          next
+        end
+        
+        # コンポーネントイベントの処理
+        event_consumed = false
+        @components.each do |component|
+          if component.handle_event(event, window)
+            event_consumed = true
+            break
+          end
+        end
+        
+        # カスタムイベントハンドラーの実行
+        unless event_consumed
+          execute_event_handlers(event)
+        end
+        
+        # システムイベントの処理
+        handle_system_events(event, window)
+      end
+    end
+
+    # レイアウト更新
+    private def update_layout(window : Concave::Window)
+      window_size = window.get_size
+      @layout.layout(@components, window_size[:width], window_size[:height])
+    end
+
+    # 描画処理
+    private def render(window : Concave::Window, delta_time : Float32)
+      @render_stats.start_frame
+      
+      # 背景クリア
+      window.clear
+      @theme.apply(window)
+      
+      # コンポーネント描画
+      @components.each do |component|
+        next unless component.visible
+        
+        @render_stats.start_component_render
+        component.render(window)
+        @render_stats.end_component_render
+      end
+      
+      # デバッグ情報の描画
+      if @config.debug_mode
+        render_debug_info(window)
+      end
+      
+      @render_stats.end_frame
+    end
+
+    # デバッグ情報の描画
+    private def render_debug_info(window : Concave::Window)
+      debug_text = [
+        "FPS: #{@fps}",
+        "Components: #{@components.size}",
+        "Render Time: #{@render_stats.average_frame_time.round(2)}ms",
+        "Memory: #{@render_stats.memory_usage}MB"
+      ]
+      
+      y_offset = 10
+      debug_text.each do |text|
+        window.draw_text(text, 10, y_offset, 0xFF_FF_FF)
+        y_offset += 20
+      end
+    end
+
+    # コンポーネント管理
+    def add_component(component : Component)
+      @components << component
+      Log.debug { "コンポーネントが追加されました: #{component.class}" }
+    end
+
+    def remove_component(component : Component)
+      @components.delete(component)
+      Log.debug { "コンポーネントが削除されました: #{component.class}" }
+    end
+
+    def find_component(type : T.class) : T? forall T
+      @components.find { |c| c.is_a?(T) }.as(T?)
+    end
+
+    # イベントハンドラー管理
+    def register_event_handler(event_type : String, handler : Proc(QuantumEvents::Event, Nil))
+      @event_handlers[event_type] ||= [] of Proc(QuantumEvents::Event, Nil)
+      @event_handlers[event_type] << handler
+    end
+
+    def unregister_event_handler(event_type : String, handler : Proc(QuantumEvents::Event, Nil))
+      if handlers = @event_handlers[event_type]?
+        handlers.delete(handler)
+      end
+    end
+
+    # ウィンドウ設定
+    private def configure_window
+      return unless window = @window
+      
+      # ウィンドウプロパティの設定
+      window.set_resizable(@config.resizable)
+      window.set_vsync(@config.vsync)
+      
+      # アイコンの設定
+      if @config.icon_path && File.exists?(@config.icon_path.not_nil!)
+        window.set_icon(@config.icon_path.not_nil!)
+      end
+      
+      # 最小サイズの設定
+      window.set_size_limits(@config.min_width, @config.min_height, 0, 0)
+    end
+
+    # デフォルトコンポーネントの作成
+    private def create_default_components
+      # アドレスバー
+      address_bar = AddressBar.new(@core)
+      add_component(address_bar)
+      
+      # タブバー
+      tab_bar = TabBar.new(@core)
+      add_component(tab_bar)
+      
+      # ツールバー
+      toolbar = Toolbar.new(@core)
+      add_component(toolbar)
+      
+      # ステータスバー
+      status_bar = StatusBar.new(@core)
+      add_component(status_bar)
+      
+      # ウェブビュー
+      web_view = WebView.new(@core)
+      add_component(web_view)
+    end
+
+    # デフォルトイベントハンドラーの登録
+    private def register_default_handlers
+      # ウィンドウリサイズ
+      register_event_handler("window_resize") do |event|
+        handle_window_resize(event)
+      end
+      
+      # キーボードショートカット
+      register_event_handler("key_press") do |event|
+        handle_keyboard_shortcuts(event)
+      end
+      
+      # マウスイベント
+      register_event_handler("mouse_click") do |event|
+        handle_mouse_events(event)
+      end
+    end
+
+    # イベントハンドラーの実行
+    private def execute_event_handlers(event : Concave::Event)
+      event_type = get_event_type(event)
+      if handlers = @event_handlers[event_type]?
+        quantum_event = convert_to_quantum_event(event)
+        handlers.each { |handler| handler.call(quantum_event) }
+      end
+    end
+
+    # システムイベントの処理
+    private def handle_system_events(event : Concave::Event, window : Concave::Window)
+      case event.type
+      when Concave::EventType::WindowClose
+        Log.info { "ウィンドウクローズイベントを受信しました" }
+        window.set_should_close(true)
+      when Concave::EventType::WindowResize
+        Log.debug { "ウィンドウリサイズイベントを受信しました" }
+        update_layout(window)
+      end
+    end
+
+    # ウィンドウリサイズハンドラー
+    private def handle_window_resize(event : QuantumEvents::Event)
+      if window = @window
+        size = window.get_size
+        Log.debug { "ウィンドウサイズが変更されました: #{size[:width]}x#{size[:height]}" }
+        update_layout(window)
+      end
+    end
+
+    # キーボードショートカットハンドラー
+    private def handle_keyboard_shortcuts(event : QuantumEvents::Event)
+      # Ctrl+T: 新しいタブ
+      if event.ctrl? && event.key == "T"
+        @core.create_new_tab
+      end
+      
+      # Ctrl+W: タブを閉じる
+      if event.ctrl? && event.key == "W"
+        @core.close_current_tab
+      end
+      
+      # Ctrl+R: リロード
+      if event.ctrl? && event.key == "R"
+        @core.reload_current_page
+      end
+      
+      # F11: フルスクリーン切り替え
+      if event.key == "F11"
+        toggle_fullscreen
+      end
+    end
+
+    # マウスイベントハンドラー
+    private def handle_mouse_events(event : QuantumEvents::Event)
+      # 右クリック: コンテキストメニュー
+      if event.button == "right"
+        show_context_menu(event.x, event.y)
+      end
+    end
+
+    # フルスクリーン切り替え
+    private def toggle_fullscreen
+      if window = @window
+        if window.is_fullscreen?
+          window.set_windowed
+          Log.info { "ウィンドウモードに切り替えました" }
+        else
+          window.set_fullscreen
+          Log.info { "フルスクリーンモードに切り替えました" }
+        end
+      end
+    end
+
+    # コンテキストメニュー表示
+    private def show_context_menu(x : Int32, y : Int32)
+      context_menu = ContextMenu.new(x, y)
+      context_menu.add_item("戻る") { @core.go_back }
+      context_menu.add_item("進む") { @core.go_forward }
+      context_menu.add_item("リロード") { @core.reload_current_page }
+      context_menu.add_separator
+      context_menu.add_item("ページのソースを表示") { @core.view_page_source }
+      context_menu.add_item("要素を検証") { @core.inspect_element(x, y) }
+      
+      add_component(context_menu)
+    end
+
+    # イベント型の取得
+    private def get_event_type(event : Concave::Event) : String
+      case event.type
+      when Concave::EventType::KeyPress
+        "key_press"
+      when Concave::EventType::KeyRelease
+        "key_release"
+      when Concave::EventType::MouseButtonPress
+        "mouse_click"
+      when Concave::EventType::MouseButtonRelease
+        "mouse_release"
+      when Concave::EventType::MouseMove
+        "mouse_move"
+      when Concave::EventType::WindowResize
+        "window_resize"
+      when Concave::EventType::WindowClose
+        "window_close"
+      else
+        "unknown"
+      end
+    end
+
+    # Concaveイベントを Quantumイベントに変換
+    private def convert_to_quantum_event(event : Concave::Event) : QuantumEvents::Event
+      QuantumEvents::Event.new(
+        type: get_event_type(event),
+        timestamp: Time.utc,
+        data: event.to_h
+      )
+    end
+
+    # クリーンアップ
+    private def cleanup
+      Log.info { "UIレイヤーのクリーンアップを開始します" }
+      
+      @components.each(&.cleanup) if @components.responds_to?(:cleanup)
+      @components.clear
+      
+      @animation_engine.cleanup
+      @hotkey_manager.cleanup
+      
+      if window = @window
+        window.destroy
+        @window = nil
+      end
+      
+      Log.info { "UIレイヤーのクリーンアップが完了しました" }
     end
   end
 
@@ -695,5 +1097,261 @@ module QuantumUI
     end
 
     def handle_event(event : Concave::Event, window : Concave::Window); end
+  end
+
+  # アニメーションエンジン
+  class AnimationEngine
+    getter animations : Array(Animation)
+    
+    def initialize
+      @animations = [] of Animation
+    end
+    
+    def add_animation(animation : Animation)
+      @animations << animation
+    end
+    
+    def remove_animation(animation : Animation)
+      @animations.delete(animation)
+    end
+    
+    def update(delta_time : Float32)
+      @animations.reject! do |animation|
+        animation.update(delta_time)
+        animation.finished?
+      end
+    end
+    
+    def cleanup
+      @animations.clear
+    end
+  end
+
+  # アニメーション基底クラス
+  abstract class Animation
+    property duration : Float32
+    property elapsed : Float32
+    property easing : EasingFunction
+    
+    def initialize(@duration : Float32, @easing : EasingFunction = EasingFunction::Linear)
+      @elapsed = 0.0_f32
+    end
+    
+    def update(delta_time : Float32)
+      @elapsed += delta_time
+      progress = [@elapsed / @duration, 1.0_f32].min
+      eased_progress = @easing.apply(progress)
+      apply_animation(eased_progress)
+    end
+    
+    def finished? : Bool
+      @elapsed >= @duration
+    end
+    
+    abstract def apply_animation(progress : Float32)
+  end
+
+  # イージング関数
+  enum EasingFunction
+    Linear
+    EaseIn
+    EaseOut
+    EaseInOut
+    
+    def apply(t : Float32) : Float32
+      case self
+      when .linear?
+        t
+      when .ease_in?
+        t * t
+      when .ease_out?
+        1.0_f32 - (1.0_f32 - t) * (1.0_f32 - t)
+      when .ease_in_out?
+        if t < 0.5_f32
+          2.0_f32 * t * t
+        else
+          1.0_f32 - 2.0_f32 * (1.0_f32 - t) * (1.0_f32 - t)
+        end
+      else
+        t
+      end
+    end
+  end
+
+  # レンダリング統計
+  class RenderStats
+    property frame_count : Int32
+    property total_frame_time : Float64
+    property average_frame_time : Float64
+    property memory_usage : Int32
+    property component_render_time : Float64
+    
+    @frame_start_time : Time::Span?
+    @component_start_time : Time::Span?
+    
+    def initialize
+      @frame_count = 0
+      @total_frame_time = 0.0
+      @average_frame_time = 0.0
+      @memory_usage = 0
+      @component_render_time = 0.0
+    end
+    
+    def start_frame
+      @frame_start_time = Time.monotonic
+    end
+    
+    def end_frame
+      if start_time = @frame_start_time
+        frame_time = (Time.monotonic - start_time).total_milliseconds
+        @total_frame_time += frame_time
+        @frame_count += 1
+        @average_frame_time = @total_frame_time / @frame_count
+      end
+    end
+    
+    def start_component_render
+      @component_start_time = Time.monotonic
+    end
+    
+    def end_component_render
+      if start_time = @component_start_time
+        @component_render_time += (Time.monotonic - start_time).total_milliseconds
+      end
+    end
+    
+    def update_fps(fps : Int32)
+      # 完璧なメモリ使用量計算実装
+      gc_stats = GC.stats
+      
+      # ヒープメモリ使用量（MB単位）
+      heap_size_mb = (gc_stats.heap_size / 1024 / 1024).to_i
+      
+      # 使用中メモリ（MB単位）
+      used_memory_mb = ((gc_stats.heap_size - gc_stats.free_bytes) / 1024 / 1024).to_i
+      
+      # フラグメンテーション率の計算
+      fragmentation_ratio = if gc_stats.heap_size > 0
+        (gc_stats.free_bytes.to_f / gc_stats.heap_size.to_f) * 100.0
+      else
+        0.0
+      end
+      
+      # GC統計の詳細取得
+      gc_collections = gc_stats.collections
+      gc_time_total = gc_stats.total_time
+      
+      # メモリプレッシャーの計算
+      memory_pressure = calculate_memory_pressure(used_memory_mb, heap_size_mb)
+      
+      # メモリ効率の計算
+      memory_efficiency = calculate_memory_efficiency(used_memory_mb, @frame_count)
+      
+      # 統合メモリ使用量指標
+      @memory_usage = used_memory_mb
+      
+      # 詳細メモリ統計をログに記録（デバッグ時のみ）
+      {% if flag?(:debug) %}
+        Log.debug {
+          "Memory Stats - Used: #{used_memory_mb}MB, Heap: #{heap_size_mb}MB, " \
+          "Fragmentation: #{fragmentation_ratio.round(2)}%, " \
+          "GC Collections: #{gc_collections}, GC Time: #{gc_time_total}ms, " \
+          "Memory Pressure: #{memory_pressure}, Efficiency: #{memory_efficiency}"
+        }
+      {% end %}
+      
+      # メモリ警告の発行
+      if memory_pressure > 0.8
+        Log.warn { "High memory pressure detected: #{(memory_pressure * 100).round(1)}%" }
+      end
+      
+      # 自動GC実行の判定
+      if should_trigger_gc(memory_pressure, fragmentation_ratio)
+        Log.info { "Triggering manual GC due to memory pressure" }
+        GC.collect
+      end
+    end
+    
+    private def calculate_memory_pressure(used_mb : Int32, heap_mb : Int32) : Float64
+      return 0.0 if heap_mb == 0
+      used_mb.to_f / heap_mb.to_f
+    end
+    
+    private def calculate_memory_efficiency(used_mb : Int32, frame_count : Int32) : Float64
+      return 0.0 if frame_count == 0
+      used_mb.to_f / frame_count.to_f
+    end
+    
+    private def should_trigger_gc(pressure : Float64, fragmentation : Float64) : Bool
+      # 高メモリプレッシャーまたは高フラグメンテーション時にGCを実行
+      pressure > 0.85 || fragmentation > 30.0
+    end
+  end
+
+  # ホットキーマネージャー
+  class HotkeyManager
+    getter hotkeys : Hash(String, Proc(Nil))
+    
+    def initialize
+      @hotkeys = Hash(String, Proc(Nil)).new
+      register_default_hotkeys
+    end
+    
+    def register_hotkey(key_combination : String, action : Proc(Nil))
+      @hotkeys[key_combination] = action
+    end
+    
+    def unregister_hotkey(key_combination : String)
+      @hotkeys.delete(key_combination)
+    end
+    
+    def handle_event(event : Concave::Event) : Bool
+      key_combination = build_key_combination(event)
+      if action = @hotkeys[key_combination]?
+        action.call
+        return true
+      end
+      false
+    end
+    
+    private def register_default_hotkeys
+      register_hotkey("Ctrl+T") { Log.info { "新しいタブを開きます" } }
+      register_hotkey("Ctrl+W") { Log.info { "タブを閉じます" } }
+      register_hotkey("Ctrl+R") { Log.info { "ページをリロードします" } }
+      register_hotkey("F5") { Log.info { "ページをリロードします" } }
+      register_hotkey("F11") { Log.info { "フルスクリーンを切り替えます" } }
+      register_hotkey("Ctrl+Shift+I") { Log.info { "開発者ツールを開きます" } }
+    end
+    
+    private def build_key_combination(event : Concave::Event) : String
+      combination = [] of String
+      
+      if event.ctrl?
+        combination << "Ctrl"
+      end
+      if event.shift?
+        combination << "Shift"
+      end
+      if event.alt?
+        combination << "Alt"
+      end
+      
+      combination << event.key.to_s
+      combination.join("+")
+    end
+    
+    def cleanup
+      @hotkeys.clear
+    end
+  end
+
+  # テーマ定義
+  struct Theme
+    property background_color : UInt32
+    property text_color : UInt32
+    property accent_color : UInt32
+    
+    def initialize(@background_color : UInt32, @text_color : UInt32, @accent_color : UInt32)
+    end
   end
 end 

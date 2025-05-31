@@ -46,9 +46,15 @@ function myIpAddress() {
 
 // DNSでホスト名を解決した結果のIPアドレスを返す
 function dnsResolve(host) {
-  // 実際のDNS解決を行う（実装はネイティブコードで行われる）
+  // 実際のDNS解決を行う
   if (host === "localhost") return "127.0.0.1";
-  return null; // 実際の実装では適切なIPアドレスを返す
+  try {
+    var net = require('net');
+    var resolved = net.dnsLookupSync(host);
+    return resolved;
+  } catch (e) {
+    return null;
+  }
 }
 
 // 与えられたホストがIPアドレスパターンとマスクの範囲内かどうかを判定

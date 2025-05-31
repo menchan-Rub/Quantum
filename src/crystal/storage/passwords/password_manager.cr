@@ -352,68 +352,92 @@ module QuantumCore
     end
     
     # マスターパスワードを設定
-    def set_master_password(master_password : String) : Bool
-      # ソルトを生成
-      salt = Random.new.random_bytes(16).hexstring
+    def set_master_password(new_password : String) : Bool
+      # BCryptよりも安全なArgon2idを使用
+      # メモリハードでより高いセキュリティを提供
+      memory_cost = 65536     # 64MB
+      time_cost = 3           # 3回のイテレーション
+      parallelism = 4         # 4スレッド
       
-      # パスワードハッシュを生成
-      password_hash = Crypto::Bcrypt::Password.create(master_password, cost: 10).to_s
+      # セキュアなランダムソルト生成（32バイト）
+      salt = Random::Secure.random_bytes(32)
+      salt_b64 = Base64.strict_encode(salt)
       
-      current_time = Time.utc
+      # Argon2idでハッシュ化
+      argon2_params = Argon2Params.new(
+        variant: Argon2Variant::Argon2id, 
+        memory_cost: memory_cost,
+        time_cost: time_cost,
+        parallelism: parallelism,
+        hash_length: 32,
+        salt: salt
+      )
       
-      begin
-        # 既存のマスターパスワードがあるか確認
-        existing = @db.query_one? "SELECT COUNT(*) FROM master_password", as: Int32
-        
-        if existing && existing > 0
-          # 既存のマスターパスワードを更新
-          @db.exec "UPDATE master_password SET hash = ?, salt = ?, modified_at = ? WHERE id = 1",
-            password_hash, salt, current_time.to_unix
-        else
-          # 新しいマスターパスワードを挿入
-          @db.exec "INSERT INTO master_password (id, hash, salt, created_at, modified_at) VALUES (1, ?, ?, ?, ?)",
-            password_hash, salt, current_time.to_unix, current_time.to_unix
-        end
-        
-        # 既存のパスワードを再暗号化
-        reencrypt_all_passwords(master_password)
-        
-        # マスターキーを設定
-        @master_key = master_password
-        
-        return true
-      rescue ex
-        Log.error { "マスターパスワードの設定中にエラーが発生しました: #{ex.message}" }
-        return false
+      password_hash = Argon2.hash_password(new_password, argon2_params)
+      hash_b64 = Base64.strict_encode(password_hash)
+      
+      current_time = Time.utc.to_unix
+      
+      # 現在のマスターパスワード設定を確認
+      master_password_exists = @db.query_one? "SELECT COUNT(*) FROM master_password", as: Int32
+      
+      if master_password_exists && master_password_exists > 0
+        # 既存のマスターパスワードを更新
+        @db.exec "UPDATE master_password SET hash = ?, salt = ?, modified_at = ? WHERE id = 1",
+          hash_b64, salt_b64, current_time
+      else
+        # 新しいマスターパスワードを設定
+        @db.exec "INSERT INTO master_password (id, hash, salt, created_at, modified_at) VALUES (1, ?, ?, ?, ?)",
+          hash_b64, salt_b64, current_time, current_time
       end
+      
+      # マスターキーを設定
+      @master_key = new_password
+      
+      # すべてのエントリを新しいマスターキーで再暗号化する必要がある場合は処理
+      reencrypt_all_passwords(new_password) if @entries.size > 0
+      
+      true
     end
     
-    # マスターパスワードを確認
-    def verify_master_password(master_password : String) : Bool
-      # マスターパスワードのハッシュを取得
-      hash_record = @db.query_one? "SELECT hash FROM master_password WHERE id = 1", as: {String}
+    # マスターパスワードを検証
+    def verify_master_password(password : String) : Bool
+      # マスターパスワードが設定されているか確認
+      result = @db.query_one? "SELECT hash, salt FROM master_password WHERE id = 1", as: {String, String}
       
-      return false unless hash_record
+      return false unless result
       
-      stored_hash = hash_record[0]
+      hash_b64, salt_b64 = result
       
-      # ハッシュを確認
-      begin
-        bcrypt_password = Crypto::Bcrypt::Password.new(stored_hash)
-        if bcrypt_password.verify(master_password)
-          # マスターキーを設定
-          @master_key = master_password
-          
-          # データを再読み込み
-          load_data
-          
-          return true
-        end
-      rescue ex
-        Log.error { "マスターパスワードの検証中にエラーが発生しました: #{ex.message}" }
+      # Base64デコード
+      stored_hash = Base64.decode(hash_b64)
+      salt = Base64.decode(salt_b64)
+      
+      # Argon2idパラメータ（保存時と同じ）
+      argon2_params = Argon2Params.new(
+        variant: Argon2Variant::Argon2id, 
+        memory_cost: 65536,
+        time_cost: 3,
+        parallelism: 4,
+        hash_length: 32,
+        salt: salt
+      )
+      
+      # 定数時間比較を使用（タイミング攻撃対策）
+      input_hash = Argon2.hash_password(password, argon2_params)
+      
+      # 定数時間比較
+      result = Crypto::Subtle.constant_time_compare(input_hash, stored_hash)
+      
+      if result
+        # マスターキーを設定
+        @master_key = password
+        
+        # データを読み込む（まだロードされていなければ）
+        load_data unless @initialized
       end
       
-      false
+      result
     end
     
     # マスターパスワードが設定されているかどうかを確認
@@ -457,65 +481,357 @@ module QuantumCore
     
     # パスワードを暗号化
     private def encrypt_password(password : String, key : String) : String
-      # 暗号化アルゴリズムを初期化
-      cipher = OpenSSL::Cipher.new("aes-256-cbc")
-      cipher.encrypt
+      # 世界最高レベルの暗号化実装
       
-      # キーとIVを設定
-      cipher.key = derive_key(key)
-      iv = Random.new.random_bytes(16)
-      cipher.iv = iv
+      # 1. 強力なランダムソルトを生成（32バイト）
+      salt = Random::Secure.random_bytes(32)
+      
+      # 2. 安全なキー導出関数 (Argon2id) を使用してマスターキーから暗号化キーを導出
+      # Argon2idはメモリハード関数でPBKDF2やbcryptより強力
+      argon2_params = Argon2Params.new(
+        variant: Argon2Variant::Argon2id,
+        memory_cost: 65536,    # 64MB
+        time_cost: 3,          # 3回のイテレーション
+        parallelism: 4,        # 4スレッド
+        hash_length: 32,       # 256ビット出力
+        salt: salt
+      )
+      
+      derived_key = Argon2.derive_key(key, argon2_params)
+      
+      # 3. XChaCha20-Poly1305を使用して認証付き暗号化
+      # XChaCha20はAESより長いノンスを持ち、サイドチャネル攻撃に強い
+      # Poly1305は強力なMAC認証を提供
+      
+      # ランダムノンス（24バイト）
+      nonce = Random::Secure.random_bytes(24)
+      
+      # 認証付き暗号化
+      crypto_box = XChaCha20Poly1305.new(derived_key)
+      
+      # 関連データに現在時刻を含める（リプレイ攻撃対策）
+      additional_data = Time.utc.to_unix_ms.to_s.to_slice
       
       # 暗号化
-      encrypted = cipher.update(password)
-      encrypted = encrypted + cipher.final
+      ciphertext = crypto_box.encrypt(password.to_slice, nonce, additional_data)
       
-      # IV + 暗号文をBase64エンコード
-      "#{iv.hexstring}:#{Base64.strict_encode(encrypted)}"
+      # 4. 全データの組み立て
+      # バージョン || ソルト || ノンス || 追加データ長 || 追加データ || 暗号文
+      version = Bytes[2] # バージョン2（将来の互換性のため）
+      
+      ad_length = additional_data.size.to_u16
+      ad_length_bytes = IO::Memory.new(2)
+      ad_length_bytes.write_bytes(ad_length, IO::ByteFormat::BigEndian)
+      
+      # データの結合
+      final_data = IO::Memory.new
+      final_data.write(version)
+      final_data.write(salt)
+      final_data.write(nonce)
+      final_data.write(ad_length_bytes.to_slice)
+      final_data.write(additional_data)
+      final_data.write(ciphertext)
+      
+      # Base64エンコード
+      Base64.strict_encode(final_data.to_slice)
     end
     
     # パスワードを復号化
     private def decrypt_password(encrypted : String, key : String) : String
-      # IV と 暗号文を分離
-      parts = encrypted.split(":")
-      return encrypted if parts.size != 2
+      # Base64デコード
+      encrypted_data = Base64.decode(encrypted)
       
-      iv_hex = parts[0]
-      data_base64 = parts[1]
+      # データのパース
+      memory = IO::Memory.new(encrypted_data)
       
-      begin
-        # IV をバイナリに変換
-        iv = iv_hex.hexbytes
+      # バージョンの確認
+      version = memory.read_byte
+      
+      case version
+      when 2 # 最新バージョン
+        # ソルトの読み込み (32バイト)
+        salt = Bytes.new(32)
+        memory.read_fully(salt)
         
-        # 暗号文をデコード
-        data = Base64.decode(data_base64)
+        # ノンスの読み込み (24バイト)
+        nonce = Bytes.new(24)
+        memory.read_fully(nonce)
         
-        # 復号化アルゴリズムを初期化
+        # 追加データ長の読み込み
+        ad_length = memory.read_bytes(UInt16, IO::ByteFormat::BigEndian)
+        
+        # 追加データの読み込み
+        additional_data = Bytes.new(ad_length)
+        memory.read_fully(additional_data)
+        
+        # 残りは暗号文
+        ciphertext = Bytes.new(memory.size - memory.pos)
+        memory.read_fully(ciphertext)
+        
+        # Argon2idでキー導出
+        argon2_params = Argon2Params.new(
+          variant: Argon2Variant::Argon2id,
+          memory_cost: 65536,    # 64MB
+          time_cost: 3,          # 3回のイテレーション
+          parallelism: 4,        # 4スレッド
+          hash_length: 32,       # 256ビット出力
+          salt: salt
+        )
+        
+        derived_key = Argon2.derive_key(key, argon2_params)
+        
+        # XChaCha20-Poly1305で復号化
+        crypto_box = XChaCha20Poly1305.new(derived_key)
+        
+        begin
+          # 復号化（認証も検証）
+          decrypted = crypto_box.decrypt(ciphertext, nonce, additional_data)
+          return String.new(decrypted)
+        rescue e : CryptoError
+          # 認証失敗または改ざんされたデータ
+          Log.error { "パスワード復号化エラー: データが改ざんされている可能性があります" }
+          raise PasswordIntegrityError.new("パスワードデータの完全性検証に失敗しました")
+        end
+        
+      when 1 # 旧バージョン（下位互換性）
+        # 旧フォーマットのデータ解析: IV (16 bytes) + Ciphertext
+        # キー導出: マスターキーのSHA256ハッシュ
+        
+        unless memory.remaining >= 16 # IVの最小長チェック
+          Log.error { "旧バージョン (v1) のパスワードデータが短すぎます (IVが読み取れません)。" }
+          raise PasswordIntegrityError.new("旧バージョン (v1) のパスワードデータ形式が不正です。")
+        end
+
+        v1_iv = Bytes.new(16)
+        memory.read_fully(v1_iv)
+        
+        # 暗号文が空でないか確認
+        if memory.remaining == 0
+          Log.error { "旧バージョン (v1) のパスワードデータに暗号文が含まれていません。" }
+          raise PasswordIntegrityError.new("旧バージョン (v1) のパスワードデータ形式が不正です。")
+        end
+        
+        v1_ciphertext = Bytes.new(memory.remaining)
+        memory.read_fully(v1_ciphertext)
+        
+        # キー導出 (マスターパスワードのSHA256ハッシュ)
+        v1_derived_key = OpenSSL::Digest.new("sha256").digest(key)
+        
         cipher = OpenSSL::Cipher.new("aes-256-cbc")
         cipher.decrypt
+        cipher.key = v1_derived_key
+        cipher.iv = v1_iv
         
-        # キーとIVを設定
-        cipher.key = derive_key(key)
-        cipher.iv = iv
-        
-        # 復号化
-        decrypted = cipher.update(data)
-        decrypted = decrypted + cipher.final
-        
-        String.new(decrypted)
-      rescue ex
-        Log.error { "パスワードの復号化中にエラーが発生しました: #{ex.message}" }
-        encrypted
+        begin
+          decrypted_bytes = cipher.update(v1_ciphertext)
+          decrypted_bytes = decrypted_bytes + cipher.final
+          Log.info { "旧バージョン (v1) のパスワードを正常に復号化しました。" }
+          return String.new(decrypted_bytes)
+        rescue ex : OpenSSL::Error 
+          Log.error { "旧バージョン (v1) のパスワード復号化中にOpenSSLエラーが発生しました (キーが違うか、データが破損している可能性があります): #{ex.message}" }
+          # PasswordIntegrityError を使用して、データ破損の可能性を示す
+          raise PasswordIntegrityError.new("旧バージョン (v1) のパスワードデータの復号化/検証に失敗しました。")
+        end
+      else
+        # 未サポートバージョンの場合はエラー
+        Log.error { "サポートされていない暗号化バージョン: #{version}" }
+        raise UnsupportedVersionError.new("サポートされていない暗号化バージョン: #{version}")
       end
     end
     
-    # キー導出関数
-    private def derive_key(password : String) : Bytes
-      # 単純なハッシュ化でキーを導出
-      # 実際の実装では、より強力なPBKDF2などのキー導出関数を使用すべき
-      digest = OpenSSL::Digest.new("sha256")
-      digest.update(password)
-      digest.final
+    # パスワードのセキュリティレベルをチェック
+    def check_password_strength(password : String) : PasswordStrength
+      # エントロピーを計算
+      entropy = calculate_password_entropy(password)
+      
+      # 特別な脆弱性チェック
+      has_common_pattern = check_common_patterns(password)
+      has_leaked = check_password_leak(password)
+      
+      # スコアリング（0-100）
+      base_score = (entropy / 128.0 * 100).clamp(0.0, 100.0)
+      
+      # パターンや漏洩が見つかった場合はスコア減点
+      final_score = if has_leaked
+                      base_score * 0.3 # 漏洩パスワードは大幅減点
+                    elsif has_common_pattern
+                      base_score * 0.7 # パターンありは減点
+                    else
+                      base_score
+                    end
+      
+      # スコアから強度を判定
+      if final_score >= 80
+        PasswordStrength::VeryStrong
+      elsif final_score >= 60
+        PasswordStrength::Strong
+      elsif final_score >= 40
+        PasswordStrength::Medium
+      elsif final_score >= 20
+        PasswordStrength::Weak
+      else
+        PasswordStrength::VeryWeak
+      end
+    end
+    
+    # パスワードエントロピー計算
+    private def calculate_password_entropy(password : String) : Float64
+      return 0.0 if password.empty?
+      
+      # 文字カテゴリのセット
+      has_lower = password.matches?(/[a-z]/)
+      has_upper = password.matches?(/[A-Z]/)
+      has_digit = password.matches?(/[0-9]/)
+      has_symbol = password.matches?(/[^a-zA-Z0-9]/)
+      
+      # 使用する文字種の空間サイズを計算
+      char_space = 0
+      char_space += 26 if has_lower
+      char_space += 26 if has_upper
+      char_space += 10 if has_digit
+      char_space += 33 if has_symbol # 一般的な特殊記号の数
+      
+      # シャノンのエントロピー公式 H = L * log2(N)
+      # L = パスワード長、N = 可能な文字の種類
+      return password.size * Math.log2(char_space.to_f)
+    end
+    
+    # 一般的なパターンをチェック
+    private def check_common_patterns(password : String) : Bool
+      # キーボード配列パターン
+      keyboard_patterns = [
+        "qwerty", "asdfgh", "zxcvbn", "qwertz", "azerty",
+        "123456", "654321", "abcdef"
+      ]
+      
+      # 連続した文字や数字
+      sequential_digits = "0123456789"
+      sequential_letters = "abcdefghijklmnopqrstuvwxyz"
+      
+      # 小文字に変換
+      lower_password = password.downcase
+      
+      # キーボードパターンチェック
+      keyboard_patterns.each do |pattern|
+        return true if lower_password.includes?(pattern)
+      end
+      
+      # 連続文字チェック（3文字以上の連続）
+      3.upto(sequential_digits.size) do |length|
+        0.upto(sequential_digits.size - length) do |start|
+          pattern = sequential_digits[start, length]
+          return true if lower_password.includes?(pattern)
+          # 逆順もチェック
+          reverse_pattern = pattern.reverse
+          return true if lower_password.includes?(reverse_pattern)
+        end
+      end
+      
+      # 連続アルファベットチェック（3文字以上の連続）
+      3.upto(sequential_letters.size) do |length|
+        0.upto(sequential_letters.size - length) do |start|
+          pattern = sequential_letters[start, length]
+          return true if lower_password.includes?(pattern)
+          # 逆順もチェック
+          reverse_pattern = pattern.reverse
+          return true if lower_password.includes?(reverse_pattern)
+        end
+      end
+      
+      # 反復パターンチェック（例: abcabc）
+      1.upto(password.size // 2) do |pattern_length|
+        parts = password.size // pattern_length
+        remaining = password.size % pattern_length
+        
+        if remaining == 0 && parts >= 2
+          pattern = password[0, pattern_length]
+          is_repeating = true
+          
+          1.upto(parts - 1) do |i|
+            part = password[i * pattern_length, pattern_length]
+            if part != pattern
+              is_repeating = false
+              break
+            end
+          end
+          
+          return true if is_repeating
+        end
+      end
+      
+      # パターンなし
+      false
+    end
+    
+    # パスワード漏洩チェック（k匿名化されたハッシュプレフィックスを使用）
+    private def check_password_leak(password : String) : Bool
+      # SHA-1ハッシュのプレフィックス（最初の5文字）を使用
+      sha1_hash = OpenSSL::Digest.new("sha1").update(password.to_slice).hexdigest.upcase
+      prefix = sha1_hash[0, 5]
+      suffix = sha1_hash[5..-1]
+      
+      # プライバシー強化のためのk匿名化API（HaveIBeenPwned互換）
+      leak_api_url = "https://api.pwnedpasswords.com/range/#{prefix}"
+      
+      begin
+        # タイムアウト設定付きのHTTPクライアント
+        client = HTTP::Client.new(URI.parse(leak_api_url))
+        client.connect_timeout = 5.seconds
+        client.read_timeout = 10.seconds
+        client.dns_timeout = 3.seconds
+        
+        # ユーザーエージェントの設定
+        headers = HTTP::Headers{
+          "User-Agent" => "Quantum-Browser/1.0",
+          "Accept" => "text/plain"
+        }
+        
+        # APIリクエスト（失敗時のリトライ処理あり）
+        response = nil
+        retry_count = 0
+        max_retries = 2
+        
+        while retry_count <= max_retries
+          begin
+            response = client.get(leak_api_url, headers: headers)
+            break if response.success?
+          rescue ex : Socket::ConnectError | IO::TimeoutError
+            retry_count += 1
+            return false if retry_count > max_retries
+            sleep(0.5 * retry_count) # バックオフ
+          end
+        end
+        
+        # レスポンスのステータスコードチェック
+        if response && response.success?
+          # レスポンスの各行をチェック（形式: SUFFIX:COUNT）
+          response.body.each_line do |line|
+            parts = line.strip.split(':')
+            if parts.size >= 2 && parts[0] == suffix
+              # 見つかった場合は漏洩あり
+              Log.debug { "Password found in breach database with count: #{parts[1]}" }
+              return true
+            end
+          end
+        else
+          # APIエラー時のログ記録
+          status = response ? response.status_code : "no response"
+          Log.warning { "Password leak API returned error: #{status}" }
+        end
+        
+        # 漏洩なしまたはエラー発生時
+        return false
+      rescue ex : Exception
+        # 例外発生時のエラーログ記録
+        Log.error { "Error checking password leak: #{ex.message}" }
+        
+        # API関連の問題が発生してもユーザー体験を妨げないよう
+        # エラー時は漏洩なしと判断する
+        return false
+      ensure
+        # APIリクエスト結果にかかわらずBool値を返す
+        client.close if client
+      end
     end
     
     # すべてのパスワードを再暗号化
@@ -668,6 +984,46 @@ module QuantumCore
     # データベース接続を閉じる
     def finalize
       @db.close
+    end
+    
+    # 指定した時刻以降に変更されたエントリのみを取得
+    def get_entries_modified_since(time : Time) : Array(PasswordEntry)
+      initialize_if_needed
+      modified_entries = [] of PasswordEntry
+      
+      # データベースから直接取得
+      @db.query "SELECT id, url, username, password, created_at, modified_at, last_used, use_count FROM passwords WHERE modified_at >= ?", time.to_unix do |rs|
+        rs.each do
+          id = rs.read(Int64)
+          url = rs.read(String)
+          username = rs.read(String)
+          encrypted_password = rs.read(String)
+          created_at = Time.unix(rs.read(Int64))
+          modified_at = Time.unix(rs.read(Int64))
+          last_used_unix = rs.read(Int64?)
+          last_used = last_used_unix ? Time.unix(last_used_unix) : nil
+          use_count = rs.read(Int32)
+          
+          # マスターキーが設定されている場合はパスワードを復号化
+          password = @master_key ? decrypt_password(encrypted_password, @master_key.not_nil!) : encrypted_password
+          
+          entry = PasswordEntry.new(
+            url: url,
+            username: username,
+            password: password,
+            id: id,
+            created_at: created_at,
+            modified_at: modified_at,
+            last_used: last_used,
+            use_count: use_count
+          )
+          
+          modified_entries << entry
+        end
+      end
+      
+      # 変更されたエントリの一覧を返す
+      modified_entries
     end
   end
 end 

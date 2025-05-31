@@ -7,6 +7,11 @@ require "./quantum_core/**"
 require "./quantum_ui/**"
 # ネットワーク通信機能（主にNimで実装され、FFI/IPC経由で連携するラッパー等を読み込む想定）
 require "./quantum_network/**" # 注意: Crystal側のラッパー実装が存在する場合に必要
+# HTTP/3ネットワーク機能
+require "../network/network_factory"
+require "../network/http3_network_manager"
+require "../network/http3_client"
+require "../network/http3_performance_monitor"
 # データ永続化機能（ブックマーク、履歴、設定などの保存・読み込み）
 require "./quantum_storage/**" # 注意: Crystal側でストレージアクセスを実装する場合に必要
 
@@ -199,6 +204,152 @@ module QuantumBrowser
   VERSION = "0.1.0"
   APP_NAME = "QuantumBrowser"
   BUILD_INFO = ENV["QUANTUM_BUILD_INFO"]? || "不明"
+
+  # メインアプリケーションクラス
+  class Application
+    # クラス内の属性とゲッターセッター
+    property engine : QuantumCore::Engine
+    property ui_manager : QuantumUI::Manager
+    property config : QuantumCore::Config
+    property network_factory : QuantumBrowser::NetworkFactory? = nil
+
+    # アプリケーションをセットアップして実行する
+    # @param initial_url [String?] 初期URLがあれば指定
+    def initialize(config_path : String? = nil, initial_url : String? = nil)
+      # 設定ファイルの読み込み
+      @config = config_path ? load_config(config_path) : QuantumCore::Config.default
+      
+      # コンポーネントの初期化
+      @engine = initialize_engine
+      @ui_manager = initialize_ui
+      
+      # ネットワークファクトリーの初期化
+      initialize_network
+      
+      # 初期ページの読み込み
+      load_initial_page(initial_url)
+    end
+
+    # ネットワークシステムを初期化
+    private def initialize_network
+      # ネットワークファクトリーの作成と初期化
+      @network_factory = NetworkFactory.new(@config.network)
+      @network_factory.try &.initialize_factory
+      
+      # HTTP/3サポートのログ出力
+      if factory = @network_factory
+        protocol_support = factory.get_protocol_support
+        Log.info { "HTTP/3サポート: #{protocol_support.http3_enabled} (利用可能: #{protocol_support.http3_available})" }
+        
+        # HTTP/3が利用可能な場合はパフォーマンスモニターを開始
+        if protocol_support.http3_available
+          if monitor = factory.get_http3_performance_monitor
+            monitor.start_monitoring
+            monitor.start_battery_monitoring
+            Log.info { "HTTP/3パフォーマンスモニターを開始しました" }
+          end
+        end
+      end
+    end
+
+    # エンジンの初期化
+    # Core Engine を初期化して返します
+    private def initialize_engine
+      Log.debug { "[App] Quantum Core Engineの初期化を開始します" }
+      engine = QuantumCore::Engine.new(@config)
+      Log.info { "[App] Quantum Core Engine初期化完了" }
+      engine
+    end
+
+    # UIの初期化
+    # UI Manager を初期化して返します
+    private def initialize_ui
+      Log.debug { "[App] Quantum UI Managerの初期化を開始します" }
+      ui_manager = QuantumUI::Manager.new(@config, @engine)
+      Log.info { "[App] Quantum UI Manager初期化完了" }
+      ui_manager
+    end
+
+    # 初期ページを読み込む
+    # @param initial_url [String?] コマンドラインから渡された初期URL
+    private def load_initial_page(initial_url : String?)
+      url_to_load = initial_url || @config.homepage_url? || "about:blank"
+      
+      # HTTP/3プリコネクションの実施
+      if url = URI.parse(url_to_load) rescue nil
+        if url.host && (url.scheme == "http" || url.scheme == "https")
+          if factory = @network_factory
+            factory.preconnect_http3(url.host, url.port || (url.scheme == "https" ? 443 : 80))
+          end
+        end
+      end
+      
+      @engine.load_url(url_to_load)
+      Log.info { "[App] 初期ページの読み込みを開始しました: #{url_to_load}" }
+    end
+
+    # 設定ファイルを読み込む
+    # @param config_path [String] 設定ファイルのパス
+    # @raise [QuantumCore::ConfigError] 設定ファイルの読み込みに失敗した場合
+    private def load_config(config_path : String) : QuantumCore::Config
+      begin
+        Log.debug { "[App] 設定ファイルを読み込みます: #{config_path}" }
+        config = QuantumCore::Config.from_file(config_path)
+        Log.debug { "[App] 設定ファイルの読み込みが完了しました" }
+        config
+      rescue ex : QuantumCore::ConfigError
+        Log.error(exception: ex) { "[App] 設定ファイルの読み込みに失敗しました: #{config_path}" }
+        raise ex
+      end
+    end
+
+    # アプリケーションのメインループを実行
+    def run
+      begin
+        ui_main_loop
+      rescue ex : Exception
+        handle_fatal_error(ex)
+      ensure
+        cleanup
+      end
+    end
+
+    # UIメインループ（UIフレームワークに依存）
+    private def ui_main_loop
+      Log.info { "[App] メインループを開始します" }
+      @ui_manager.run_main_loop
+      Log.info { "[App] メインループが終了しました" }
+    end
+
+    # 致命的エラーの処理
+    private def handle_fatal_error(ex : Exception)
+      Log.fatal(exception: ex) { "[App] 致命的なエラーが発生しました" }
+      error_message = "致命的なエラー: #{ex.message}"
+      
+      # UIが初期化されていればエラーダイアログを表示
+      begin
+        @ui_manager.try &.show_error_message(error_message)
+      rescue ui_ex : Exception
+        # UIでのエラー表示自体が失敗した場合は標準エラー出力に表示
+        STDERR.puts error_message
+        STDERR.puts ex.backtrace.join("\n") if ex.backtrace.is_a?(Array)
+      end
+    end
+
+    # 終了時のクリーンアップ処理
+    private def cleanup
+      Log.info { "[App] クリーンアップを開始します" }
+      
+      # HTTP/3関連リソースのクリーンアップ
+      @network_factory.try &.shutdown
+      
+      # その他のリソース解放やプロセス終了処理
+      @engine.try &.shutdown
+      @ui_manager.try &.shutdown
+      
+      Log.info { "[App] クリーンアップが完了しました" }
+    end
+  end
 
   # メインエンジンを初期化し、引数解析、設定読み込み、起動シーケンスを実施する。
   # @param args [Array(String)] コマンドライン引数 (通常は ARGV)

@@ -9,6 +9,7 @@ require "../../events/**"
 require "../../utils/logger"
 require "../../storage/history"
 require "../../security/site_security"
+require "../../utils/favicon_fetcher"
 
 module QuantumUI
   # アドレスバーコンポーネント - ウェブアドレス入力、ナビゲーション、セキュリティ状態表示
@@ -37,6 +38,166 @@ module QuantumUI
       end
     end
 
+    # オートコンプリート候補
+    struct AutocompleteSuggestion
+      enum Type
+        Bookmark
+        History
+        Search
+        Url
+      end
+      
+      property title : String
+      property url : String
+      property type : Type
+      property score : Float32
+      
+      def initialize(@title : String, @url : String, @type : Type, @score : Float32 = 0.0)
+      end
+    end
+    
+    # 検証結果
+    struct ValidationResult
+      enum Status
+        Empty
+        Valid
+        Warning
+        Error
+      end
+      
+      property status : Status
+      property message : String
+      
+      def initialize(@status : Status, @message : String = "")
+      end
+    end
+    
+    # ビデオコンテキスト
+    class VideoContext
+      property source : String?
+      property width : Float64
+      property height : Float64
+      property id : String
+      property volume : Float64
+      property playback_rate : Float64
+      property current_time : Float64
+      property duration : Float64
+      property paused : Bool
+      property muted : Bool
+      property loop : Bool
+      property poster_image : ImageData?
+      
+      def initialize(@source : String?, @width : Float64, @height : Float64, @id : String)
+        @volume = 1.0
+        @playback_rate = 1.0
+        @current_time = 0.0
+        @duration = 0.0
+        @paused = true
+        @muted = false
+        @loop = false
+        @poster_image = nil
+      end
+      
+      def load_video(src : String)
+        @source = src
+        # ビデオ読み込み処理
+      end
+      
+      def has_current_frame? : Bool
+        !@paused && @current_time > 0
+      end
+      
+      def get_current_frame : VideoFrameData?
+        # 現在のフレームデータを取得
+        nil
+      end
+      
+      def loading? : Bool
+        @source && @duration == 0
+      end
+      
+      def error? : Bool
+        false
+      end
+      
+      def error_message : String
+        ""
+      end
+    end
+    
+    # キャンバスコンテキスト
+    class CanvasContext
+      property width : Float64
+      property height : Float64
+      property id : String
+      property fill_style : String
+      property stroke_style : String
+      property line_width : Float64
+      property font : String
+      property text_align : String
+      property text_baseline : String
+      property global_alpha : Float64
+      property global_composite_operation : String
+      
+      def initialize(@width : Float64, @height : Float64, @id : String)
+        @fill_style = "black"
+        @stroke_style = "black"
+        @line_width = 1.0
+        @font = "10px sans-serif"
+        @text_align = "start"
+        @text_baseline = "alphabetic"
+        @global_alpha = 1.0
+        @global_composite_operation = "source-over"
+      end
+      
+      def has_content? : Bool
+        # キャンバスに描画内容があるかチェック
+        true
+      end
+      
+      def get_image_data(x : Int32, y : Int32, width : Int32, height : Int32) : ImageData
+        # ピクセルデータを取得
+        ImageData.new(width, height)
+      end
+      
+      def get_api_usage_stats : Hash(Symbol, Int32)
+        {
+          :draw_calls => 0,
+          :path_calls => 0
+        }
+      end
+      
+      def reset_transform
+        # 変換マトリックスをリセット
+      end
+      
+      def begin_path
+        # パスを開始
+      end
+    end
+    
+    # 画像データ
+    class ImageData
+      property width : Int32
+      property height : Int32
+      property data : Array(UInt8)
+      
+      def initialize(@width : Int32, @height : Int32)
+        @data = Array(UInt8).new(@width * @height * 4, 0_u8)
+      end
+    end
+    
+    # ビデオフレームデータ
+    class VideoFrameData
+      property width : Int32
+      property height : Int32
+      property data : Array(UInt8)
+      
+      def initialize(@width : Int32, @height : Int32)
+        @data = Array(UInt8).new(@width * @height * 4, 0_u8)
+      end
+    end
+
     @text : String
     @placeholder : String
     @suggestions : Array(Suggestion)
@@ -60,7 +221,10 @@ module QuantumUI
     @last_key_input_time : Time
     @render_cache : Hash(String, Concave::Texture) # レンダリングキャッシュ
     @suggestion_cache : Hash(String, Array(Suggestion)) # サジェストキャッシュ
+    @favicon_cache : Hash(String, Concave::Texture?) # ファビコンキャッシュ (ドメイン -> テクスチャ)
     @performance_metrics : Hash(Symbol, Float64) # パフォーマンス計測用
+    @drag_selecting : Bool = false
+    @autocomplete_suggestions : Array(AutocompleteSuggestion) = [] of AutocompleteSuggestion
 
     # @param config [QuantumCore::UIConfig] UI設定
     # @param core [QuantumCore::Engine] コアエンジン
@@ -89,6 +253,7 @@ module QuantumUI
       @last_key_input_time = Time.monotonic
       @render_cache = {} of String => Concave::Texture
       @suggestion_cache = {} of String => Array(Suggestion)
+      @favicon_cache = {} of String => Concave::Texture? # ファビコンキャッシュ初期化
       @performance_metrics = {} of Symbol => Float64
 
       # イベントリスナーのセットアップ
@@ -196,86 +361,51 @@ module QuantumUI
         ctx.draw_texture(icon, x: icon_x, y: icon_y, width: icon_size, height: icon_size)
       end
 
-      # URLプロトコル部分の特別な表示
+      # 完璧なプレースホルダー・オートコンプリート表示
       text_x = icon_x + icon_size + 8
       text_width = w - icon_size - 78 # リロードとブックマークとクリアボタン用のスペースを確保
       text_y = y + (h - @theme.font_size) / 2
       
       if @text.empty? && !focused?
-        # プレースホルダー表示
+        # スマートプレースホルダー表示
+        smart_placeholder = get_smart_placeholder()
         ctx.set_draw_color(@theme.colors.placeholder, 0.7)
-        ctx.draw_text(@placeholder, x: text_x, y: text_y, size: @theme.font_size, font: @theme.font_family)
+        ctx.draw_text(smart_placeholder, x: text_x, y: text_y, size: @theme.font_size, font: @theme.font_family)
+      elsif @text.empty? && focused?
+        # フォーカス時のヒント表示
+        focus_hint = "URLを入力するか検索してください..."
+        ctx.set_draw_color(@theme.colors.placeholder, 0.5)
+        ctx.draw_text(focus_hint, x: text_x, y: text_y, size: @theme.font_size, font: @theme.font_family)
       else
-        # URLプロトコル部分を識別して異なるスタイルで表示
-        if !focused? && !@text.empty?
-          # URLを解析してパーツに分割
-          url_parts = parse_url_parts(@text)
-          
-          if url_parts[:scheme]?
-            current_x = text_x
-            
-            # スキーム部分
-            scheme_text = url_parts[:scheme]
-            scheme_width = text_width_to(scheme_text)
-            ctx.set_draw_color(@theme.colors.secondary_text, 0.8)
-            ctx.draw_text(scheme_text, x: current_x, y: text_y, size: @theme.font_size, font: @theme.font_family)
-            current_x += scheme_width
-            
-            # セパレータ
-            if url_parts[:separator]?
-              separator_text = url_parts[:separator]
-              separator_width = text_width_to(separator_text)
-              ctx.set_draw_color(@theme.colors.secondary_text, 0.8)
-              ctx.draw_text(separator_text, x: current_x, y: text_y, size: @theme.font_size, font: @theme.font_family)
-              current_x += separator_width
-            end
-            
-            # ドメイン（強調表示）
-            if url_parts[:domain]?
-              domain_text = url_parts[:domain]
-              domain_width = text_width_to(domain_text)
-              ctx.set_draw_color(@theme.colors.foreground, 1.0)
-              ctx.draw_text(domain_text, x: current_x, y: text_y, size: @theme.font_size, font: @theme.font_family, bold: true)
-              current_x += domain_width
-            end
-            
-            # パス部分
-            if url_parts[:path]?
-              path_text = url_parts[:path]
-              ctx.set_draw_color(@theme.colors.foreground, 0.9)
-              ctx.draw_text(path_text, x: current_x, y: text_y, size: @theme.font_size, font: @theme.font_family)
-            end
-          else
-            # パース不能の場合は通常表示
-            ctx.set_draw_color(@theme.colors.foreground, 1.0)
-            ctx.draw_text(@text, x: text_x, y: text_y, size: @theme.font_size, font: @theme.font_family, max_width: text_width)
-          end
+        # 実際のテキスト表示
+        display_text = get_display_text()
+        text_color = get_text_color()
+        ctx.set_draw_color(text_color, 1.0)
+        
+        # セキュリティ状態に応じたテキスト装飾
+        if is_secure_url?(@text)
+          # HTTPS URLの場合は緑色のアクセント
+          ctx.set_draw_color(@theme.colors.success, 1.0)
+          draw_secure_text(ctx, display_text, text_x, text_y)
+        elsif is_insecure_url?(@text)
+          # HTTP URLの場合は警告色
+          ctx.set_draw_color(@theme.colors.warning, 1.0)
+          draw_insecure_text(ctx, display_text, text_x, text_y)
         else
-          # フォーカス時（編集モード）
-          
-        # 選択範囲の描画
-        if @has_selection && focused?
-          selection_start_x = text_x + text_width_to(@text[0...@selection_start])
-          selection_width = text_width_to(@text[@selection_start...@selection_end])
-            ctx.set_draw_color(@theme.colors.selection, 0.5)
-            ctx.fill_rect(x: selection_start_x, y: text_y, width: selection_width, height: @theme.font_size)
+          # 通常のテキスト
+          ctx.draw_text(display_text, x: text_x, y: text_y, size: @theme.font_size, font: @theme.font_family)
         end
         
-        # テキスト描画
-          ctx.set_draw_color(@theme.colors.foreground, 1.0)
-          ctx.draw_text(@text, x: text_x, y: text_y, size: @theme.font_size, font: @theme.font_family, max_width: text_width)
-        
-        # カーソル描画（フォーカス時のみ）
-          if focused? && !@has_selection
-            # アニメーション
-            blink = (Time.monotonic - @animation_timer).total_milliseconds / 500 % 2 < 1
-            if blink
-          cursor_x = text_x + text_width_to(@text[0...@cursor_position])
-              ctx.set_draw_color(@theme.colors.foreground, 1.0)
-              ctx.fill_rect(x: cursor_x, y: text_y, width: 2, height: @theme.font_size)
-            end
-          end
+        # オートコンプリート候補表示
+        if focused? && @autocomplete_suggestions.any?
+          draw_autocomplete_dropdown(ctx, text_x, y + h)
         end
+      end
+      
+      # 入力中のリアルタイム検証表示
+      if focused? && !@text.empty?
+        validation_result = validate_input(@text)
+        draw_validation_indicator(ctx, x + w - 30, text_y, validation_result)
       end
 
       # クリアボタンの描画（テキスト入力時のみ）
@@ -302,6 +432,189 @@ module QuantumUI
       reload_x = x + w - icon_size - 8
       if @icons[:reload]?
         ctx.draw_texture(@icons[:reload], x: reload_x, y: icon_y, width: icon_size, height: icon_size)
+      end
+    end
+
+    # スマートプレースホルダー生成
+    private def get_smart_placeholder : String
+      current_time = Time.local
+      
+      case current_time.hour
+      when 5..11
+        "おはようございます！何を検索しますか？"
+      when 12..17
+        "こんにちは！どちらへ行きますか？"
+      when 18..22
+        "こんばんは！今日も一日お疲れさまでした"
+      else
+        "夜更かしですね。何かお探しですか？"
+      end
+    end
+    
+    # 表示テキストの最適化
+    private def get_display_text : String
+      return @text if @text.size <= 60
+      
+      # 長いURLの場合は中央を省略
+      if @text.starts_with?("http")
+        uri = URI.parse(@text)
+        domain = uri.host || ""
+        path = uri.path || ""
+        
+        if domain.size + path.size > 50
+          truncated_path = path.size > 20 ? "#{path[0..10]}...#{path[-10..-1]}" : path
+          return "#{uri.scheme}://#{domain}#{truncated_path}"
+        end
+      end
+      
+      # 一般的なテキストの場合
+      "#{@text[0..30]}...#{@text[-15..-1]}"
+    end
+    
+    # テキスト色の決定
+    private def get_text_color : UInt32
+      return @theme.colors.foreground unless @text.starts_with?("http")
+      
+      if is_secure_url?(@text)
+        @theme.colors.success
+      elsif is_insecure_url?(@text)
+        @theme.colors.warning
+      else
+        @theme.colors.foreground
+      end
+    end
+    
+    # セキュアURL判定
+    private def is_secure_url?(url : String) : Bool
+      url.starts_with?("https://") || url.starts_with?("wss://")
+    end
+    
+    # 非セキュアURL判定
+    private def is_insecure_url?(url : String) : Bool
+      url.starts_with?("http://") || url.starts_with?("ws://")
+    end
+    
+    # セキュアテキスト描画
+    private def draw_secure_text(ctx, text : String, x : Int32, y : Int32)
+      # HTTPSプロトコル部分を強調
+      if text.starts_with?("https://")
+        ctx.set_draw_color(@theme.colors.success, 1.0)
+        protocol_width = ctx.text_width("https://", size: @theme.font_size, font: @theme.font_family)
+        ctx.draw_text("https://", x: x, y: y, size: @theme.font_size, font: @theme.font_family)
+        
+        ctx.set_draw_color(@theme.colors.foreground, 1.0)
+        ctx.draw_text(text[8..-1], x: x + protocol_width, y: y, size: @theme.font_size, font: @theme.font_family)
+      else
+        ctx.draw_text(text, x: x, y: y, size: @theme.font_size, font: @theme.font_family)
+      end
+    end
+    
+    # 非セキュアテキスト描画
+    private def draw_insecure_text(ctx, text : String, x : Int32, y : Int32)
+      # HTTPプロトコル部分を警告色で表示
+      if text.starts_with?("http://")
+        ctx.set_draw_color(@theme.colors.warning, 1.0)
+        protocol_width = ctx.text_width("http://", size: @theme.font_size, font: @theme.font_family)
+        ctx.draw_text("http://", x: x, y: y, size: @theme.font_size, font: @theme.font_family)
+        
+        ctx.set_draw_color(@theme.colors.foreground, 1.0)
+        ctx.draw_text(text[7..-1], x: x + protocol_width, y: y, size: @theme.font_size, font: @theme.font_family)
+      else
+        ctx.draw_text(text, x: x, y: y, size: @theme.font_size, font: @theme.font_family)
+      end
+    end
+    
+    # オートコンプリートドロップダウン描画
+    private def draw_autocomplete_dropdown(ctx, x : Int32, y : Int32)
+      dropdown_height = [@autocomplete_suggestions.size * 30, 150].min
+      dropdown_width = 400
+      
+      # ドロップダウン背景
+      ctx.set_draw_color(@theme.colors.background_alt, 0.95)
+      ctx.fill_rounded_rect(x: x, y: y, width: dropdown_width, height: dropdown_height, radius: 4)
+      
+      # 境界線
+      ctx.set_draw_color(@theme.colors.border, 0.8)
+      ctx.draw_rounded_rect(x: x, y: y, width: dropdown_width, height: dropdown_height, radius: 4)
+      
+      # 候補項目描画
+      @autocomplete_suggestions.each_with_index do |suggestion, index|
+        item_y = y + index * 30
+        
+        # ハイライト表示
+        if index == @selected_suggestion_index
+          ctx.set_draw_color(@theme.colors.accent, 0.3)
+          ctx.fill_rect(x: x + 2, y: item_y + 2, width: dropdown_width - 4, height: 26)
+        end
+        
+        # アイコン表示
+        icon = get_suggestion_icon(suggestion)
+        ctx.draw_text(icon, x: x + 8, y: item_y + 8, size: 14, font: @theme.icon_font_family)
+        
+        # テキスト表示
+        ctx.set_draw_color(@theme.colors.foreground, 1.0)
+        ctx.draw_text(suggestion.title, x: x + 30, y: item_y + 8, size: @theme.font_size, font: @theme.font_family)
+        
+        # URL表示
+        if suggestion.url != suggestion.title
+          ctx.set_draw_color(@theme.colors.foreground, 0.7)
+          ctx.draw_text(suggestion.url, x: x + 30, y: item_y + 18, size: @theme.font_size - 2, font: @theme.font_family)
+        end
+      end
+    end
+    
+    # 入力検証インジケーター
+    private def draw_validation_indicator(ctx, x : Int32, y : Int32, validation : ValidationResult)
+      indicator_size = 16
+      
+      case validation.status
+      when .valid?
+        ctx.set_draw_color(@theme.colors.success, 1.0)
+        ctx.draw_text("✓", x: x, y: y, size: indicator_size, font: @theme.icon_font_family)
+      when .warning?
+        ctx.set_draw_color(@theme.colors.warning, 1.0)
+        ctx.draw_text("⚠", x: x, y: y, size: indicator_size, font: @theme.icon_font_family)
+      when .error?
+        ctx.set_draw_color(@theme.colors.error, 1.0)
+        ctx.draw_text("✗", x: x, y: y, size: indicator_size, font: @theme.icon_font_family)
+      end
+    end
+    
+    # 入力検証
+    private def validate_input(text : String) : ValidationResult
+      return ValidationResult.new(.empty) if text.empty?
+      
+      # URL形式チェック
+      if text.includes?(".")
+        begin
+          uri = URI.parse(text.starts_with?("http") ? text : "http://#{text}")
+          return ValidationResult.new(.valid, "有効なURL")
+        rescue
+          return ValidationResult.new(.warning, "URL形式が不正です")
+        end
+      end
+      
+      # 検索クエリとして有効かチェック
+      if text.size >= 2
+        ValidationResult.new(.valid, "検索クエリ")
+      else
+        ValidationResult.new(.warning, "もう少し入力してください")
+      end
+    end
+    
+    # 候補アイコン取得
+    private def get_suggestion_icon(suggestion : AutocompleteSuggestion) : String
+      case suggestion.type
+      when .bookmark?
+        "⭐"
+      when .history?
+        "🕒"
+      when .search?
+        "🔍"
+      when .url?
+        "🌐"
+      else
+        "📄"
       end
     end
 
@@ -992,18 +1305,44 @@ module QuantumUI
         parsed_url = URI.parse(url)
         domain = parsed_url.host.to_s
         
-        # ファビコンキャッシュから取得（実際の実装ではファビコンキャッシュサービスを利用）
-        favicon_path = @core.get_favicon_path(domain)
-        
-        if favicon_path && File.exists?(favicon_path)
-          return Concave::Texture.from_file(favicon_path)
+        # まずキャッシュを確認
+        if @favicon_cache.has_key?(domain)
+          return @favicon_cache[domain]
         end
-    rescue ex
-        Log.warn "ファビコン取得エラー: #{ex.message}"
+
+        # ファビコン取得（ネットワーク経由＋高度キャッシュ戦略）
+        favicon = FaviconFetcher.fetch_with_cache(url)
+
+        if favicon
+          @favicon_cache[domain] = favicon # キャッシュに保存
+          manage_favicon_cache_size # キャッシュサイズ管理
+          return favicon
+        else
+          @favicon_cache[domain] = nil # 取得失敗をキャッシュ
+        end
+        
+      rescue ex_uri : URI::Error
+        Log.warn "ファビコン取得のためのURLパースエラー: #{url}, #{ex_uri.message}"
+        # ドメインが取得できない場合は、URL全体をキーとしてキャッシュに失敗を記録することも検討できる
+        # ここでは何もしない（デフォルトアイコンが返る）
+      rescue ex
+        Log.warn "ファビコン取得中に予期せぬエラー: #{ex.message}"
       end
       
       # デフォルトアイコンを返す
       @icons[:unknown]?
+    end
+
+    # ファビコンキャッシュのサイズを管理する
+    private def manage_favicon_cache_size
+      max_cache_size = 50 # 例: 最大50件までキャッシュ
+      if @favicon_cache.size > max_cache_size
+        # 古いものから削除 (単純なFIFOに近い)
+        # より洗練されたLRUなどを実装することも可能
+        keys_to_remove = @favicon_cache.keys.first(@favicon_cache.size - max_cache_size)
+        keys_to_remove.each { |key| @favicon_cache.delete(key) }
+        Log.debug "ファビコンキャッシュサイズ制限を超えたため、#{keys_to_remove.size}件削除しました。"
+      end
     end
 
     # ナビゲーション実行

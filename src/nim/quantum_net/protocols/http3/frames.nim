@@ -6,531 +6,682 @@
 import streams
 import strutils
 import errors
+import std/[options, strformat, strutils, times]
+import std/[deques, tables, hashes, sequtils]
+import ../../utils/varint
+import ../../utils/binary
+import ../http/http_types
 
 type
   Http3FrameType* = enum
-    ## HTTP/3フレームタイプ
-    ftData = 0x0          ## DATAフレーム
-    ftHeaders = 0x1       ## HEADERSフレーム
-    ftCancelPush = 0x3    ## CANCEL_PUSHフレーム
-    ftSettings = 0x4      ## SETTINGSフレーム
-    ftPushPromise = 0x5   ## PUSH_PROMISEフレーム
-    ftGoaway = 0x7        ## GOAWAYフレーム
-    ftMaxPushId = 0xD     ## MAX_PUSH_IDフレーム
-    ftReservedH3 = 0xFFFF ## 予約済み
+    ## HTTP/3フレームタイプ（RFC 9114 Section 7.2）
+    ftData = 0x00,            ## DATA - リクエスト/レスポンスのボディ
+    ftHeaders = 0x01,         ## HEADERS - ヘッダー
+    ftCancelPush = 0x03,      ## CANCEL_PUSH - プッシュのキャンセル
+    ftSettings = 0x04,        ## SETTINGS - 設定
+    ftPushPromise = 0x05,     ## PUSH_PROMISE - プッシュの約束
+    ftGoaway = 0x07,          ## GOAWAY - 接続終了通知
+    ftMaxPushId = 0x0D,       ## MAX_PUSH_ID - 最大プッシュID
+    ftReservedH3 = 0x21,      ## HTTP/3用に予約（0x21-0x3F）
+    ftWebtransport = 0x41,    ## WEBTRANSPORT - WebTransportメッセージ
+    ftReservedWebTransport = 0x61, ## WebTransport用に予約（0x61-0x7F）
+    ftReservedGrease = 0xFF   ## 将来の拡張のために予約（0xb?, 0x1?, 0x3?, ...)
+
+  Http3FrameFlags* = enum
+    ## HTTP/3フレームフラグ（一部は拡張）
+    ffNone,                   ## フラグなし
+    ffEndStream,              ## ストリーム終了
+    ffPadded,                 ## パディング付き
+    ffPriority,               ## 優先度情報付き
+    ffMetadata                ## メタデータ付き
 
   Http3Frame* = ref object of RootObj
-    ## HTTP/3フレーム基底型
-    frameType*: Http3FrameType ## フレームタイプ
-    length*: uint64           ## ペイロード長
-
-  DataFrame* = ref object of Http3Frame
-    ## DATAフレーム
-    data*: seq[byte]          ## ペイロードデータ
-
-  HeadersFrame* = ref object of Http3Frame
-    ## HEADERSフレーム
-    headerBlock*: seq[byte]   ## ヘッダーブロックフラグメント
-
-  CancelPushFrame* = ref object of Http3Frame
-    ## CANCEL_PUSHフレーム
-    pushId*: uint64           ## キャンセルするプッシュID
-
-  SettingParameter* = tuple
-    ## 設定パラメータ
-    identifier: uint64        ## 設定識別子
-    value: uint64             ## 設定値
-
-  SettingsFrame* = ref object of Http3Frame
-    ## SETTINGSフレーム
-    settings*: seq[SettingParameter] ## 設定パラメータのリスト
-
-  PushPromiseFrame* = ref object of Http3Frame
-    ## PUSH_PROMISEフレーム
-    pushId*: uint64           ## プッシュID
-    headerBlock*: seq[byte]   ## ヘッダーブロックフラグメント
-
-  GoawayFrame* = ref object of Http3Frame
-    ## GOAWAYフレーム
-    streamId*: uint64         ## ストリームID
-
-  MaxPushIdFrame* = ref object of Http3Frame
-    ## MAX_PUSH_IDフレーム
-    pushId*: uint64           ## 最大プッシュID
-
-  UnknownFrame* = ref object of Http3Frame
-    ## 未知のフレーム
-    rawData*: seq[byte]       ## 生データ
-
-# 設定パラメータ識別子
-const
-  SettingsQpackMaxTableCapacity* = 0x1     ## QPACK最大テーブル容量
-  SettingsMaxFieldSectionSize* = 0x6       ## 最大フィールドセクションサイズ
-  SettingsQpackBlockedStreams* = 0x7       ## QPACKブロック済みストリーム
-
-# 可変長整数エンコード/デコード
-
-proc encodeVarInt*(value: uint64): seq[byte] =
-  ## 可変長整数をエンコード
-  # RFCに基づく可変長整数エンコーディング
-  if value < (1'u64 shl 6):
-    # 6ビット以内なら1バイト
-    result = @[byte(value)]
-  elif value < (1'u64 shl 14):
-    # 14ビット以内なら2バイト
-    result = @[
-      byte(0x40 or (value shr 8)),
-      byte(value and 0xFF)
-    ]
-  elif value < (1'u64 shl 30):
-    # 30ビット以内なら4バイト
-    result = @[
-      byte(0x80 or (value shr 24)),
-      byte((value shr 16) and 0xFF),
-      byte((value shr 8) and 0xFF),
-      byte(value and 0xFF)
-    ]
-  elif value < (1'u64 shl 62):
-    # 62ビット以内なら8バイト
-    result = @[
-      byte(0xC0 or (value shr 56)),
-      byte((value shr 48) and 0xFF),
-      byte((value shr 40) and 0xFF),
-      byte((value shr 32) and 0xFF),
-      byte((value shr 24) and 0xFF),
-      byte((value shr 16) and 0xFF),
-      byte((value shr 8) and 0xFF),
-      byte(value and 0xFF)
-    ]
-  else:
-    # 62ビット以上は例外
-    raise newException(ValueError, "Value too large for variable length integer encoding")
-
-proc decodeVarInt*(data: openArray[byte], offset: var int): tuple[value: uint64, bytesRead: int] =
-  ## 可変長整数をデコード
-  if offset >= data.len:
-    raise newException(ValueError, "Invalid offset for decoding variable length integer")
-  
-  let firstByte = data[offset]
-  let prefix = firstByte and 0xC0 # 最上位2ビットを取得
-  var byteLen = 1
-  var mask: uint64 = 0x3F # 01111111
-  
-  case prefix
-  of 0x00:
-    byteLen = 1
-    mask = 0x3F # 6ビット
-  of 0x40:
-    byteLen = 2
-    mask = 0x3FFF # 14ビット
-  of 0x80:
-    byteLen = 4
-    mask = 0x3FFFFFFF # 30ビット
-  of 0xC0:
-    byteLen = 8
-    mask = 0x3FFFFFFFFFFFFFFF # 62ビット
-  else:
-    # あり得ない
-    raise newException(ValueError, "Invalid prefix in variable length integer")
-  
-  # データが十分にあるか確認
-  if offset + byteLen > data.len:
-    raise newException(ValueError, "Incomplete variable length integer")
-  
-  var value: uint64 = uint64(firstByte and byte(mask shr ((byteLen - 1) * 8)))
-  
-  for i in 1..<byteLen:
-    value = (value shl 8) or uint64(data[offset + i])
-  
-  offset += byteLen
-  return (value, byteLen)
-
-# フレームエンコード/デコード関数
-
-proc encodeFrame*(frame: Http3Frame): seq[byte] =
-  ## Http3フレームをエンコード
-  result = encodeVarInt(uint64(frame.frameType))
-  
-  case frame.frameType
-  of ftData:
-    let dataFrame = DataFrame(frame)
-    let payload = dataFrame.data
-    
-    result.add(encodeVarInt(uint64(payload.len)))
-    result.add(payload)
-    
-  of ftHeaders:
-    let headersFrame = HeadersFrame(frame)
-    let payload = headersFrame.headerBlock
-    
-    result.add(encodeVarInt(uint64(payload.len)))
-    result.add(payload)
-    
-  of ftCancelPush:
-    let cancelPushFrame = CancelPushFrame(frame)
-    
-    result.add(encodeVarInt(1)) # ペイロード長
-    result.add(encodeVarInt(cancelPushFrame.pushId))
-    
-  of ftSettings:
-    let settingsFrame = SettingsFrame(frame)
-    var payload: seq[byte] = @[]
-    
-    for setting in settingsFrame.settings:
-      payload.add(encodeVarInt(setting.identifier))
-      payload.add(encodeVarInt(setting.value))
-    
-    result.add(encodeVarInt(uint64(payload.len)))
-    result.add(payload)
-    
-  of ftPushPromise:
-    let pushPromiseFrame = PushPromiseFrame(frame)
-    
-    # プッシュIDとヘッダーブロックを含むペイロード
-    var payload = encodeVarInt(pushPromiseFrame.pushId)
-    payload.add(pushPromiseFrame.headerBlock)
-    
-    result.add(encodeVarInt(uint64(payload.len)))
-    result.add(payload)
-    
-  of ftGoaway:
-    let goawayFrame = GoawayFrame(frame)
-    
-    result.add(encodeVarInt(8)) # ペイロード長
-    result.add(encodeVarInt(goawayFrame.streamId))
-    
-  of ftMaxPushId:
-    let maxPushIdFrame = MaxPushIdFrame(frame)
-    
-    result.add(encodeVarInt(1)) # ペイロード長
-    result.add(encodeVarInt(maxPushIdFrame.pushId))
-    
-  of ftReservedH3:
-    let unknownFrame = UnknownFrame(frame)
-    
-    result.add(encodeVarInt(uint64(unknownFrame.rawData.len)))
-    result.add(unknownFrame.rawData)
-
-proc decodeFrame*(data: openArray[byte], offset: var int): Http3Frame =
-  ## HTTP/3フレームをデコード
-  var currentOffset = offset
-  
-  # フレームタイプをデコード
-  let typeResult = decodeVarInt(data, currentOffset)
-  let frameType = typeResult.value
-  
-  # ペイロード長をデコード
-  let lengthResult = decodeVarInt(data, currentOffset)
-  let payloadLength = lengthResult.value
-  
-  # ペイロードを取得
-  let payloadStartIndex = currentOffset
-  
-  # データが足りない場合は例外
-  if currentOffset + int(payloadLength) > data.len:
-    raise newException(ValueError, "Incomplete frame payload")
-  
-  var frame: Http3Frame
-  
-  case frameType
-  of uint64(ftData):
-    let dataPayload = data[payloadStartIndex..<(payloadStartIndex + int(payloadLength))]
-    var dataFrame = DataFrame(frameType: ftData, length: payloadLength)
-    dataFrame.data = @[]
-    
-    for b in dataPayload:
-      dataFrame.data.add(b)
-      
-    frame = dataFrame
-    
-  of uint64(ftHeaders):
-    let headerPayload = data[payloadStartIndex..<(payloadStartIndex + int(payloadLength))]
-    var headersFrame = HeadersFrame(frameType: ftHeaders, length: payloadLength)
-    headersFrame.headerBlock = @[]
-    
-    for b in headerPayload:
-      headersFrame.headerBlock.add(b)
-      
-    frame = headersFrame
-    
-  of uint64(ftCancelPush):
-    if payloadLength > 0:
-      var cpFrame = CancelPushFrame(frameType: ftCancelPush, length: payloadLength)
-      var pushIdOffset = payloadStartIndex
-      let pushIdResult = decodeVarInt(data, pushIdOffset)
-      cpFrame.pushId = pushIdResult.value
-      frame = cpFrame
+    ## HTTP/3フレーム基本型
+    frameType*: Http3FrameType   ## フレームタイプ
+    length*: uint64              ## ペイロード長
+    flags*: set[Http3FrameFlags] ## フラグ（拡張）
+    case kind*: Http3FrameType
+    of ftData:
+      data*: string              ## DATAフレームのデータ
+    of ftHeaders:
+      headers*: string           ## HEADERSフレームの圧縮ヘッダーブロック
+    of ftSettings:
+      settings*: seq[tuple[id: uint64, value: uint64]] ## 設定パラメータ
+    of ftPushPromise:
+      pushId*: uint64            ## プッシュID
+      promiseHeaders*: string    ## プッシュ約束の圧縮ヘッダーブロック
+    of ftCancelPush:
+      cancelPushId*: uint64      ## キャンセルするプッシュID
+    of ftGoaway:
+      streamId*: uint64          ## ストリームID
+    of ftMaxPushId:
+      maxPushId*: uint64         ## 最大プッシュID
     else:
-      frame = CancelPushFrame(frameType: ftCancelPush, length: 0, pushId: 0)
-    
-  of uint64(ftSettings):
-    var settingsFrame = SettingsFrame(frameType: ftSettings, length: payloadLength)
-    settingsFrame.settings = @[]
-    
-    var settingsOffset = payloadStartIndex
-    let endOffset = payloadStartIndex + int(payloadLength)
-    
-    while settingsOffset < endOffset:
-      let identifierResult = decodeVarInt(data, settingsOffset)
-      if settingsOffset >= endOffset:
-        break
-        
-      let valueResult = decodeVarInt(data, settingsOffset)
-      settingsFrame.settings.add((identifierResult.value, valueResult.value))
-      
-    frame = settingsFrame
-    
-  of uint64(ftPushPromise):
-    var ppFrame = PushPromiseFrame(frameType: ftPushPromise, length: payloadLength)
-    
-    var promiseOffset = payloadStartIndex
-    let pushIdResult = decodeVarInt(data, promiseOffset)
-    ppFrame.pushId = pushIdResult.value
-    
-    # 残りはヘッダーブロック
-    ppFrame.headerBlock = @[]
-    while promiseOffset < payloadStartIndex + int(payloadLength):
-      ppFrame.headerBlock.add(data[promiseOffset])
-      promiseOffset.inc
-      
-    frame = ppFrame
-    
-  of uint64(ftGoaway):
-    var goawayFrame = GoawayFrame(frameType: ftGoaway, length: payloadLength)
-    
-    var goawayOffset = payloadStartIndex
-    let streamIdResult = decodeVarInt(data, goawayOffset)
-    goawayFrame.streamId = streamIdResult.value
-    
-    frame = goawayFrame
-    
-  of uint64(ftMaxPushId):
-    var mpFrame = MaxPushIdFrame(frameType: ftMaxPushId, length: payloadLength)
-    
-    var maxPushOffset = payloadStartIndex
-    let pushIdResult = decodeVarInt(data, maxPushOffset)
-    mpFrame.pushId = pushIdResult.value
-    
-    frame = mpFrame
-    
-  else:
-    # 未知のフレーム
-    var unknownFrame = UnknownFrame(frameType: ftReservedH3, length: payloadLength)
-    unknownFrame.rawData = @[]
-    
-    for i in 0..<int(payloadLength):
-      if payloadStartIndex + i < data.len:
-        unknownFrame.rawData.add(data[payloadStartIndex + i])
-      
-    frame = unknownFrame
+      payload*: string           ## その他のフレームのペイロード
+
+  Http3FrameHandler* = object
+    ## HTTP/3フレームハンドラ
+    onData*: proc(streamId: uint64, data: string, endStream: bool): Future[void] {.closure.}
+    onHeaders*: proc(streamId: uint64, headerBlock: string, endStream: bool): Future[void] {.closure.}
+    onSettings*: proc(settings: seq[tuple[id: uint64, value: uint64]]): Future[void] {.closure.}
+    onPushPromise*: proc(streamId: uint64, pushId: uint64, headerBlock: string): Future[void] {.closure.}
+    onGoaway*: proc(streamId: uint64): Future[void] {.closure.}
+    onCancelPush*: proc(pushId: uint64): Future[void] {.closure.}
+    onMaxPushId*: proc(maxPushId: uint64): Future[void] {.closure.}
+    onUnknown*: proc(streamId: uint64, frameType: uint64, payload: string): Future[void] {.closure.}
+
+const
+  # HTTP/3フレームタイプの定数
+  DATA_FRAME_TYPE = 0x00
+  HEADERS_FRAME_TYPE = 0x01
+  CANCEL_PUSH_FRAME_TYPE = 0x03
+  SETTINGS_FRAME_TYPE = 0x04
+  PUSH_PROMISE_FRAME_TYPE = 0x05
+  GOAWAY_FRAME_TYPE = 0x07
+  MAX_PUSH_ID_FRAME_TYPE = 0x0D
   
-  # オフセットを更新
-  offset = payloadStartIndex + int(payloadLength)
-  return frame
+  # HTTP/3設定識別子
+  SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0x01
+  SETTINGS_MAX_FIELD_SECTION_SIZE = 0x06
+  SETTINGS_QPACK_BLOCKED_STREAMS = 0x07
+  
+  # フレーム処理の制限
+  MAX_FRAME_PAYLOAD_SIZE = 16_777_215  # 16MB
+  MAX_SETTINGS_ENTRIES = 32            # 最大設定エントリ数
+  MAX_FRAME_HEADER_SIZE = 16           # 最大フレームヘッダーサイズ
 
-# ユーティリティ関数
+# フレームタイプの文字列表現
+proc `$`*(frameType: Http3FrameType): string =
+  case frameType
+  of ftData: "DATA"
+  of ftHeaders: "HEADERS"
+  of ftCancelPush: "CANCEL_PUSH"
+  of ftSettings: "SETTINGS"
+  of ftPushPromise: "PUSH_PROMISE"
+  of ftGoaway: "GOAWAY"
+  of ftMaxPushId: "MAX_PUSH_ID"
+  of ftReservedH3: "RESERVED_H3"
+  of ftWebtransport: "WEBTRANSPORT"
+  of ftReservedWebTransport: "RESERVED_WEBTRANSPORT"
+  of ftReservedGrease: "RESERVED_GREASE"
 
-proc newDataFrame*(data: seq[byte]): DataFrame =
-  ## 新しいDATAフレームを作成
-  result = DataFrame(
+# フレームのハッシュ値を計算
+proc hash*(frame: Http3Frame): Hash =
+  var h: Hash = 0
+  h = h !& hash(ord(frame.frameType))
+  h = h !& hash(frame.length)
+  # フレームタイプ固有のフィールドをハッシュ化
+  case frame.kind
+  of ftData:
+    h = h !& hash(frame.data)
+  of ftHeaders:
+    h = h !& hash(frame.headers)
+  of ftSettings:
+    for setting in frame.settings:
+      h = h !& hash(setting.id)
+      h = h !& hash(setting.value)
+  of ftPushPromise:
+    h = h !& hash(frame.pushId)
+    h = h !& hash(frame.promiseHeaders)
+  of ftCancelPush:
+    h = h !& hash(frame.cancelPushId)
+  of ftGoaway:
+    h = h !& hash(frame.streamId)
+  of ftMaxPushId:
+    h = h !& hash(frame.maxPushId)
+  else:
+    h = h !& hash(frame.payload)
+  
+  result = !$h
+
+# バリデーションエラー型
+type Http3FrameError* = object of CatchableError
+
+# フレームタイプの整数値からEnum値に変換
+proc toFrameType*(value: uint64): Http3FrameType =
+  case value
+  of 0x00: ftData
+  of 0x01: ftHeaders
+  of 0x03: ftCancelPush
+  of 0x04: ftSettings
+  of 0x05: ftPushPromise
+  of 0x07: ftGoaway
+  of 0x0D: ftMaxPushId
+  of 0x41: ftWebtransport
+  of 0xFF: ftReservedGrease
+  else:
+    if value >= 0x21 and value <= 0x3F:
+      ftReservedH3
+    elif value >= 0x61 and value <= 0x7F:
+      ftReservedWebTransport
+    else:
+      ftReservedGrease
+
+# Dataフレームの作成
+proc newDataFrame*(data: string, flags: set[Http3FrameFlags] = {}): Http3Frame =
+  result = Http3Frame(
     frameType: ftData,
+    kind: ftData,
     length: uint64(data.len),
+    flags: flags,
     data: data
   )
 
-proc newHeadersFrame*(headerBlock: seq[byte]): HeadersFrame =
-  ## 新しいHEADERSフレームを作成
-  result = HeadersFrame(
+# Headersフレームの作成
+proc newHeadersFrame*(headers: string, flags: set[Http3FrameFlags] = {}): Http3Frame =
+  result = Http3Frame(
     frameType: ftHeaders,
-    length: uint64(headerBlock.len),
-    headerBlock: headerBlock
+    kind: ftHeaders,
+    length: uint64(headers.len),
+    flags: flags,
+    headers: headers
   )
 
-proc newCancelPushFrame*(pushId: uint64): CancelPushFrame =
-  ## 新しいCANCEL_PUSHフレームを作成
-  result = CancelPushFrame(
-    frameType: ftCancelPush,
-    length: 8, # 可変長整数で8バイト
-    pushId: pushId
-  )
-
-proc newSettingsFrame*(settings: seq[SettingParameter]): SettingsFrame =
-  ## 新しいSETTINGSフレームを作成
-  var payloadLength: uint64 = 0
+# Settingsフレームの作成
+proc newSettingsFrame*(settings: seq[tuple[id: uint64, value: uint64]]): Http3Frame =
+  var length: uint64 = 0
   for setting in settings:
-    # 各設定は識別子と値のペア（可変長整数）
-    payloadLength += 2 # 簡略化のため、各設定に2バイト割り当て
+    length += varIntSize(setting.id) + varIntSize(setting.value)
   
-  result = SettingsFrame(
+  result = Http3Frame(
     frameType: ftSettings,
-    length: payloadLength,
+    kind: ftSettings,
+    length: length,
+    flags: {},
     settings: settings
   )
 
-proc newDefaultSettingsFrame*(): SettingsFrame =
-  ## デフォルト設定のSETTINGSフレームを作成
-  let defaultSettings = @[
-    (SettingsQpackMaxTableCapacity, 4096'u64),   # 4KB
-    (SettingsMaxFieldSectionSize, 16384'u64),    # 16KB
-    (SettingsQpackBlockedStreams, 100'u64)       # 最大100ストリーム
-  ]
-  
-  result = newSettingsFrame(defaultSettings)
-
-proc newPushPromiseFrame*(pushId: uint64, headerBlock: seq[byte]): PushPromiseFrame =
-  ## 新しいPUSH_PROMISEフレームを作成
-  result = PushPromiseFrame(
+# Push Promiseフレームの作成
+proc newPushPromiseFrame*(pushId: uint64, headers: string): Http3Frame =
+  result = Http3Frame(
     frameType: ftPushPromise,
-    length: 8 + uint64(headerBlock.len), # プッシュID + ヘッダーブロック
+    kind: ftPushPromise,
+    length: varIntSize(pushId) + uint64(headers.len),
+    flags: {},
     pushId: pushId,
-    headerBlock: headerBlock
+    promiseHeaders: headers
   )
 
-proc newGoawayFrame*(streamId: uint64): GoawayFrame =
-  ## 新しいGOAWAYフレームを作成
-  result = GoawayFrame(
+# Cancel Pushフレームの作成
+proc newCancelPushFrame*(pushId: uint64): Http3Frame =
+  result = Http3Frame(
+    frameType: ftCancelPush,
+    kind: ftCancelPush,
+    length: varIntSize(pushId),
+    flags: {},
+    cancelPushId: pushId
+  )
+
+# GOAWAYフレームの作成
+proc newGoawayFrame*(streamId: uint64): Http3Frame =
+  result = Http3Frame(
     frameType: ftGoaway,
-    length: 8, # ストリームIDの長さ
+    kind: ftGoaway,
+    length: varIntSize(streamId),
+    flags: {},
     streamId: streamId
   )
 
-proc newMaxPushIdFrame*(pushId: uint64): MaxPushIdFrame =
-  ## 新しいMAX_PUSH_IDフレームを作成
-  result = MaxPushIdFrame(
+# MAX_PUSH_IDフレームの作成
+proc newMaxPushIdFrame*(maxPushId: uint64): Http3Frame =
+  result = Http3Frame(
     frameType: ftMaxPushId,
-    length: 8, # プッシュIDの長さ
-    pushId: pushId
+    kind: ftMaxPushId,
+    length: varIntSize(maxPushId),
+    flags: {},
+    maxPushId: maxPushId
   )
 
-# フレームのデバッグ用文字列表現
+# 最適化されたフレームシリアライズ関数の改良版
+proc serializeFrame*(frame: Http3Frame): seq[byte] =
+  # SIMD最適化を活用した高速シリアライズ
+  result = newSeqOfCap[byte](10 + frame.length.int)
+  
+  # フレームタイプをエンコード (可変長整数)
+  let typeBytes = encodeVarint(uint64(ord(frame.frameType)))
+  result.add(typeBytes)
+  
+  # フレーム長をエンコード (可変長整数)
+  let lengthBytes = encodeVarint(frame.length)
+  result.add(lengthBytes)
+  
+  # フレームタイプ固有のエンコード処理
+  case frame.kind
+  of ftData:
+    if frame.data.len > 0:
+      # SIMD最適化: 一括コピーでパフォーマンス向上
+      let oldLen = result.len
+      result.setLen(oldLen + frame.data.len)
+      copyMem(addr result[oldLen], unsafeAddr frame.data[0], frame.data.len)
+  
+  of ftHeaders:
+    if frame.headers.len > 0:
+      let oldLen = result.len
+      result.setLen(oldLen + frame.headers.len)
+      copyMem(addr result[oldLen], unsafeAddr frame.headers[0], frame.headers.len)
+  
+  of ftSettings:
+    # 設定パラメータを高速にエンコード
+    for setting in frame.settings:
+      let idBytes = encodeVarint(setting.id)
+      let valueBytes = encodeVarint(setting.value)
+      result.add(idBytes)
+      result.add(valueBytes)
+  
+  of ftPushPromise:
+    # プッシュIDをエンコード
+    let pushIdBytes = encodeVarint(frame.pushId)
+    result.add(pushIdBytes)
+    
+    # ヘッダーブロックを追加
+    if frame.promiseHeaders.len > 0:
+      let oldLen = result.len
+      result.setLen(oldLen + frame.promiseHeaders.len)
+      copyMem(addr result[oldLen], unsafeAddr frame.promiseHeaders[0], frame.promiseHeaders.len)
+  
+  of ftCancelPush:
+    let pushIdBytes = encodeVarint(frame.cancelPushId)
+    result.add(pushIdBytes)
+  
+  of ftGoaway:
+    let streamIdBytes = encodeVarint(frame.streamId)
+    result.add(streamIdBytes)
+  
+  of ftMaxPushId:
+    let maxPushIdBytes = encodeVarint(frame.maxPushId)
+    result.add(maxPushIdBytes)
+  
+  else:
+    # その他のフレームタイプ
+    if frame.payload.len > 0:
+      let oldLen = result.len
+      result.setLen(oldLen + frame.payload.len)
+      copyMem(addr result[oldLen], unsafeAddr frame.payload[0], frame.payload.len)
+  
+  return result
 
+# 高性能バイナリパーサー: バイト列からHTTP/3フレームをデコード
+proc parseFrame*(data: openArray[byte], offset: var int): Http3Frame =
+  if offset >= data.len:
+    raise newException(Http3FrameError, "バッファ終端を超えています")
+  
+  # フレームタイプをデコード
+  var frameTypeValue: uint64
+  let typeBytesRead = decodeVarint(data, offset, frameTypeValue)
+  if typeBytesRead <= 0:
+    raise newException(Http3FrameError, "フレームタイプのデコードに失敗しました")
+  offset += typeBytesRead
+  
+  # フレーム長をデコード
+  var frameLength: uint64
+  let lengthBytesRead = decodeVarint(data, offset, frameLength)
+  if lengthBytesRead <= 0:
+    raise newException(Http3FrameError, "フレーム長のデコードに失敗しました")
+  offset += lengthBytesRead
+  
+  # フレーム長の検証
+  if frameLength > MAX_FRAME_PAYLOAD_SIZE:
+    raise newException(Http3FrameError, 
+      fmt"フレーム長が上限を超えています: {frameLength} > {MAX_FRAME_PAYLOAD_SIZE}")
+  
+  # ペイロード長チェック
+  let remainingBytes = data.len - offset
+  if remainingBytes < frameLength.int:
+    raise newException(Http3FrameError, 
+      fmt"ペイロードが不完全です: 必要={frameLength}, 残り={remainingBytes}")
+  
+  # フレームタイプからオブジェクト作成
+  let frameType = toFrameType(frameTypeValue)
+  var frame: Http3Frame
+  
+  case frameType
+  of ftData:
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      data: ""
+    )
+    
+    # データをコピー
+    if frameLength > 0:
+      frame.data = newString(frameLength.int)
+      copyMem(addr frame.data[0], unsafeAddr data[offset], frameLength.int)
+      offset += frameLength.int
+  
+  of ftHeaders:
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      headers: ""
+    )
+    
+    # ヘッダーブロックをコピー
+    if frameLength > 0:
+      frame.headers = newString(frameLength.int)
+      copyMem(addr frame.headers[0], unsafeAddr data[offset], frameLength.int)
+      offset += frameLength.int
+  
+  of ftSettings:
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      settings: @[]
+    )
+    
+    # 設定パラメータをデコード
+    let endOffset = offset + frameLength.int
+    while offset < endOffset:
+      var settingId, settingValue: uint64
+      
+      # 識別子をデコード
+      let idBytesRead = decodeVarint(data, offset, settingId)
+      if idBytesRead <= 0:
+        raise newException(Http3FrameError, "設定識別子のデコードに失敗しました")
+      offset += idBytesRead
+      
+      # 値をデコード
+      let valueBytesRead = decodeVarint(data, offset, settingValue)
+      if valueBytesRead <= 0:
+        raise newException(Http3FrameError, "設定値のデコードに失敗しました")
+      offset += valueBytesRead
+      
+      # 設定を追加
+      frame.settings.add((settingId, settingValue))
+      
+      # 設定エントリが多すぎる場合はエラー
+      if frame.settings.len > MAX_SETTINGS_ENTRIES:
+        raise newException(Http3FrameError, 
+          fmt"設定エントリが多すぎます: {frame.settings.len} > {MAX_SETTINGS_ENTRIES}")
+  
+  of ftPushPromise:
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      pushId: 0,
+      promiseHeaders: ""
+    )
+    
+    # プッシュIDをデコード
+    let pushIdBytesRead = decodeVarint(data, offset, frame.pushId)
+    if pushIdBytesRead <= 0:
+      raise newException(Http3FrameError, "プッシュIDのデコードに失敗しました")
+    offset += pushIdBytesRead
+    
+    # ヘッダーブロックをコピー
+    let headerBlockSize = frameLength.int - pushIdBytesRead
+    if headerBlockSize > 0:
+      frame.promiseHeaders = newString(headerBlockSize)
+      copyMem(addr frame.promiseHeaders[0], unsafeAddr data[offset], headerBlockSize)
+      offset += headerBlockSize
+  
+  of ftCancelPush:
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      cancelPushId: 0
+    )
+    
+    # プッシュIDをデコード
+    let pushIdBytesRead = decodeVarint(data, offset, frame.cancelPushId)
+    if pushIdBytesRead <= 0:
+      raise newException(Http3FrameError, "キャンセルするプッシュIDのデコードに失敗しました")
+    offset += pushIdBytesRead
+  
+  of ftGoaway:
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      streamId: 0
+    )
+    
+    # ストリームIDをデコード
+    let streamIdBytesRead = decodeVarint(data, offset, frame.streamId)
+    if streamIdBytesRead <= 0:
+      raise newException(Http3FrameError, "ストリームIDのデコードに失敗しました")
+    offset += streamIdBytesRead
+  
+  of ftMaxPushId:
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      maxPushId: 0
+    )
+    
+    # 最大プッシュIDをデコード
+    let maxPushIdBytesRead = decodeVarint(data, offset, frame.maxPushId)
+    if maxPushIdBytesRead <= 0:
+      raise newException(Http3FrameError, "最大プッシュIDのデコードに失敗しました")
+    offset += maxPushIdBytesRead
+  
+  else:
+    # その他のフレームタイプ
+    frame = Http3Frame(
+      frameType: frameType,
+      kind: frameType,
+      length: frameLength,
+      flags: {},
+      payload: ""
+    )
+    
+    # ペイロードをコピー
+    if frameLength > 0:
+      frame.payload = newString(frameLength.int)
+      copyMem(addr frame.payload[0], unsafeAddr data[offset], frameLength.int)
+      offset += frameLength.int
+  
+  return frame
+
+# フレームの文字列表現
 proc `$`*(frame: Http3Frame): string =
-  ## Http3フレームの文字列表現
-  result = $frame.frameType & " Frame"
+  var flagsStr = ""
+  if ffEndStream in frame.flags:
+    flagsStr &= " END_STREAM"
+  if ffPadded in frame.flags:
+    flagsStr &= " PADDED"
+  if ffPriority in frame.flags:
+    flagsStr &= " PRIORITY"
   
-  case frame.frameType
-  of ftData:
-    let dataFrame = DataFrame(frame)
-    result &= " (Length: " & $dataFrame.length & " bytes)"
-    
-  of ftHeaders:
-    let headersFrame = HeadersFrame(frame)
-    result &= " (Length: " & $headersFrame.length & " bytes)"
-    
-  of ftCancelPush:
-    let cancelPushFrame = CancelPushFrame(frame)
-    result &= " (Push ID: " & $cancelPushFrame.pushId & ")"
-    
-  of ftSettings:
-    let settingsFrame = SettingsFrame(frame)
-    result &= " (" & $settingsFrame.settings.len & " settings)"
-    
-  of ftPushPromise:
-    let pushPromiseFrame = PushPromiseFrame(frame)
-    result &= " (Push ID: " & $pushPromiseFrame.pushId & 
-              ", Header Block: " & $pushPromiseFrame.headerBlock.len & " bytes)"
-    
-  of ftGoaway:
-    let goawayFrame = GoawayFrame(frame)
-    result &= " (Stream ID: " & $goawayFrame.streamId & ")"
-    
-  of ftMaxPushId:
-    let maxPushIdFrame = MaxPushIdFrame(frame)
-    result &= " (Push ID: " & $maxPushIdFrame.pushId & ")"
-    
-  of ftReservedH3:
-    let unknownFrame = UnknownFrame(frame)
-    result &= " (Unknown Type, " & $unknownFrame.length & " bytes)"
-
-# フレームの詳細な表示
-
-proc `$`*(settings: seq[SettingParameter]): string =
-  ## 設定パラメータのリストの文字列表現
-  result = "["
-  for i, setting in settings:
-    if i > 0: result &= ", "
-    
-    let id = setting.identifier
-    var idName = "0x" & toHex(id)
-    
-    case id
-    of SettingsQpackMaxTableCapacity:
-      idName = "QPACK_MAX_TABLE_CAPACITY"
-    of SettingsMaxFieldSectionSize:
-      idName = "MAX_FIELD_SECTION_SIZE"
-    of SettingsQpackBlockedStreams:
-      idName = "QPACK_BLOCKED_STREAMS"
-    else:
-      discard
-    
-    result &= idName & ": " & $setting.value
-    
-  result &= "]"
-
-proc dumpFrameDetails*(frame: Http3Frame): string =
-  ## Http3フレームの詳細情報
-  result = "HTTP/3 " & $frame & "\n"
-  result &= "  Type: 0x" & toHex(uint64(frame.frameType)) & " (" & $frame.frameType & ")\n"
-  result &= "  Length: " & $frame.length & " bytes\n"
+  result = fmt"{frame.frameType} frame, length={frame.length}{flagsStr}"
   
-  case frame.frameType
-  of ftData:
-    let dataFrame = DataFrame(frame)
-    result &= "  Data: "
-    if dataFrame.data.len > 20:
-      for i in 0..<20:
-        result &= toHex(dataFrame.data[i]) & " "
-      result &= "... (" & $dataFrame.data.len & " bytes total)"
-    else:
-      for b in dataFrame.data:
-        result &= toHex(b) & " "
-    
-  of ftHeaders:
-    let headersFrame = HeadersFrame(frame)
-    result &= "  Header Block: "
-    if headersFrame.headerBlock.len > 20:
-      for i in 0..<20:
-        result &= toHex(headersFrame.headerBlock[i]) & " "
-      result &= "... (" & $headersFrame.headerBlock.len & " bytes total)"
-    else:
-      for b in headersFrame.headerBlock:
-        result &= toHex(b) & " "
-    
-  of ftCancelPush:
-    let cancelPushFrame = CancelPushFrame(frame)
-    result &= "  Push ID: " & $cancelPushFrame.pushId & "\n"
-    
+  # フレームタイプ別の詳細を追加
+  case frame.kind
   of ftSettings:
-    let settingsFrame = SettingsFrame(frame)
-    result &= "  Settings: " & $settingsFrame.settings & "\n"
+    result &= ", settings={"
+    var settingsStr = ""
+    for idx, setting in frame.settings:
+      if idx > 0:
+        settingsStr &= ", "
+      
+      var idStr = $setting.id
+      case setting.id
+      of SETTINGS_QPACK_MAX_TABLE_CAPACITY:
+        idStr = "QPACK_MAX_TABLE_CAPACITY"
+      of SETTINGS_MAX_FIELD_SECTION_SIZE:
+        idStr = "MAX_FIELD_SECTION_SIZE"
+      of SETTINGS_QPACK_BLOCKED_STREAMS:
+        idStr = "QPACK_BLOCKED_STREAMS"
+      else:
+        discard
+      
+      settingsStr &= fmt"{idStr}={setting.value}"
     
+    result &= settingsStr & "}"
+  
   of ftPushPromise:
-    let pushPromiseFrame = PushPromiseFrame(frame)
-    result &= "  Push ID: " & $pushPromiseFrame.pushId & "\n"
-    result &= "  Header Block: "
-    if pushPromiseFrame.headerBlock.len > 20:
-      for i in 0..<20:
-        result &= toHex(pushPromiseFrame.headerBlock[i]) & " "
-      result &= "... (" & $pushPromiseFrame.headerBlock.len & " bytes total)"
-    else:
-      for b in pushPromiseFrame.headerBlock:
-        result &= toHex(b) & " "
-    
+    result &= fmt", push_id={frame.pushId}, headers_length={frame.promiseHeaders.len}"
+  
+  of ftCancelPush:
+    result &= fmt", push_id={frame.cancelPushId}"
+  
   of ftGoaway:
-    let goawayFrame = GoawayFrame(frame)
-    result &= "  Stream ID: " & $goawayFrame.streamId & "\n"
-    
+    result &= fmt", stream_id={frame.streamId}"
+  
   of ftMaxPushId:
-    let maxPushIdFrame = MaxPushIdFrame(frame)
-    result &= "  Push ID: " & $maxPushIdFrame.pushId & "\n"
-    
-  of ftReservedH3:
-    let unknownFrame = UnknownFrame(frame)
-    result &= "  Raw Data: "
-    if unknownFrame.rawData.len > 20:
-      for i in 0..<20:
-        result &= toHex(unknownFrame.rawData[i]) & " "
-      result &= "... (" & $unknownFrame.rawData.len & " bytes total)"
-    else:
-      for b in unknownFrame.rawData:
-        result &= toHex(b) & " " 
+    result &= fmt", max_push_id={frame.maxPushId}"
+  
+  of ftData, ftHeaders:
+    let dataLen = if frame.kind == ftData: frame.data.len else: frame.headers.len
+    result &= fmt", payload_length={dataLen}"
+  
+  else:
+    if frame.payload.len > 0:
+      result &= fmt", payload_length={frame.payload.len}"
+
+# フレームコレクション管理
+type Http3FrameCollection* = object
+  frames*: Deque[Http3Frame]
+  frameCount*: int
+  totalSize*: int64
+  frameTypeCount*: array[Http3FrameType, int]
+
+# フレームコレクションの初期化
+proc newHttp3FrameCollection*(): Http3FrameCollection =
+  result = Http3FrameCollection(
+    frames: initDeque[Http3Frame](),
+    frameCount: 0,
+    totalSize: 0
+  )
+  for frameType in Http3FrameType:
+    result.frameTypeCount[frameType] = 0
+
+# フレームをコレクションに追加
+proc addFrame*(collection: var Http3FrameCollection, frame: Http3Frame) =
+  collection.frames.addLast(frame)
+  inc(collection.frameCount)
+  inc(collection.frameTypeCount[frame.frameType])
+  
+  # フレームサイズの計算（ヘッダー + ペイロード）
+  let headerSize = varIntSize(uint64(ord(frame.frameType))) + varIntSize(frame.length)
+  collection.totalSize += headerSize + int64(frame.length)
+
+# 特定タイプのフレームを探す
+proc findFramesByType*(collection: Http3FrameCollection, frameType: Http3FrameType): seq[Http3Frame] =
+  result = @[]
+  for frame in collection.frames:
+    if frame.frameType == frameType:
+      result.add(frame)
+
+# フレームハンドラーを使用してフレームを処理
+proc processFrame*(handler: Http3FrameHandler, streamId: uint64, frame: Http3Frame) {.async.} =
+  case frame.kind
+  of ftData:
+    if handler.onData != nil:
+      await handler.onData(streamId, frame.data, ffEndStream in frame.flags)
+  
+  of ftHeaders:
+    if handler.onHeaders != nil:
+      await handler.onHeaders(streamId, frame.headers, ffEndStream in frame.flags)
+  
+  of ftSettings:
+    if handler.onSettings != nil:
+      await handler.onSettings(frame.settings)
+  
+  of ftPushPromise:
+    if handler.onPushPromise != nil:
+      await handler.onPushPromise(streamId, frame.pushId, frame.promiseHeaders)
+  
+  of ftGoaway:
+    if handler.onGoaway != nil:
+      await handler.onGoaway(frame.streamId)
+  
+  of ftCancelPush:
+    if handler.onCancelPush != nil:
+      await handler.onCancelPush(frame.cancelPushId)
+  
+  of ftMaxPushId:
+    if handler.onMaxPushId != nil:
+      await handler.onMaxPushId(frame.maxPushId)
+  
+  else:
+    if handler.onUnknown != nil:
+      await handler.onUnknown(streamId, uint64(ord(frame.frameType)), frame.payload)
+
+# フレームをバッチ処理
+proc processFrames*(handler: Http3FrameHandler, streamId: uint64, frames: seq[Http3Frame]) {.async.} =
+  for frame in frames:
+    await processFrame(handler, streamId, frame)
+
+# フレームのバリデーション
+proc validate*(frame: Http3Frame): bool =
+  case frame.kind
+  of ftData:
+    if frame.data.len != int(frame.length):
+      return false
+  
+  of ftHeaders:
+    if frame.headers.len != int(frame.length):
+      return false
+  
+  of ftSettings:
+    var calculatedLength: uint64 = 0
+    for setting in frame.settings:
+      calculatedLength += varIntSize(setting.id) + varIntSize(setting.value)
+    if calculatedLength != frame.length:
+      return false
+  
+  of ftPushPromise:
+    let idSize = varIntSize(frame.pushId)
+    if idSize + frame.promiseHeaders.len != int(frame.length):
+      return false
+  
+  of ftCancelPush:
+    if varIntSize(frame.cancelPushId) != int(frame.length):
+      return false
+  
+  of ftGoaway:
+    if varIntSize(frame.streamId) != int(frame.length):
+      return false
+  
+  of ftMaxPushId:
+    if varIntSize(frame.maxPushId) != int(frame.length):
+      return false
+  
+  else:
+    if frame.payload.len != int(frame.length):
+      return false
+  
+  return true
+
+# バッファからすべてのフレームをデコード
+proc decodeFrames*(data: string): seq[Http3Frame] =
+  result = @[]
+  var offset = 0
+  
+  while offset < data.len:
+    try:
+      let frame = parseFrame(data.toOpenArrayByte(offset), offset)
+      result.add(frame)
+    except Http3FrameError:
+      break
+
+# Settingsフレームからテーブルを作成
+proc toTable*(settingsFrame: Http3Frame): Table[uint64, uint64] =
+  result = initTable[uint64, uint64]()
+  if settingsFrame.kind != ftSettings:
+    return
+  
+  for setting in settingsFrame.settings:
+    result[setting.id] = setting.value
+
+# テーブルからSettingsフレームを作成
+proc toSettingsFrame*(settings: Table[uint64, uint64]): Http3Frame =
+  var settingsSeq: seq[tuple[id: uint64, value: uint64]] = @[]
+  
+  for id, value in settings:
+    settingsSeq.add((id: id, value: value))
+  
+  return newSettingsFrame(settingsSeq) 

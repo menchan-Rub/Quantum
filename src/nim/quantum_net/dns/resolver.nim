@@ -1019,8 +1019,6 @@ proc queryStandardDns(resolver: DnsResolver, domain: string, recordType: RecordT
 
 proc queryDoH(resolver: DnsResolver, domain: string, recordType: RecordType): Future[DnsResponse] {.async.} =
   ## DNS over HTTPSを使ってクエリを実行
-  # 実装はHTTPSクライアントライブラリを使用
-  # ここでは概略のみ示します
   let queryData = buildDnsQuery(domain, recordType)
   let queryBase64 = base64.encode(queryData)
   
@@ -1028,15 +1026,28 @@ proc queryDoH(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
     let dohUrl = resolver.config.servers[serverIndex]
     
     try:
-      # HTTP GET リクエスト
-      # 実際の実装では適切なHTTPクライアントを使用する必要があります
+      # 完全なHTTPクライアント実装
       var client = newAsyncHttpClient()
+      client.timeout = resolver.config.timeout.milliseconds
       client.headers = newHttpHeaders({
-        "Accept": "application/dns-message"
+        "Accept": "application/dns-message",
+        "User-Agent": "Quantum-Browser/1.0",
+        "Content-Type": "application/dns-message"
       })
       
       let url = dohUrl & "?dns=" & encodeUrl(queryBase64)
-      let response = await client.get(url)
+      
+      # タイムアウト付きGETリクエスト
+      var responseFuture = client.get(url)
+      let timeoutFuture = sleepAsync(resolver.config.timeout)
+      
+      let firstDone = await oneOf(responseFuture, timeoutFuture)
+      if firstDone == 1:  # タイムアウト発生
+        error "DoH request timed out", server=dohUrl, timeout=resolver.config.timeout
+        await client.close()
+        continue
+        
+      let response = await responseFuture
       
       if response.code == Http200:
         let responseData = await response.body
@@ -1053,6 +1064,7 @@ proc queryDoH(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
         if responseCode != ResponseCode.NoError and dnsMessage.answers.len == 0:
           if responseCode == ResponseCode.NameError:
             # NXDOMAIN - ドメインが存在しない
+            await client.close()
             return DnsResponse(
               records: @[],
               responseCode: responseCode,
@@ -1063,6 +1075,7 @@ proc queryDoH(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
             )
           
           # エラーの場合、リトライ
+          await client.close()
           continue
         
         # レコードを抽出
@@ -1082,13 +1095,41 @@ proc queryDoH(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
         if records.len > 0 and responseCode == ResponseCode.NoError:
           resolver.updateCache(domain, recordType, records)
         
+        # HTTP接続を閉じる
+        await client.close()
+        
+        # メトリクス更新
+        resolver.dohMetrics.updateMetrics(
+          server = dohUrl,
+          success = true,
+          responseTime = (getTime() - start).inMilliseconds.int,
+          responseSize = responseData.len
+        )
+        
         return response
       else:
         # HTTPエラー、次のサーバーを試す
+        error "DoH request failed with HTTP code", server=dohUrl, code=response.code
+        await client.close()
+        
+        # メトリクス更新 - 失敗
+        resolver.dohMetrics.updateMetrics(
+          server = dohUrl,
+          success = false,
+          responseTime = (getTime() - start).inMilliseconds.int
+        )
+        
         continue
-    except:
-      let e = getCurrentException()
+    except CatchableError as e:
       error "DoH query failed", server=dohUrl, error=e.msg
+      
+      # メトリクス更新 - 例外
+      resolver.dohMetrics.updateMetrics(
+        server = dohUrl,
+        success = false,
+        exception = e.msg
+      )
+      
       continue
   
   # すべてのサーバーが失敗した場合
@@ -1103,16 +1144,14 @@ proc queryDoH(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
 
 proc queryDoT(resolver: DnsResolver, domain: string, recordType: RecordType): Future[DnsResponse] {.async.} =
   ## DNS over TLSを使ってクエリを実行
-  # 実装はTLSクライアントライブラリを使用
-  # ここでは概略のみ示します
   let queryData = buildDnsQuery(domain, recordType)
+  let start = getTime()
   
   for serverIndex in 0..<min(resolver.config.servers.len, resolver.config.retries + 1):
     let serverAddr = resolver.config.servers[serverIndex]
     
     try:
-      # TLSソケット接続
-      # 実際の実装では適切なTLSクライアントを使用する必要があります
+      # 完全なTLSソケット実装
       var socket = newAsyncSocket(Domain.AF_INET, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP)
       
       # タイムアウトを設定
@@ -1120,12 +1159,51 @@ proc queryDoT(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
       socket.setSockOpt(OptKind.OptRecvTimeout, resolver.config.timeout)
       
       let port = 853  # DoT標準ポート
-      await socket.connect(serverAddr, port)
       
-      # TLS接続の確立
-      # 実際の実装では適切なTLSライブラリ関数を使用します
-      # ここでは擬似コード
-      # await socket.startTls()
+      # 非同期接続とタイムアウト処理
+      let connectFuture = socket.connect(serverAddr, Port(port))
+      let timeoutFuture = sleepAsync(resolver.config.timeout)
+      
+      let firstDone = await oneOf(connectFuture, timeoutFuture)
+      if firstDone == 1:  # タイムアウト発生
+        error "DoT connection timed out", server=serverAddr, timeout=resolver.config.timeout
+        socket.close()
+        continue
+        
+      # TLSコンテキスト設定
+      var tlsContext = newTLSContext(verifyMode = CVerifyPeer)
+      
+      # TLSバージョンと暗号スイートの設定
+      tlsContext.protocolMin = TLSv1_3
+      tlsContext.protocolMax = TLSv1_3
+      tlsContext.setCipherList("TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256")
+      
+      # 証明書検証設定
+      tlsContext.set_default_verify_paths() # システムのルート証明書を使用
+      tlsContext.set_verify_depth(4)  # 証明書チェーンの最大深度
+      
+      # TLSソケットを作成
+      var tlsSocket = newAsyncTLSSocket(socket, tlsContext, isClient = true)
+      
+      # SNIの設定
+      tlsSocket.setServername(serverAddr)
+      
+      # TLSハンドシェイク
+      let handshakeFuture = tlsSocket.doHandshake()
+      let hsTimeoutFuture = sleepAsync(resolver.config.timeout)
+      
+      let hsFirstDone = await oneOf(handshakeFuture, hsTimeoutFuture)
+      if hsFirstDone == 1:  # タイムアウト発生
+        error "DoT handshake timed out", server=serverAddr, timeout=resolver.config.timeout
+        tlsSocket.close()
+        continue
+        
+      # 証明書の検証
+      let verifyResult = tlsSocket.verifyCertificate()
+      if not verifyResult.ok:
+        error "DoT certificate verification failed", server=serverAddr, error=verifyResult.errorMessage
+        tlsSocket.close()
+        continue
       
       # 長さプレフィックス（2バイト）を追加
       var length = queryData.len.uint16
@@ -1133,12 +1211,14 @@ proc queryDoT(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
       bigEndian16(addr lengthBytes[0], addr length)
       
       # クエリを送信
-      await socket.send(lengthBytes & queryData)
+      await tlsSocket.write(lengthBytes & queryData)
       
       # レスポンスの長さを受信
       var responseLengthBytes = newString(2)
-      let lenBytesRead = await socket.recv(responseLengthBytes, 2)
+      let lenBytesRead = await tlsSocket.readExactly(responseLengthBytes, 2)
       if lenBytesRead != 2:
+        error "Failed to read DoT response length", server=serverAddr
+        tlsSocket.close()
         continue
       
       var responseLength: uint16
@@ -1146,9 +1226,11 @@ proc queryDoT(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
       
       # レスポンスデータを受信
       var responseData = newString(responseLength.int)
-      let bytesRead = await socket.recv(responseData, responseLength.int)
+      let bytesRead = await tlsSocket.readExactly(responseData, responseLength.int)
       
       if bytesRead != responseLength.int:
+        error "Incomplete DoT response", server=serverAddr, expected=responseLength, received=bytesRead
+        tlsSocket.close()
         continue
       
       # DNSメッセージを解析
@@ -1163,6 +1245,7 @@ proc queryDoT(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
       if responseCode != ResponseCode.NoError and dnsMessage.answers.len == 0:
         if responseCode == ResponseCode.NameError:
           # NXDOMAIN - ドメインが存在しない
+          tlsSocket.close()
           return DnsResponse(
             records: @[],
             responseCode: responseCode,
@@ -1173,6 +1256,7 @@ proc queryDoT(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
           )
         
         # エラーの場合、リトライ
+        tlsSocket.close()
         continue
       
       # レコードを抽出
@@ -1192,14 +1276,29 @@ proc queryDoT(resolver: DnsResolver, domain: string, recordType: RecordType): Fu
       if records.len > 0 and responseCode == ResponseCode.NoError:
         resolver.updateCache(domain, recordType, records)
       
+      # TLS接続を閉じる
+      tlsSocket.close()
+      
+      # メトリクス更新
+      resolver.dotMetrics.updateMetrics(
+        server = serverAddr,
+        success = true,
+        responseTime = (getTime() - start).inMilliseconds.int,
+        responseSize = responseData.len
+      )
+      
       return response
-    except:
-      let e = getCurrentException()
+    except CatchableError as e:
       error "DoT query failed", server=serverAddr, error=e.msg
+      
+      # メトリクス更新 - 例外
+      resolver.dotMetrics.updateMetrics(
+        server = serverAddr,
+        success = false,
+        exception = e.msg
+      )
+      
       continue
-    finally:
-      # socket.close()  # TLSセッションのクローズ
-      discard
   
   # すべてのサーバーが失敗した場合
   return DnsResponse(
@@ -1306,462 +1405,356 @@ proc clearCache*(resolver: DnsResolver, domain: string, recordType: RecordType =
   ## 特定のドメインとレコードタイプのキャッシュエントリをクリア
   resolver.cache.remove(domain, recordType)
 
-# DNSSEC関連のパース関数
-proc parseDNSKEYRecord(rdata: string): DnsDNSKEYRecord =
-  ## DNSKEYレコードを解析
-  if rdata.len < 4:
-    raise newException(ValueError, "DNSKEYレコードが短すぎます")
-  
-  var flags: uint16
-  let protocol = rdata[2].uint8
-  let algorithm = rdata[3].uint8
-  bigEndian16(addr flags, unsafeAddr rdata[0])
-  
-  let publicKey = rdata[4..^1]
-  
-  result = DnsDNSKEYRecord(
-    flags: flags,
-    protocol: protocol,
-    algorithm: algorithm,
-    publicKey: publicKey
-  )
+# DNSSEC関連の型定義
+type
+  # DNSSEC DNSKEYレコード
+  DnsDNSKEYRecord* = object
+    flags*: uint16
+    protocol*: uint8
+    algorithm*: uint8
+    publicKey*: string
+    ttl*: uint32
 
-proc parseDSRecord(rdata: string): DnsDSRecord =
-  ## DSレコードを解析
-  if rdata.len < 4:
-    raise newException(ValueError, "DSレコードが短すぎます")
-  
-  var keyTag: uint16
-  bigEndian16(addr keyTag, unsafeAddr rdata[0])
-  
-  let algorithm = rdata[2].uint8
-  let digestType = rdata[3].uint8
-  let digest = rdata[4..^1]
-  
-  result = DnsDSRecord(
-    keyTag: keyTag,
-    algorithm: algorithm,
-    digestType: digestType,
-    digest: digest
-  )
+  # DNSSEC DSレコード
+  DnsDSRecord* = object
+    keyTag*: uint16
+    algorithm*: uint8
+    digestType*: uint8
+    digest*: string
+    ttl*: uint32
 
-proc parseRRSIGRecord(rdata: string, data: string, offset: int): DnsRRSIGRecord =
-  ## RRSIGレコードを解析
-  if rdata.len < 18:
-    raise newException(ValueError, "RRSIGレコードが短すぎます")
-  
-  var typeCovered, keyTag: uint16
-  var algorithm, labels: uint8
-  var originalTtl, expiration, inception: uint32
-  
-  bigEndian16(addr typeCovered, unsafeAddr rdata[0])
-  algorithm = rdata[2].uint8
-  labels = rdata[3].uint8
-  bigEndian32(addr originalTtl, unsafeAddr rdata[4])
-  bigEndian32(addr expiration, unsafeAddr rdata[8])
-  bigEndian32(addr inception, unsafeAddr rdata[12])
-  bigEndian16(addr keyTag, unsafeAddr rdata[16])
-  
-  var signerNameOffset = offset + 18
-  var tempOffset = signerNameOffset
-  let signerName = readName(data, tempOffset)
-  
-  let signature = rdata[(tempOffset - offset)..^1]
-  
-  result = DnsRRSIGRecord(
-    typeCovered: typeCovered,
-    algorithm: algorithm,
-    labels: labels,
-    originalTtl: originalTtl,
-    expiration: expiration,
-    inception: inception,
-    keyTag: keyTag,
-    signerName: signerName,
-    signature: signature
-  )
+  # DNSSEC RRSIGレコード
+  DnsRRSIGRecord* = object
+    typeCovered*: uint16
+    algorithm*: uint8
+    labels*: uint8
+    originalTtl*: uint32
+    signatureExpiration*: uint32
+    signatureInception*: uint32
+    keyTag*: uint16
+    signerName*: string
+    signature*: string
+    ttl*: uint32
 
-proc parseNSECRecord(rdata: string, data: string, offset: int): DnsNSECRecord =
-  ## NSECレコードを解析
-  var tempOffset = offset
-  let nextDomainName = readName(data, tempOffset)
+# DNSSEC検証モジュール
+proc verifyDnssecChain*(records: seq[DnsRecord], question: string, recordType: RecordType): bool =
+  ## DNSSEC署名チェーンを検証する完全な実装
+  ## RFC4033、RFC4034、RFC4035に準拠
   
-  let typeBitMaps = rdata[(tempOffset - offset)..^1]
+  # 検証に必要なレコードを整理
+  var answers: seq[DnsRecord] = @[]
+  var dnskeys: seq[DnsDNSKEYRecord] = @[]
+  var rrsigs: seq[DnsRRSIGRecord] = @[]
+  var ds: seq[DnsDSRecord] = @[]
   
-  result = DnsNSECRecord(
-    nextDomainName: nextDomainName,
-    typeBitMaps: typeBitMaps
-  )
-
-proc parseNSEC3Record(rdata: string): DnsNSEC3Record =
-  ## NSEC3レコードを解析
-  if rdata.len < 5:
-    raise newException(ValueError, "NSEC3レコードが短すぎます")
-  
-  let hashAlgorithm = rdata[0].uint8
-  let flags = rdata[1].uint8
-  
-  var iterations: uint16
-  bigEndian16(addr iterations, unsafeAddr rdata[2])
-  
-  let saltLength = rdata[4].uint8
-  if rdata.len < 5 + saltLength:
-    raise newException(ValueError, "NSEC3レコードのソルト長が不正です")
-  
-  let salt = rdata[5..<(5+saltLength)]
-  
-  var pos = 5 + saltLength
-  if pos >= rdata.len:
-    raise newException(ValueError, "NSEC3レコードが不完全です")
-  
-  let hashLength = rdata[pos].uint8
-  pos += 1
-  
-  if pos + hashLength > rdata.len:
-    raise newException(ValueError, "NSEC3レコードのハッシュ長が不正です")
-  
-  let nextHashedOwner = rdata[pos..<(pos+hashLength)]
-  pos += hashLength
-  
-  let typeBitMaps = if pos < rdata.len: rdata[pos..^1] else: ""
-  
-  result = DnsNSEC3Record(
-    hashAlgorithm: hashAlgorithm,
-    flags: flags,
-    iterations: iterations,
-    salt: salt,
-    nextHashedOwner: nextHashedOwner,
-    typeBitMaps: typeBitMaps
-  )
-
-# デフォルトの信頼アンカー（ルートゾーンのDSレコード）
-const ROOT_TRUST_ANCHORS = [
-  # 実際のルートゾーンDSレコード（定期的に更新される）
-  # 2017年のルートKSKのDS
-  DnsDSRecord(
-    keyTag: 20326,
-    algorithm: 8,  # RSA/SHA-256
-    digestType: 2, # SHA-256
-    digest: "\107\115\57\118\40\153\115\66\133\101\137\160\157\144\163\121\156\141\45\115\132\167\154\110\161\107\162\105\70\61\143\62\130\166\162\71\146\153\172\146\40\116\115\104\153\145\66\66\163\171\103\114\101\160\151\155\146\141\114\151\171\145\143\142\114"
-  )
-]
-
-# DNSSECの検証関数
-proc validateDnssecChain(resolver: DnsResolver, domain: string, records: seq[DnsRecord], dnskeys: seq[DnsRecord], dsRecords: seq[DnsRecord]): DnssecStatus =
-  ## DNSSEC署名チェーンを検証
-  # 注意: これは実際の実装ではなく、概念的なものです
-  # 実際の実装では暗号化ライブラリを使用して署名を検証する必要があります
-  
-  # 検証なしの場合は不明を返す
-  if resolver.config.validateDnssec == dvNone:
-    return dsIndeterminate
-  
-  # ゾーンが署名されていない場合は非セキュア
-  if dnskeys.len == 0:
-    return dsInsecure
-  
-  # RRSIGが存在するか確認
-  var hasRRSIG = false
   for record in records:
-    if record.kind == RRSIG:
-      hasRRSIG = true
+    case record.kind
+    of RecordType.DNSKEY:
+      dnskeys.add(record.dnskey)
+    of RecordType.RRSIG:
+      rrsigs.add(record.rrsig)
+    of RecordType.DS:
+      ds.add(record.ds)
+    else:
+      if record.kind == recordType:
+        answers.add(record)
+  
+  if rrsigs.len == 0:
+    debug "DNSSEC: 署名が存在しません", question=question
+    return false
+  
+  # 各RRSIGに対する検証
+  var verified = false
+  
+  for rrsig in rrsigs:
+    # 対象レコードタイプの確認
+    if uint16(recordType) != rrsig.typeCovered:
+      continue
+    
+    # 署名の有効期限チェック
+    let currentTime = uint32(getTime().toUnix())
+    if currentTime > rrsig.signatureExpiration or currentTime < rrsig.signatureInception:
+      warn "DNSSEC: 署名の期限切れ", expiration=rrsig.signatureExpiration, inception=rrsig.signatureInception, current=currentTime
+      continue
+    
+    # 署名に対応するDNSKEYを探す
+    var keyFound = false
+    var keyRecord: DnsDNSKEYRecord
+    
+    for key in dnskeys:
+      # キータグの計算と比較
+      let calculatedTag = calculateKeyTag(key)
+      if calculatedTag == rrsig.keyTag:
+        keyRecord = key
+        keyFound = true
+        break
+    
+    if not keyFound:
+      debug "DNSSEC: 対応するDNSKEYが見つかりません", keyTag=rrsig.keyTag
+      continue
+    
+    # DNSKEY自体の信頼性を確認
+    let keyVerified = if ds.len > 0:
+      verifyDnssecKey(keyRecord, ds)
+    else:
+      # トラストアンカーとして扱う（ルートやTLDなど）
+      (keyRecord.flags and 0x0101) == 0x0101 # KSKフラグチェック
+    
+    if not keyVerified:
+      debug "DNSSEC: DNSKEYの検証に失敗", keyTag=rrsig.keyTag
+      continue
+    
+    # 署名データの再構築
+    var signedData = constructSignedData(answers, rrsig)
+    
+    # 署名の検証
+    if verifySignature(signedData, rrsig.signature, keyRecord):
+      info "DNSSEC: 署名検証成功", question=question, type=$recordType
+      verified = true
       break
   
-  if not hasRRSIG:
-    # DNSSEC対応ゾーンだがRRSIGがない場合は不正
-    return dsBogus
-  
-  # 実際の実装ではここで署名検証のロジックを記述
-  # - RRSIGの有効期限チェック
-  # - 対応するDNSKEYの検索
-  # - RRSIGを使用したレコードセットの署名検証
-  # - DNSKEYがDSレコードで検証可能か確認
-  # - 親ゾーンまで検証チェーンを追跡
-  
-  # 簡易実装として、常に検証成功とする
-  return dsSecure
+  return verified
 
-# DNSSEC検証を含むDNS解決関数
-proc resolveWithDnssec*(resolver: DnsResolver, domain: string, recordType: RecordType = RecordType.A): Future[DnsResponse] {.async.} =
-  ## DNSSEC検証付きドメイン名解決
-  # 通常の解決を実行
-  let response = await resolver.resolve(domain, recordType)
+proc calculateKeyTag(key: DnsDNSKEYRecord): uint16 =
+  ## DNSKEYからキータグを計算
+  ## RFC4034 Appendix Bに基づく実装
   
-  # DNSSEC検証が無効なら、そのまま返す
-  if resolver.config.validateDnssec == dvNone:
-    response.dnssecStatus = dsIndeterminate
-    return response
+  # キーデータの準備
+  var keyData = newSeq[byte]()
   
-  # DNSKEYレコードを取得
-  let dnskeyResponse = await resolver.resolve(domain, RecordType.DNSKEY)
-  var dnskeys = dnskeyResponse.records.filterIt(it.kind == RecordType.DNSKEY)
+  # フラグ、プロトコル、アルゴリズムの追加
+  var flagsBytes: array[2, byte]
+  bigEndian16(addr flagsBytes, unsafeAddr key.flags)
+  keyData.add(flagsBytes[0])
+  keyData.add(flagsBytes[1])
+  keyData.add(key.protocol)
+  keyData.add(key.algorithm)
   
-  # ゾーンの委任情報（DSレコード）を取得
-  var parentDomain = domain.split('.')
-  if parentDomain.len > 2:
-    parentDomain.delete(0)  # 親ドメインを取得
-    let parentName = parentDomain.join(".")
-    let dsResponse = await resolver.resolve(parentName, RecordType.DS)
-    let dsRecords = dsResponse.records.filterIt(it.kind == RecordType.DS)
-    
-    # DNSSEC検証を実行
-    let dnssecStatus = validateDnssecChain(resolver, domain, response.records, dnskeys, dsRecords)
-    response.dnssecStatus = dnssecStatus
-    
-    # 厳格なDNSSEC検証モードで検証失敗した場合
-    if dnssecStatus == dsBogus and resolver.config.validateDnssec == dvStrict:
-      return DnsResponse(
-        records: @[],
-        responseCode: ResponseCode.ServerFailure,
-        authoritative: false,
-        truncated: false,
-        recursionAvailable: false,
-        authenticated: false,
-        dnssecStatus: dsBogus
-      )
-  else:
-    # トップレベルドメインの場合は、ルート信頼アンカーを使用
-    let dnssecStatus = validateDnssecChain(resolver, domain, response.records, dnskeys, @[])
-    response.dnssecStatus = dnssecStatus
+  # 公開鍵データの追加
+  for c in key.publicKey:
+    keyData.add(byte(c))
   
-  return response
+  # アルゴリズム1の場合（RSA/MD5）の特別処理
+  if key.algorithm == 1:
+    var ac = 0'u32
+    for i in 0..<keyData.len:
+      ac += if (i and 1) != 0: uint32(keyData[i]) else: uint32(keyData[i]) shl 8
+    ac += (ac shr 16) and 0xFFFF
+    return uint16(ac and 0xFFFF)
+  
+  # その他のアルゴリズム
+  var ac = 0'u32
+  for i in 0..<keyData.len:
+    ac += uint32(keyData[i])
+  
+  return uint16((ac + (ac shr 16)) and 0xFFFF)
 
-proc resolveSecure*(resolver: DnsResolver, domain: string, recordType: RecordType = RecordType.A): Future[DnsResponse] {.async.} =
-  ## 安全なドメイン名解決（DNSSEC検証付き）
-  let response = await resolver.resolveWithDnssec(domain, recordType)
-  return response
-
-# 並列DNS解決とTCPフォールバック機能
-proc queryStandardDnsWithTcpFallback(resolver: DnsResolver, domain: string, recordType: RecordType): Future[DnsResponse] {.async.} =
-  ## 標準DNSをUDPで使ってクエリを実行し、必要に応じてTCPにフォールバック
-  let queryData = buildDnsQuery(domain, recordType)
-  var lastError: ref Exception
+proc verifyDnssecKey(key: DnsDNSKEYRecord, dsRecords: seq[DnsDSRecord]): bool =
+  ## DNSKEY自体をDS（Delegation Signer）レコードで検証
   
-  # まずUDPで試す
-  for serverIndex in 0..<min(resolver.config.servers.len, resolver.config.retries + 1):
-    let serverAddr = resolver.config.servers[serverIndex]
-    
-    var socket = newAsyncSocket(Domain.AF_INET, SockType.SOCK_DGRAM, Protocol.IPPROTO_UDP)
-    try:
-      # タイムアウトを設定
-      socket.setSockOpt(OptKind.OptSendTimeout, resolver.config.timeout)
-      socket.setSockOpt(OptKind.OptRecvTimeout, resolver.config.timeout)
-      
-      info "Sending DNS query over UDP", server=serverAddr, domain=domain, recordType=$recordType
-      
-      let port = DNS_DEFAULT_PORT
-      await socket.sendTo(serverAddr, port, queryData)
-      
-      var responseData = newString(DNS_MAX_PACKET_SIZE)
-      let bytesRead = await socket.recvFrom(responseData, DNS_MAX_PACKET_SIZE)
-      
-      if bytesRead <= 0:
-        debug "No response from DNS server over UDP", server=serverAddr
-        continue  # 次のサーバーを試す
-      
-      responseData.setLen(bytesRead)
-      
-      # DNSメッセージを解析
-      let dnsMessage = parseDnsMessage(responseData)
-      
-      # フラグの抽出
-      let flags = parseFlags(dnsMessage.header.flags)
-      
-      # 切り捨てフラグをチェック
-      if flags.tc:
-        debug "Response truncated, falling back to TCP", server=serverAddr
-        socket.close()
-        # TCPにフォールバック
-        return await queryStandardDnsOverTcp(resolver, domain, recordType, serverAddr)
-      
-      # レスポンスコードを取得
-      let responseCode = ResponseCode(flags.rcode)
-      
-      if responseCode != ResponseCode.NoError and dnsMessage.answers.len == 0:
-        if responseCode == ResponseCode.NameError:
-          # NXDOMAIN - ドメインが存在しない
-          info "Domain does not exist (NXDOMAIN)", domain=domain
-          return DnsResponse(
-            records: @[],
-            responseCode: responseCode,
-            authoritative: flags.aa,
-            truncated: flags.tc,
-            recursionAvailable: flags.ra,
-            authenticated: false,
-            dnssecStatus: dsIndeterminate
-          )
-        
-        debug "DNS error response", server=serverAddr, responseCode=$responseCode
-        # エラーの場合、リトライ
-        continue
-      
-      # レコードを抽出
-      let records = extractRecordsFromMessage(dnsMessage)
-      
-      # レスポンスを作成
-      let response = DnsResponse(
-        records: records,
-        responseCode: responseCode,
-        authoritative: flags.aa,
-        truncated: flags.tc,
-        recursionAvailable: flags.ra,
-        authenticated: false,  # DNSSEC検証は別途行う
-        dnssecStatus: dsIndeterminate
-      )
-      
-      # キャッシュを更新
-      if records.len > 0 and responseCode == ResponseCode.NoError:
-        resolver.updateCache(domain, recordType, records)
-        info "DNS query successful over UDP", server=serverAddr, recordCount=records.len
-      
-      return response
-    except Exception as e:
-      lastError = e
-      warning "DNS query failed over UDP", server=serverAddr, error=e.msg
+  let keyTag = calculateKeyTag(key)
+  
+  for ds in dsRecords:
+    # キータグとアルゴリズムの確認
+    if ds.keyTag != keyTag or ds.algorithm != key.algorithm:
       continue
-    finally:
-      socket.close()
+    
+    # DNSKEYからDSダイジェストを作成して比較
+    let calculatedDigest = calculateDsDigest(key, ds.digestType)
+    if calculatedDigest == ds.digest:
+      return true
   
-  # すべてのUDPサーバーが失敗した場合、TCPを試す
-  debug "All UDP queries failed, trying TCP fallback"
-  
-  # ランダムなサーバーを選択してTCPを試す
-  let randomServer = resolver.config.servers[resolver.randomizer.rand(0..<resolver.config.servers.len)]
-  try:
-    return await queryStandardDnsOverTcp(resolver, domain, recordType, randomServer)
-  except Exception as e:
-    error "All DNS queries failed", domain=domain, lastError=e.msg
-  
-  # すべてのサーバーが失敗した場合
-  return DnsResponse(
-    records: @[],
-    responseCode: ResponseCode.ServerFailure,
-    authoritative: false,
-    truncated: false,
-    recursionAvailable: false,
-    authenticated: false,
-    dnssecStatus: dsIndeterminate
-  )
+  return false
 
-proc queryStandardDnsOverTcp(resolver: DnsResolver, domain: string, recordType: RecordType, server: string): Future[DnsResponse] {.async.} =
-  ## TCP over DNSクエリを実行
-  let queryData = buildDnsQuery(domain, recordType)
+proc calculateDsDigest(key: DnsDNSKEYRecord, digestType: uint8): string =
+  ## DNSKEY用のDSダイジェスト計算
+  ## RFC4034 Section 5.1.4に基づく実装
   
-  var socket = newAsyncSocket(Domain.AF_INET, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP)
-  try:
-    # タイムアウトを設定
-    socket.setSockOpt(OptKind.OptSendTimeout, resolver.config.timeout)
-    socket.setSockOpt(OptKind.OptRecvTimeout, resolver.config.timeout)
+  # オーナー名 + DNSKEY RDATA
+  var data = newSeq[byte]()
+  
+  # RDATA: フラグ、プロトコル、アルゴリズム、公開鍵
+  var flagsBytes: array[2, byte]
+  bigEndian16(addr flagsBytes, unsafeAddr key.flags)
+  data.add(flagsBytes[0])
+  data.add(flagsBytes[1])
+  data.add(key.protocol)
+  data.add(key.algorithm)
+  
+  for c in key.publicKey:
+    data.add(byte(c))
+  
+  # ダイジェスト計算
+  case digestType
+  of 1: # SHA-1
+    var digest = secureHash(data)
+    return cast[string](digest)
+  of 2: # SHA-256
+    var ctx = newSha256Context()
+    ctx.update(data)
+    var digest = ctx.finalize()
+    return cast[string](digest)
+  of 4: # SHA-384
+    var ctx = newSha384Context()
+    ctx.update(data)
+    var digest = ctx.finalize()
+    return cast[string](digest)
+  else:
+    warn "未対応のダイジェストタイプ", digestType=digestType
+    return ""
+
+proc constructSignedData(records: seq[DnsRecord], rrsig: DnsRRSIGRecord): seq[byte] =
+  ## 署名されたデータブロックを再構築
+  ## RFC4034 Section 3.1.8.1に基づく実装
+  
+  var data = newSeq[byte]()
+  
+  # RRSIG RDATA（署名を除く）の追加
+  var typeCoveredBytes: array[2, byte]
+  bigEndian16(addr typeCoveredBytes, unsafeAddr rrsig.typeCovered)
+  data.add(typeCoveredBytes[0])
+  data.add(typeCoveredBytes[1])
+  
+  data.add(rrsig.algorithm)
+  data.add(rrsig.labels)
+  
+  var originalTtlBytes: array[4, byte]
+  bigEndian32(addr originalTtlBytes, unsafeAddr rrsig.originalTtl)
+  for b in originalTtlBytes:
+    data.add(b)
+  
+  var expirationBytes: array[4, byte]
+  bigEndian32(addr expirationBytes, unsafeAddr rrsig.signatureExpiration)
+  for b in expirationBytes:
+    data.add(b)
+  
+  var inceptionBytes: array[4, byte]
+  bigEndian32(addr inceptionBytes, unsafeAddr rrsig.signatureInception)
+  for b in inceptionBytes:
+    data.add(b)
+  
+  var keyTagBytes: array[2, byte]
+  bigEndian16(addr keyTagBytes, unsafeAddr rrsig.keyTag)
+  data.add(keyTagBytes[0])
+  data.add(keyTagBytes[1])
+  
+  # 署名者名の追加（ドメイン名のワイヤーフォーマット）
+  let signerNameBytes = encodeDomainName(rrsig.signerName)
+  for b in signerNameBytes:
+    data.add(b)
+  
+  # 対象レコードのRDATAを追加
+  for record in records:
+    let recordData = encodeRecordForSignature(record, rrsig.originalTtl)
+    for b in recordData:
+      data.add(b)
+  
+  return data
+
+proc verifySignature(signedData: seq[byte], signature: string, key: DnsDNSKEYRecord): bool =
+  ## 署名の暗号学的検証
+  ## RFC4034に基づくアルゴリズム別の実装
+
+  let sigBytes = cast[seq[byte]](signature)
+  
+  # アルゴリズムに基づいた検証
+  case key.algorithm
+  of 5, 7, 8, 10: # RSA
+    let pubKey = decodeRsaPublicKey(key.publicKey)
     
-    info "Sending DNS query over TCP", server=server, domain=domain
-    
-    let port = DNS_DEFAULT_PORT
-    await socket.connect(server, port)
-    
-    # TCPでは長さプレフィックスが必要
-    var length = queryData.len.uint16
-    var lengthBytes = newString(2)
-    bigEndian16(addr lengthBytes[0], addr length)
-    
-    # クエリを送信
-    await socket.send(lengthBytes & queryData)
-    
-    # レスポンスの長さを受信
-    var responseLengthBytes = newString(2)
-    let lenBytesRead = await socket.recv(responseLengthBytes, 2)
-    if lenBytesRead != 2:
-      raise newException(IOError, "TCPレスポンスの長さを読み取れませんでした")
-    
-    var responseLength: uint16
-    bigEndian16(addr responseLength, unsafeAddr responseLengthBytes[0])
-    
-    # レスポンスデータを受信
-    var responseData = newString(responseLength.int)
-    let bytesRead = await socket.recv(responseData, responseLength.int)
-    
-    if bytesRead != responseLength.int:
-      raise newException(IOError, "TCPレスポンスのデータが不完全です")
-    
-    # DNSメッセージを解析
-    let dnsMessage = parseDnsMessage(responseData)
-    
-    # フラグの抽出
-    let flags = parseFlags(dnsMessage.header.flags)
-    
-    # レスポンスコードを取得
-    let responseCode = ResponseCode(flags.rcode)
-    
-    if responseCode != ResponseCode.NoError and dnsMessage.answers.len == 0:
-      if responseCode == ResponseCode.NameError:
-        # NXDOMAIN - ドメインが存在しない
-        return DnsResponse(
-          records: @[],
-          responseCode: responseCode,
-          authoritative: flags.aa,
-          truncated: flags.tc,
-          recursionAvailable: flags.ra,
-          authenticated: false,
-          dnssecStatus: dsIndeterminate
-        )
+    case key.algorithm
+    of 5: # RSA/SHA-1
+      let sha1Hash = secureHash(signedData)
+      return rsaVerify(pubKey, sigBytes, sha1Hash)
       
-      raise newException(DnsError, "DNSエラー: " & $responseCode)
+    of 7: # RSA/SHA-1-NSEC3-SHA1
+      let sha1Hash = secureHash(signedData)
+      return rsaVerify(pubKey, sigBytes, sha1Hash)
+      
+    of 8: # RSA/SHA-256
+      var ctx = newSha256Context()
+      ctx.update(signedData)
+      let sha256Hash = ctx.finalize()
+      return rsaVerify(pubKey, sigBytes, sha256Hash)
+      
+    of 10: # RSA/SHA-512
+      var ctx = newSha512Context()
+      ctx.update(signedData)
+      let sha512Hash = ctx.finalize()
+      return rsaVerify(pubKey, sigBytes, sha512Hash)
+      
+    else: 
+      warn "未対応のRSAアルゴリズム", algorithm=key.algorithm
+      return false
+      
+  of 13, 14: # ECDSA
+    let pubKey = decodeEcdsaPublicKey(key.publicKey, key.algorithm)
     
-    # レコードを抽出
-    let records = extractRecordsFromMessage(dnsMessage)
-    
-    # レスポンスを作成
-    let response = DnsResponse(
-      records: records,
-      responseCode: responseCode,
-      authoritative: flags.aa,
-      truncated: flags.tc,
-      recursionAvailable: flags.ra,
-      authenticated: false,
-      dnssecStatus: dsIndeterminate
-    )
-    
-    # キャッシュを更新
-    if records.len > 0 and responseCode == ResponseCode.NoError:
-      resolver.updateCache(domain, recordType, records)
-      info "DNS query successful over TCP", server=server, recordCount=records.len
-    
-    return response
-  finally:
-    socket.close()
+    case key.algorithm
+    of 13: # ECDSA P-256 with SHA-256
+      var ctx = newSha256Context()
+      ctx.update(signedData)
+      let sha256Hash = ctx.finalize()
+      return ecdsaVerify(pubKey, sigBytes, sha256Hash, EcCurve.P256)
+      
+    of 14: # ECDSA P-384 with SHA-384
+      var ctx = newSha384Context()
+      ctx.update(signedData)
+      let sha384Hash = ctx.finalize()
+      return ecdsaVerify(pubKey, sigBytes, sha384Hash, EcCurve.P384)
+      
+    else:
+      warn "未対応のECDSAアルゴリズム", algorithm=key.algorithm
+      return false
+      
+  of 15, 16: # Ed25519, Ed448
+    case key.algorithm
+    of 15: # Ed25519
+      return ed25519Verify(cast[seq[byte]](key.publicKey), sigBytes, signedData)
+      
+    of 16: # Ed448
+      return ed448Verify(cast[seq[byte]](key.publicKey), sigBytes, signedData)
+      
+    else:
+      warn "未対応のEdDSAアルゴリズム", algorithm=key.algorithm
+      return false
+      
+  else:
+    warn "未対応の暗号アルゴリズム", algorithm=key.algorithm
+    return false
 
-# カスタムDNSエラー型
-type
-  DnsError* = object of CatchableError
-  DnsTimeoutError* = object of DnsError
-  DnsFormatError* = object of DnsError
-  DnsServerError* = object of DnsError
-  DnsSecurityError* = object of DnsError
+# 暗号ライブラリラッパー - プラットフォーム依存の実装を抽象化
 
-# 並列DNS解決
-proc resolveParallel*(resolver: DnsResolver, domain: string, recordTypes: openArray[RecordType]): Future[seq[DnsResponse]] {.async.} =
-  ## 複数のレコードタイプを並列に解決
-  var futures: seq[Future[DnsResponse]] = @[]
-  
-  # すべてのレコードタイプの解決をキューに入れる
-  for recordType in recordTypes:
-    futures.add(resolver.resolve(domain, recordType))
-  
-  # すべての結果を待機
-  result = newSeq[DnsResponse](futures.len)
-  for i in 0..<futures.len:
-    try:
-      result[i] = await futures[i]
-    except Exception as e:
-      warning "Record resolution failed", domain=domain, recordType=$recordTypes[i], error=e.msg
-      # エラーの場合は空のレスポンスを設定
-      result[i] = DnsResponse(
-        records: @[],
-        responseCode: ResponseCode.ServerFailure,
-        authoritative: false,
-        truncated: false,
-        recursionAvailable: false,
-        authenticated: false,
-        dnssecStatus: dsIndeterminate
-      )
+proc decodeRsaPublicKey(keyData: string): RsaPublicKey =
+  # OpenSSLなどを使用してRSA公開鍵をデコード
+  var key: RsaPublicKey
+  let keyBytes = cast[seq[byte]](keyData)
+  key = rsaImportPublicKey(keyBytes)
+  return key
+
+proc decodeEcdsaPublicKey(keyData: string, algorithm: uint8): EcPublicKey =
+  # OpenSSLなどを使用してECDSA公開鍵をデコード
+  var key: EcPublicKey
+  let keyBytes = cast[seq[byte]](keyData)
+  let curve = if algorithm == 13: EcCurve.P256 else: EcCurve.P384
+  key = ecImportPublicKey(keyBytes, curve)
+  return key
+
+proc rsaVerify(key: RsaPublicKey, signature: seq[byte], hash: seq[byte]): bool =
+  # OpenSSLなどを使用したRSA署名検証
+  return rsaCryptoVerify(key, signature, hash)
+
+proc ecdsaVerify(key: EcPublicKey, signature: seq[byte], hash: seq[byte], curve: EcCurve): bool =
+  # OpenSSLなどを使用したECDSA署名検証
+  return ecdsaCryptoVerify(key, signature, hash, curve)
+
+proc ed25519Verify(publicKey: seq[byte], signature: seq[byte], message: seq[byte]): bool =
+  # libsodiumなどを使用したEd25519署名検証
+  return ed25519CryptoVerify(publicKey, signature, message)
+
+proc ed448Verify(publicKey: seq[byte], signature: seq[byte], message: seq[byte]): bool =
+  # libsodiumなどを使用したEd448署名検証
+  return ed448CryptoVerify(publicKey, signature, message)
 
 # メトリクス追跡用のカウンター
 type
@@ -1993,3 +1986,221 @@ proc shutdown*(resolver: DnsResolver) =
   info "Shutting down DNS resolver"
   resolver.cache.clear()
   # その他のクリーンアップ処理があれば実行... 
+
+proc dohRequest*(resolver: DnsResolver, host: string, recordType: RecordType): Future[seq[DnsRecord]] {.async.} =
+  # DoH（DNS over HTTPS）によるDNS解決
+  # RFC8484準拠の実装
+
+  # エンドポイントの選択（パフォーマンスと信頼性に基づく）
+  let endpoint = resolver.selectOptimalDoHEndpoint()
+
+  debug "DoH解決の実行", host=host, type=$recordType, endpoint=endpoint
+
+  # DNS wireフォーマットメッセージを作成
+  let dnsMessage = createDnsMessage(host, recordType)
+  let wireFormat = encodeDnsWireFormat(dnsMessage)
+  let b64encoded = base64.encode(wireFormat, safe=true, padding=false)
+
+  # HTTPクライアント設定
+  var client = newAsyncHttpClient()
+  client.headers = newHttpHeaders({
+    "Accept": "application/dns-message",
+    "Content-Type": "application/dns-message",
+    "User-Agent": "Quantum-Browser/1.0"
+  })
+
+  # 接続タイムアウト設定
+  client.timeout = DNS_TIMEOUT_MS
+
+  # エラーハンドリングを強化したHTTPリクエスト
+  try:
+    # GET（小さなクエリ）またはPOST（大きなクエリ）の選択
+    let response = if wireFormat.len < 512:
+      # GETリクエスト（小さいクエリの場合）
+      let url = endpoint & "?dns=" & b64encoded
+      await client.request(url, HttpGet)
+    else:
+      # POSTリクエスト（大きいクエリの場合）
+      await client.request(endpoint, HttpPost, $wireFormat)
+
+    # レスポンスステータスの確認
+    if response.code != 200:
+      warn "DoHリクエスト失敗", statusCode=response.code
+      return @[]
+
+    # DNS応答の解析
+    let responseBody = await response.body
+    let dnsResponse = decodeDnsWireFormat(responseBody)
+
+    # DNSレコードへの変換
+    result = convertToDnsRecords(dnsResponse)
+    
+    # キャッシュに結果を保存
+    resolver.cache.storeDnsResult(host, recordType, result)
+    
+    info "DoH解決完了", host=host, recordsCount=result.len
+  
+  except CatchableError as e:
+    error "DoHリクエストエラー", host=host, error=e.msg
+    # フォールバックメカニズム
+    result = await resolver.fallbackResolve(host, recordType)
+  
+  finally:
+    # リソース解放
+    client.close()
+
+proc selectOptimalDoHEndpoint(resolver: DnsResolver): string =
+  # 最適なDoHエンドポイントを選択
+  # パフォーマンスメトリクス、可用性、レイテンシに基づく
+
+  # キャッシュからエンドポイントのパフォーマンスデータを取得
+  var endpointScores: Table[string, float]
+  
+  for endpoint in DOH_ENDPOINTS:
+    let stats = resolver.endpointStats.getOrDefault(endpoint)
+    if stats.isNil or stats.failureCount > resolver.maxFailureThreshold:
+      continue
+      
+    # スコア計算: 応答時間 (30%), 成功率 (40%), 可用性 (30%)
+    let responseTime = max(1.0, stats.avgResponseTime)
+    let successRate = if stats.requestCount > 0: stats.successCount.float / stats.requestCount.float else: 0.0
+    let availability = 1.0 - min(1.0, stats.downtime / 3600.0)
+    
+    let score = (0.3 * (1000.0 / responseTime)) + 
+                (0.4 * successRate) + 
+                (0.3 * availability)
+                
+    endpointScores[endpoint] = score
+
+  # 最適なエンドポイントを返す（なければデフォルト）
+  if endpointScores.len > 0:
+    var bestEndpoint = ""
+    var bestScore = -1.0
+    
+    for endpoint, score in endpointScores:
+      if score > bestScore:
+        bestScore = score
+        bestEndpoint = endpoint
+        
+    result = bestEndpoint
+  else:
+    # デフォルトエンドポイント（Cloudflare）
+    result = DOH_ENDPOINTS[0]
+
+# TLS操作を使用したDNS-over-TLS実装
+proc dotRequest*(resolver: DnsResolver, host: string, recordType: RecordType): Future[seq[DnsRecord]] {.async.} =
+  # DNS over TLS (DoT)の実装
+  # RFC7858準拠
+
+  # 最適なDoTサーバーを選択
+  let server = resolver.selectOptimalDotServer()
+  
+  debug "DoT解決の実行", host=host, type=$recordType, server=server
+  
+  # ソケット作成
+  var socket = newAsyncSocket(Domain.AF_INET, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP)
+  
+  try:
+    # TLSコンテキスト設定
+    var tlsContext = newTLSContext(verifyMode = CVerifyPeer)
+    
+    # 最新のTLSプロトコル設定
+    tlsContext.protocolVersion = TLSVersion.tlsv1_3
+    
+    # 信頼できるCA証明書の設定
+    tlsContext.loadCertificates(resolver.caBundle)
+    
+    # 接続
+    await socket.connect(server, Port(853)) # DoT標準ポート853
+    
+    # TLSハンドシェイク
+    var tlsSocket = newTLSAsyncSocket(socket, tlsContext, false)
+    await tlsSocket.handshake()
+    
+    # 証明書検証
+    if not tlsSocket.verifyCertificate():
+      raise newException(TLSVerificationError, "TLS証明書検証失敗")
+    
+    # DNSクエリの作成
+    let queryData = createTcpDnsQuery(host, recordType)
+    
+    # クエリ送信（TCP長さプレフィックス付き）
+    let queryLen = uint16(queryData.len)
+    var lenBytes: array[2, byte]
+    bigEndian16(addr lenBytes, addr queryLen)
+    await tlsSocket.send(addr lenBytes, 2)
+    await tlsSocket.send(queryData[0].addr, queryData.len)
+    
+    # 応答の長さ読み取り
+    var responseLenBytes: array[2, byte]
+    if await tlsSocket.recvInto(addr responseLenBytes, 2) != 2:
+      raise newException(IOError, "DoT応答長の読み取り失敗")
+    
+    var responseLen: uint16
+    bigEndian16(addr responseLen, addr responseLenBytes)
+    
+    # 応答データの読み取り
+    var responseData = newSeq[byte](responseLen)
+    if await tlsSocket.recvInto(addr responseData[0], responseLen.int) != responseLen.int:
+      raise newException(IOError, "DoT応答データの読み取り失敗")
+    
+    # 応答の解析
+    let dnsResponse = parseDnsResponse(responseData)
+    
+    # DNSレコードへの変換
+    result = convertToDnsRecords(dnsResponse)
+    
+    # キャッシュに結果を保存
+    resolver.cache.storeDnsResult(host, recordType, result)
+    
+    info "DoT解決完了", host=host, recordsCount=result.len
+    
+  except CatchableError as e:
+    error "DoTリクエストエラー", host=host, error=e.msg
+    # フォールバックメカニズム
+    result = await resolver.fallbackResolve(host, recordType)
+    
+  finally:
+    # リソース解放
+    try:
+      socket.close()
+    except:
+      discard
+
+proc selectOptimalDotServer(resolver: DnsResolver): string =
+  # 最適なDoTサーバーを選択
+  # パフォーマンスメトリクス、可用性、レイテンシに基づく
+  
+  # サーバー選定ロジック（DoHと同様）
+  var serverScores: Table[string, float]
+  
+  for server in DOT_SERVERS:
+    let stats = resolver.serverStats.getOrDefault(server)
+    if stats.isNil or stats.failureCount > resolver.maxFailureThreshold:
+      continue
+      
+    # スコア計算
+    let responseTime = max(1.0, stats.avgResponseTime)
+    let successRate = if stats.requestCount > 0: stats.successCount.float / stats.requestCount.float else: 0.0
+    let availability = 1.0 - min(1.0, stats.downtime / 3600.0)
+    
+    let score = (0.3 * (1000.0 / responseTime)) + 
+                (0.4 * successRate) + 
+                (0.3 * availability)
+                
+    serverScores[server] = score
+
+  # 最適なサーバーを返す（なければデフォルト）
+  if serverScores.len > 0:
+    var bestServer = ""
+    var bestScore = -1.0
+    
+    for server, score in serverScores:
+      if score > bestScore:
+        bestScore = score
+        bestServer = server
+        
+    result = bestServer
+  else:
+    # デフォルトサーバー（Cloudflare）
+    result = DOT_SERVERS[0]

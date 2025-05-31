@@ -27,6 +27,7 @@ type
     thirdPartyPolicy*: CookieThirdPartyPolicy # サードパーティクッキーポリシー
     securePolicy*: CookieSecurePolicy  # セキュアポリシー
     partitioningPolicy*: CookiePartition # パーティショニングポリシー
+    promptCallback*: proc(cookie: Cookie, url: Uri, firstPartyUrl: Option[Uri]): bool # プロンプトコールバック
 
   CookieStore* = ref object
     ## クッキーストアオブジェクト
@@ -366,8 +367,13 @@ proc getCookies*(store: CookieStore, url: Uri, firstPartyUrl: Option[Uri] = none
           if not (cookie.isHttpOnly or cookie.isSecure):
             continue
         of tpPrompt:
-          # ここではブロックする。実際の実装ではUI側でプロンプト表示
-          continue
+          # UIプロンプト連携（コールバック/イベント発火）
+          if store.options.promptCallback != nil:
+            if not store.options.promptCallback(cookie, url, firstPartyUrl):
+              continue
+          else:
+            # コールバック未設定時はブロック
+            continue
         of tpAllow:
           # 許可 - 何もしない
           discard

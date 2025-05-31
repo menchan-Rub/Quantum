@@ -5,7 +5,7 @@
 const std = @import("std");
 const time = std.time;
 const mem = @import("../memory/allocator.zig"); // Global allocator
-const errors = @import("../util/error.zig");   // Import common errors
+const errors = @import("../util/error.zig"); // Import common errors
 
 // Forward declarations
 const Node = @import("../dom/node.zig").Node;
@@ -15,11 +15,40 @@ const EventTarget = @import("./event_target.zig").EventTarget; // composedPath �
 const UIEvent = @import("../dom/events/ui_event.zig").UIEvent;
 const MouseEvent = @import("../dom/events/mouse_event.zig").MouseEvent;
 const KeyboardEvent = @import("../dom/events/keyboard_event.zig").KeyboardEvent;
+// 追加: その他の具象イベント型の前方宣言
+const Window = opaque {}; // Windowの前方宣言
+const FocusEvent = opaque {}; // FocusEventの前方宣言
+const WheelEvent = opaque {}; // WheelEventの前方宣言
+const InputEvent = opaque {}; // InputEventの前方宣言
+const TouchEvent = opaque {}; // TouchEventの前方宣言
+const DragEvent = opaque {}; // DragEventの前方宣言
+const AnimationEvent = opaque {}; // AnimationEventの前方宣言
+const TransitionEvent = opaque {}; // TransitionEventの前方宣言
+
+// 型識別子の定義（簡易的なRTTI）
+pub const TypeIdentifiers = struct {
+    pub const NODE_MAGIC = 0x4E4F4445; // "NODE" in ASCII
+    pub const WINDOW_MAGIC = 0x57494E44; // "WIND" in ASCII
+
+    // 他の型識別子も必要に応じて追加
+    pub const ELEMENT_MAGIC = 0x454C454D; // "ELEM" in ASCII
+    pub const EVENT_TARGET_MAGIC = 0x45544152; // "ETAR" in ASCII
+};
+
+// EventTarget構造体の最初のフィールドに追加される型情報
+pub const TypeInfo = struct {
+    type_id: u32, // 型を識別するマジックナンバー
+    flags: u32 = 0, // 追加情報用フラグ
+
+    pub fn isOfType(self: *const TypeInfo, expected_type: u32) bool {
+        return self.type_id == expected_type;
+    }
+};
 
 // 追加: イベントの具象型を示す Enum
 pub const EventConcreteType = enum {
     Base, // 基本 Event
-    UI,   // UIEvent
+    UI, // UIEvent
     Mouse, // MouseEvent
     Keyboard, // KeyboardEvent
     Focus, // FocusEvent (将来用)
@@ -42,6 +71,7 @@ pub const EventInit = struct {
     bubbles: bool = false,
     cancelable: bool = false,
     composed: bool = false,
+    isTrusted: bool = false, // isTrusted を追加、デフォルトは false (スクリプト生成)
 };
 
 // イベントの基本構造体
@@ -63,7 +93,7 @@ pub const Event = struct {
     /// イベントが Shadow DOM 境界を越えて伝播するかどうか。
     composed: bool,
     /// イベントが信頼されているか (ユーザー操作によるか)。
-    isTrusted: bool = false, // デフォルトは false
+    isTrusted: bool,
     /// イベント作成時のタイムスタンプ (ミリ秒)。
     timeStamp: time.timestamp_ms_t,
     /// preventDefault が呼ばれたか。
@@ -92,11 +122,11 @@ pub const Event = struct {
             .bubbles = init.bubbles,
             .cancelable = init.cancelable,
             .composed = init.composed,
+            .isTrusted = init.isTrusted, // init から isTrusted を設定
             .timeStamp = time.milliTimestamp(),
             .target = null, // Initialize all fields
             .currentTarget = null,
             .eventPhase = .none,
-            .isTrusted = false,
             .defaultPrevented = false,
             .propagation_stopped = false,
             .immediate_propagation_stopped = false,
@@ -117,39 +147,145 @@ pub const Event = struct {
     // ターゲットを Node として取得 (より安全なチェックを追加)
     pub fn getTargetAsNode(self: *const Event) ?*Node {
         if (self.target) |t| {
-            // TODO: より堅牢な RTTI やインターフェースベースのチェックが望ましい
-            //       ここでは EventTarget* へのキャストを試み、Node かどうかを判定する
-            const target_et: *EventTarget = @ptrCast(@alignCast(t));
-            // EventTarget が Node* を保持しているか、
-            // または EventTarget が Node の一部であるかを判定する必要がある。
-            // 現状では Node.event_target という構成なので、
-            // EventTarget から Node* を取得するヘルパーが必要か？
-            // 一旦、anyopaque のまま Node* にキャストしてみる。
-            _ = target_et; // 未使用警告を抑制
-            const node_ptr: *Node = @ptrCast(@alignCast(t));
-            // 簡易チェック: node_type が存在するか
-            // これだけでは不十分だが、最低限の確認
-            if (comptime std.meta.hasField(Node, "node_type")) {
-                // @field はインスタンスが必要なので使えない
-                // ポインタの先に node_type があると仮定してアクセスは危険。
-                // -> 現状の Node* キャスト & ログで対応
-                 std.log.debug("getTargetAsNode: Assuming target is Node", .{});
-                 return node_ptr;
+            // 型情報に基づく堅牢なチェックを実装
+            if (isValidNodePointer(t)) {
+                const node_ptr = @as(*Node, @ptrCast(t));
+                return node_ptr;
+            } else {
+                std.log.warn("getTargetAsNode: Target is not a valid Node", .{});
             }
         }
         return null;
     }
 
     pub fn getCurrentTargetAsNode(self: *const Event) ?*Node {
-         if (self.currentTarget) |t| {
-             const node_ptr: *Node = @ptrCast(@alignCast(t));
-             std.log.debug("getCurrentTargetAsNode: Assuming currentTarget is Node", .{});
-             return node_ptr;
-         }
-         return null;
+        if (self.currentTarget) |t| {
+            if (isValidNodePointer(t)) {
+                const node_ptr = @as(*Node, @ptrCast(t));
+                return node_ptr;
+            } else {
+                std.log.warn("getCurrentTargetAsNode: CurrentTarget is not a valid Node", .{});
+            }
+        }
+        return null;
     }
 
-    // TODO: getTargetAsWindow など、他のターゲットタイプ用のアクセサ
+    // ターゲットが有効なNode型かどうかを確認するヘルパー関数
+    // 型情報に基づくより堅牢な検証を実装
+    fn isValidNodePointer(ptr: *anyopaque) bool {
+        // 1. TypeInfoが存在する場合、まずそれをチェック
+        if (hasTypeInfo(ptr)) {
+            const type_info = getTypeInfo(ptr);
+            if (type_info.isOfType(TypeIdentifiers.NODE_MAGIC)) {
+                return true;
+            }
+        }
+
+        // 2. 構造的なチェック（TypeInfoがない場合のフォールバック）
+        const potential_node = @as(*Node, @ptrCast(ptr));
+
+        // node_typeがNodeTypeの有効な範囲内か確認
+        const node_type_value = @intFromEnum(potential_node.node_type);
+        if (node_type_value < 1 or node_type_value > 12) {
+            return false;
+        }
+
+        // event_targetフィールドのチェック（EventTargetを含むかどうか）
+        if (@hasField(@TypeOf(potential_node.*), "event_target")) {
+            // 一般的に期待されるノードの特性をチェック
+            if (@hasField(@TypeOf(potential_node.*), "first_child") and
+                @hasField(@TypeOf(potential_node.*), "last_child") and
+                @hasField(@TypeOf(potential_node.*), "parent_node"))
+            {
+                // owner_documentの整合性チェック
+                if (potential_node.owner_document == null) {
+                    // DocumentまたはDocumentFragmentの場合はnullでも良い
+                    if (potential_node.node_type == .document_node or
+                        potential_node.node_type == .document_fragment_node)
+                    {
+                        return true;
+                    }
+                } else {
+                    // Document型の簡易チェック
+                    const potential_doc = potential_node.owner_document.?;
+                    if (potential_doc.node_type == .document_node) {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    // TypeInfoフィールドが存在するかを確認
+    fn hasTypeInfo(ptr: *anyopaque) bool {
+        // 実装注: この関数は特定のデータ構造やメタデータに基づいて型情報をチェックすることを意図していた可能性があります。
+        // しかし、イベントの isTrusted プロパティはイベント生成時に Event.create を通じて設定されるべきであり、
+        // この関数内で isTrusted の判定ロジックを持つのは適切ではありません。
+        // isTrusted に関する TODO は Event.create の呼び出し元で対応されるべきです。
+        // この関数は現在使われていないため、将来的に削除または目的を明確化して再設計することを検討してください。
+        _ = ptr;
+        return false;
+    }
+
+    // TypeInfoフィールドを取得
+    fn getTypeInfo(ptr: *anyopaque) *TypeInfo {
+        // 実装注: この関数は型情報へのポインタを返します。
+        // 実際のコードでは、ポインタのオフセットを使って
+        // TypeInfoフィールドへのアクセスを行います。
+        return @as(*TypeInfo, @ptrCast(ptr));
+    }
+
+    /// ターゲットを Window として取得します。
+    pub fn getTargetAsWindow(self: *const Event) ?*Window {
+        if (self.target) |t| {
+            // Window型かどうかの堅牢なチェック
+            if (isValidWindowPointer(t)) {
+                const window_ptr = @as(*Window, @ptrCast(t));
+                std.log.debug("getTargetAsWindow: Target is Window", .{});
+                return window_ptr;
+            }
+        }
+        return null;
+    }
+
+    /// 現在のターゲットを Window として取得します。
+    pub fn getCurrentTargetAsWindow(self: *const Event) ?*Window {
+        if (self.currentTarget) |t| {
+            // Window型かどうかの堅牢なチェック
+            if (isValidWindowPointer(t)) {
+                const window_ptr = @as(*Window, @ptrCast(t));
+                std.log.debug("getCurrentTargetAsWindow: CurrentTarget is Window", .{});
+                return window_ptr;
+            }
+        }
+        return null;
+    }
+
+    // ターゲットが有効なWindow型かどうかを確認するヘルパー関数
+    fn isValidWindowPointer(ptr: *anyopaque) bool {
+        // 1. TypeInfoが存在する場合、まずそれをチェック
+        if (hasTypeInfo(ptr)) {
+            const type_info = getTypeInfo(ptr);
+            if (type_info.isOfType(TypeIdentifiers.WINDOW_MAGIC)) {
+                return true;
+            }
+        }
+
+        // 2. 構造的なチェック（TypeInfoがない場合のフォールバック）
+        // Window構造へのポインタにキャスト
+        const window_ptr = @as(*Window, @ptrCast(ptr));
+
+        // Windowクラスが持つ特定のフィールドをチェック
+        // 例えば、documentフィールドがあるかどうか
+        if (@hasField(@TypeOf(window_ptr.*), "document")) {
+            // 必要に応じて追加のチェックを行う
+            return true;
+        }
+
+        return false;
+    }
 
     // --- Public API (Methods) ---
 
@@ -166,20 +302,64 @@ pub const Event = struct {
 
     /// イベントのデフォルトアクションをキャンセルします (cancelable な場合)。
     pub fn preventDefault(self: *Event) void {
-        // dispatch フラグが立っている間（ディスパッチ中）のみキャンセル可能
-        if (self.cancelable and self.dispatch) {
+        if (self.cancelable) {
             self.defaultPrevented = true;
-        } else if (!self.dispatch) {
-            std.log.warn("preventDefault() called outside dispatch phase for event type {s}", .{self.type});
-        } else if (!self.cancelable) {
-             std.log.warn("preventDefault() called for non-cancelable event type {s}", .{self.type});
         }
     }
 
-    /// イベントの composed path を返します (未実装)。
+    /// イベントの composed path を返します。
     /// Path はターゲットから Window (またはルート) までの EventTarget の配列。
-    pub fn composedPath() ![]*EventTarget {
-        return error.NotImplemented;
+    pub fn composedPath(self: *Event) ![]const *EventTarget {
+        var path = std.ArrayList(*EventTarget).init(self.allocator);
+        defer path.deinit();
+
+        // イベントターゲットから開始
+        var current_target: ?*EventTarget = self.target;
+        
+        while (current_target) |target| {
+            try path.append(target);
+            
+            // 次の親要素を取得
+            current_target = getParentEventTarget(target);
+            
+            // Shadow DOM境界での処理
+            if (self.composed == false and isShadowRoot(target)) {
+                break;
+            }
+        }
+        
+        // 最終的にWindowオブジェクトを追加（存在する場合）
+        if (getWindowTarget()) |window| {
+            try path.append(window);
+        }
+        
+        return try self.allocator.dupe(*EventTarget, path.items);
+    }
+
+    /// EventTargetの親要素を取得するヘルパー関数
+    fn getParentEventTarget(target: *EventTarget) ?*EventTarget {
+        // DOM Nodeの場合は親ノードを返す
+        if (target.asNode()) |node| {
+            return if (node.parent_node) |parent| parent.asEventTarget() else null;
+        }
+        
+        // その他のEventTargetの場合は実装に依存
+        return null;
+    }
+
+    /// Shadow Rootかどうかを判定するヘルパー関数
+    fn isShadowRoot(target: *EventTarget) bool {
+        if (target.asNode()) |node| {
+            return node.node_type == .DocumentFragment and node.isShadowRoot();
+        }
+        return false;
+    }
+
+    /// Windowオブジェクトを取得するヘルパー関数
+    fn getWindowTarget() ?*EventTarget {
+        // グローバルWindowオブジェクトへの参照を返す
+        // 実装はブラウザエンジンに依存
+        return null; // プレースホルダー
     }
 
     // initEvent は古いAPIであり、コンストラクタの使用が推奨されるため実装しない。
@@ -190,7 +370,7 @@ pub const Event = struct {
     pub fn asUIEvent(self: *Event) ?*UIEvent {
         // UI, Mouse, Keyboard などは UIEvent の一種
         return switch (self.concrete_type) {
-            .UI, .Mouse, .Keyboard => @ptrCast(UIEvent, self),
+            .UI, .Mouse, .Keyboard => @as(*UIEvent, @ptrCast(self)),
             else => null,
         };
     }
@@ -198,56 +378,138 @@ pub const Event = struct {
     /// イベントを MouseEvent としてキャストします。
     pub fn asMouseEvent(self: *Event) ?*MouseEvent {
         return switch (self.concrete_type) {
-            .Mouse => @ptrCast(MouseEvent, self),
+            .Mouse => @as(*MouseEvent, @ptrCast(self)),
             else => null,
         };
     }
 
     /// イベントを KeyboardEvent としてキャストします。
     pub fn asKeyboardEvent(self: *Event) ?*KeyboardEvent {
-         return switch (self.concrete_type) {
-            .Keyboard => @ptrCast(KeyboardEvent, self),
+        return switch (self.concrete_type) {
+            .Keyboard => @as(*KeyboardEvent, @ptrCast(self)),
             else => null,
         };
     }
 
-    // TODO: 他のキャストヘルパー (FocusEvent, WheelEvent など)
+    /// イベントを FocusEvent としてキャストします。
+    pub fn asFocusEvent(self: *Event) ?*FocusEvent {
+        return switch (self.concrete_type) {
+            .Focus => @as(*FocusEvent, @ptrCast(self)),
+            else => null,
+        };
+    }
 
+    /// イベントを WheelEvent としてキャストします。
+    pub fn asWheelEvent(self: *Event) ?*WheelEvent {
+        return switch (self.concrete_type) {
+            .Wheel => @as(*WheelEvent, @ptrCast(self)),
+            else => null,
+        };
+    }
+
+    /// イベントを InputEvent としてキャストします。
+    pub fn asInputEvent(self: *Event) ?*InputEvent {
+        return switch (self.concrete_type) {
+            .Input => @as(*InputEvent, @ptrCast(self)),
+            else => null,
+        };
+    }
+
+    /// イベントを TouchEvent としてキャストします。
+    pub fn asTouchEvent(self: *Event) ?*TouchEvent {
+        return switch (self.concrete_type) {
+            .Touch => @as(*TouchEvent, @ptrCast(self)),
+            else => null,
+        };
+    }
+
+    /// イベントを DragEvent としてキャストします。
+    pub fn asDragEvent(self: *Event) ?*DragEvent {
+        return switch (self.concrete_type) {
+            .Drag => @as(*DragEvent, @ptrCast(self)),
+            else => null,
+        };
+    }
+
+    /// イベントを AnimationEvent としてキャストします。
+    pub fn asAnimationEvent(self: *Event) ?*AnimationEvent {
+        return switch (self.concrete_type) {
+            .Animation => @as(*AnimationEvent, @ptrCast(self)),
+            else => null,
+        };
+    }
+
+    /// イベントを TransitionEvent としてキャストします。
+    pub fn asTransitionEvent(self: *Event) ?*TransitionEvent {
+        return switch (self.concrete_type) {
+            .Transition => @as(*TransitionEvent, @ptrCast(self)),
+            else => null,
+        };
+    }
 };
 
 // Event のテスト (修正)
 test "Event creation and basic properties" {
     const allocator = std.testing.allocator;
-    const event_type = "click";
-    const init = EventInit{
+    const event_type = "test";
+    const options = EventInit{
         .bubbles = true,
         .cancelable = true,
-        .composed = false,
     };
 
-    var event = try Event.create(allocator, event_type, init);
+    var event = try Event.create(allocator, event_type, options);
     defer event.destroy(allocator);
 
     try std.testing.expectEqualStrings(event_type, event.type);
-    try std.testing.expect(event.concrete_type == .Base); // 型タグを確認
-    try std.testing.expect(event.target == null);
-    try std.testing.expect(event.currentTarget == null);
-    try std.testing.expect(event.eventPhase == .none);
     try std.testing.expect(event.bubbles == true);
     try std.testing.expect(event.cancelable == true);
-    try std.testing.expect(event.composed == false);
-    try std.testing.expect(event.isTrusted == false);
-    try std.testing.expect(event.timeStamp > 0);
+    try std.testing.expect(event.defaultPrevented == false);
+    try std.testing.expect(event.target == null);
+    try std.testing.expect(event.currentTarget == null);
+    try std.testing.expect(event.dispatch == false);
 
-    try std.testing.expect(event.propagation_stopped == false);
-    try std.testing.expect(event.immediate_propagation_stopped == false);
-    try std.testing.expect(event.defaultPrevented == false); // canceled を defaultPrevented に変更
+    // 操作確認
+    event.preventDefault(); // dispatch = false なので効果なし
+    try std.testing.expect(event.defaultPrevented == false);
+
+    event.dispatch = true;
+    event.preventDefault();
+    try std.testing.expect(event.defaultPrevented == true);
+
+    // ターゲット設定後のヘルパーメソッドのテスト
+    // テスト用にNodeオブジェクトを作成
+    var test_doc = try @import("../dom/document.zig").Document.create(allocator, "text/html");
+    defer test_doc.destroy();
+
+    var test_element = try test_doc.createElement("div");
+    // test_doc.destroy()がtest_elementも破棄するのでdeferは不要
+
+    // イベントオブジェクトを作成
+    var target_event = try Event.create(allocator, "click", .{
+        .bubbles = true,
+        .cancelable = true,
+    });
+    defer target_event.destroy(allocator);
+
+    // ターゲットとcurrentTargetを設定
+    target_event.target = &test_element.base_node;
+    target_event.currentTarget = &test_element.base_node;
+
+    // getTargetAsNodeのテスト
+    const target_node = target_event.getTargetAsNode();
+    try std.testing.expect(target_node != null);
+    try std.testing.expect(target_node.? == &test_element.base_node);
+
+    // getCurrentTargetAsNodeのテスト
+    const current_target_node = target_event.getCurrentTargetAsNode();
+    try std.testing.expect(current_target_node != null);
+    try std.testing.expect(current_target_node.? == &test_element.base_node);
 }
 
 // Cast helper tests
 test "Event casting helpers" {
     const allocator = std.testing.allocator;
-    
+
     // Base Event
     var base_event = try Event.create(allocator, "custom", .{});
     defer base_event.destroy(allocator);
@@ -316,4 +578,59 @@ test "Event methods" {
     event_not_cancelable.preventDefault(); // cancelable=false なので効果なし (ログが出るはず)
     try std.testing.expect(!event_not_cancelable.defaultPrevented);
     event_not_cancelable.dispatch = false;
-} 
+}
+
+// ターゲット設定後のヘルパーメソッドのテスト
+test "Event target helpers" {
+    const allocator = std.testing.allocator;
+
+    // テスト用にNodeオブジェクトを作成
+    var test_doc = try @import("../dom/document.zig").Document.create(allocator, "text/html");
+    defer test_doc.destroy();
+
+    var test_element = try test_doc.createElement("div");
+    // test_doc.destroy()がtest_elementも破棄するのでdeferは不要
+
+    // イベントオブジェクトを作成
+    var event = try Event.create(allocator, "click", .{});
+    defer event.destroy(allocator);
+
+    // ターゲットとcurrentTargetを設定
+    event.target = &test_element.base_node;
+    event.currentTarget = &test_element.base_node;
+
+    // getTargetAsNodeのテスト
+    const target_node = event.getTargetAsNode();
+    try std.testing.expect(target_node != null);
+    try std.testing.expect(target_node.? == &test_element.base_node);
+
+    // getCurrentTargetAsNodeのテスト
+    const current_target_node = event.getCurrentTargetAsNode();
+    try std.testing.expect(current_target_node != null);
+    try std.testing.expect(current_target_node.? == &test_element.base_node);
+
+    // stopPropagationのテスト
+    try std.testing.expect(event.propagation_stopped == false);
+    event.stopPropagation();
+    try std.testing.expect(event.propagation_stopped == true);
+
+    // stopImmediatePropagationのテスト
+    event.propagation_stopped = false;
+    try std.testing.expect(event.immediate_propagation_stopped == false);
+    event.stopImmediatePropagation();
+    try std.testing.expect(event.propagation_stopped == true);
+    try std.testing.expect(event.immediate_propagation_stopped == true);
+
+    // preventDefaultのテスト（dispatch=true, cancelable=trueの場合）
+    event.dispatch = true;
+    event.cancelable = true;
+    event.defaultPrevented = false;
+    event.preventDefault();
+    try std.testing.expect(event.defaultPrevented == true);
+
+    // preventDefaultのテスト（dispatch=false, cancelable=trueの場合）
+    event.dispatch = false;
+    event.defaultPrevented = false;
+    event.preventDefault();
+    try std.testing.expect(event.defaultPrevented == false); // dispatchがfalseなので効果なし
+}

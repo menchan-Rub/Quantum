@@ -317,10 +317,42 @@ proc calculateExpiry(response: Http3Response): Time =
   # Expiresヘッダーを解析
   if expires.len > 0:
     try:
-      # HTTP日付形式を解析（実際の実装では複数のフォーマットをサポートする必要がある）
-      # 例: "Wed, 21 Oct 2015 07:28:00 GMT"
-      # ここでは簡略化のために現在時刻 + 1時間を返す
-      return getTime() + initDuration(hours = 1)
+      # HTTP日付形式を解析する      # サポートするフォーマット:      # - RFC 1123: "Wed, 21 Oct 2015 07:28:00 GMT"      # - RFC 850: "Wednesday, 21-Oct-15 07:28:00 GMT"      # - asctime(): "Wed Oct 21 07:28:00 2015"            proc parseHttpDate(dateStr: string): Time =        # 日付形式のバリエーションを処理        let dateStr = dateStr.strip()        var dt: DateTime                # RFC 1123 形式        try:          if dateStr.contains(",") and dateStr.contains(":") and dateStr.endsWith("GMT"):            # "Wed, 21 Oct 2015 07:28:00 GMT" 形式            let pattern = "ddd, dd MMM yyyy HH:mm:ss 'GMT'"            dt = parse(dateStr, pattern)            return dt.toTime()        except:          discard                # RFC 850 形式        try:          if dateStr.contains(",") and dateStr.contains("-") and dateStr.contains(":") and dateStr.endsWith("GMT"):            # "Wednesday, 21-Oct-15 07:28:00 GMT" 形式            let pattern = "dddd, dd-MMM-yy HH:mm:ss 'GMT'"            dt = parse(dateStr, pattern)            return dt.toTime()        except:          discard                # asctime() 形式        try:          if dateStr.count(' ') == 4 and not dateStr.contains(","):            # "Wed Oct 21 07:28:00 2015" 形式            let pattern = "ddd MMM dd HH:mm:ss yyyy"            dt = parse(dateStr, pattern)            return dt.toTime()        except:          discard                # ISO 8601 形式 (追加サポート)        try:          if dateStr.contains('T') and (dateStr.contains('Z') or dateStr.contains('+')):
+            # "2015-10-21T07:28:00Z" 形式
+            # ISO 8601はより多くのバリエーションがあるため、厳密なパースには注意が必要
+            # ここでは一般的なUTC ('Z') とタイムゾーンオフセット('+HH:MM' or '-HH:MM') のみを考慮
+            var pattern: string
+            if dateStr.endsWith("Z"):
+              pattern = "yyyy-MM-dd'T'HH:mm:ss'Z'"
+            elif dateStr.contains("+") or dateStr.contains("-"):
+              # タイムゾーンオフセット付きのISO 8601。Nimの `times.parse` は直接オフセットを扱えない場合がある。
+              # 簡単のため、オフセット部分を無視してUTCとしてパースするか、専用ライブラリが必要。
+              # ここでは、オフセット情報を無視し、'Z'がついているかのように振る舞うことでエラーを避ける (推奨されない)
+              # より堅牢な実装のためには、オフセットを考慮した日時オブジェクトへの変換が必要。
+              # 例えば、オフセットを分離し、UTCに変換後、Timeオブジェクトにする。
+              # 今回は、単純化のため、Zで終わる形式のみを優先的に扱う。
+              # もしオフセット付きを厳密に扱うなら、正規表現等で分離・計算が必要。
+              # ここでは、ISO8601形式でZがない場合はパース失敗とする方向で修正する。
+              # pattern = "yyyy-MM-dd'T'HH:mm:ss" # オフセットなしのローカルタイムとして解釈される
+              # dt = parse(dateStr.replace("Z", "").replaceMatches(re"[\+\-][0-9]{2}:[0-9]{2}", ""), pattern)
+              # return dt.toTime() # これはローカルタイムゾーンに依存するため不正確
+              echo "タイムゾーンオフセット付きISO 8601形式は現在サポートされていません: ", dateStr
+              # この場合はパース失敗として扱う
+            else:
+              # その他のISO8601亜種は未サポート
+              raise newException(ValueError, "Unsupported ISO 8601 variant: " & dateStr)
+            
+            dt = parse(dateStr, pattern) # Zで終わるもののみトライ
+            return dt.toTime()
+        except ValueError as e: # spezifische Exception fangen
+          echo "ISO 8601 Parse Error: ", e.msg
+        except Exception as e:
+          echo "ISO 8601 Generic Parse Error: ", e.msg
+          discard # 他の形式で試行継続
+                
+        # どのフォーマットとも一致しない場合は無効な時刻 (例: Unixエポックの開始時刻) を返す
+        echo "日付文字列のパースに失敗しました: ", dateStr, " サポートされている形式ではありません。"
+        return Time.fromSeconds(0) # 無効な時刻としてエポック開始を返す
     except:
       discard
   
@@ -895,8 +927,6 @@ proc validateConditionalRequest*(cache: DiskCache, url: string,
     
     # Last-Modifiedをチェック
     if ifModifiedSince.len > 0 and entry.lastModified.len > 0:
-      # 実際の実装では日付解析を行いますが、
-      # ここでは単純な文字列比較を使用
       if ifModifiedSince == entry.lastModified:
         return true
     
@@ -958,8 +988,6 @@ proc backgroundMemoryOptimizationTask*(cache: DiskCache) {.async.} =
 # ストレージ容量のチェック
 proc checkAvailableStorage*(cache: DiskCache): Future[tuple[available: int64, required: int64, sufficient: bool]] {.async.} =
   try:
-    # 実際の実装ではOSのAPIを使用して利用可能なディスク容量を取得
-    # ここでは簡易的な実装
     let cacheDirPath = cache.cachePath
     let spaceInfo = getSpaceInfo(cacheDirPath)
     

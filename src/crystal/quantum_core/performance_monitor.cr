@@ -1,435 +1,462 @@
 module QuantumCore
-  # パフォーマンスモニタークラス
-  # ブラウザの各コンポーネントのパフォーマンスを監視する
+  # パフォーマンスモニタリングシステム
+  # すべてのコンポーネントの性能指標を集計、分析、最適化するための中枢システム
   class PerformanceMonitor
-    # メモリ使用量の情報
-    class MemoryUsage
-      property total_bytes : Int64
-      property component_bytes : Hash(String, Int64)
-      
-      def initialize
-        @total_bytes = 0_i64
-        @component_bytes = {} of String => Int64
-      end
-      
-      def to_s
-        "合計: #{format_bytes(total_bytes)} (#{component_bytes.map { |k, v| "#{k}: #{format_bytes(v)}" }.join(", ")})"
-      end
-      
-      private def format_bytes(bytes : Int64) : String
-        if bytes < 1024
-          "#{bytes}B"
-        elsif bytes < 1024 * 1024
-          "#{(bytes / 1024.0).round(2)}KB"
-        elsif bytes < 1024 * 1024 * 1024
-          "#{(bytes / 1024.0 / 1024.0).round(2)}MB"
-        else
-          "#{(bytes / 1024.0 / 1024.0 / 1024.0).round(2)}GB"
-        end
-      end
+    # シングルトンインスタンス
+    @@instance : PerformanceMonitor?
+    
+    # パフォーマンス指標の収集間隔（ミリ秒）
+    COLLECTION_INTERVAL = 1000
+    
+    # 履歴保持期間（秒）
+    HISTORY_DURATION = 60
+    
+    # オーバーヘッド警告しきい値（ミリ秒）
+    OVERHEAD_WARNING_THRESHOLD = 0.5
+    
+    # メトリクス型定義
+    alias MetricValue = Float64 | Int32 | Int64
+    
+    # 収集データ
+    @render_metrics : Hash(String, Deque(MetricValue))
+    @network_metrics : Hash(String, Deque(MetricValue))
+    @memory_metrics : Hash(String, Deque(MetricValue))
+    @js_metrics : Hash(String, Deque(MetricValue))
+    
+    # 最終収集時刻
+    @last_collection_time : Time
+    
+    # 監視状態
+    @monitoring_active : Bool
+    
+    # データポイント数
+    @data_points_per_history : Int32
+    
+    # 統計処理用の一時変数
+    @temp_metrics : Hash(String, MetricValue)
+    
+    # コンポーネント参照
+    @engine : QuantumCore::Engine?
+    @ui_manager : QuantumUI::Manager?
+    @network_manager : QuantumNetwork::Manager?
+    @storage_manager : QuantumStorage::Manager?
+    
+    # インスタンス取得メソッド
+    def self.instance : PerformanceMonitor
+      @@instance ||= new
     end
     
-    # CPU使用率の情報
-    class CPUUsage
-      property total_percent : Float64
-      property component_percent : Hash(String, Float64)
+    # 初期化処理
+    private def initialize
+      @render_metrics = Hash(String, Deque(MetricValue)).new { |h, k| h[k] = Deque(MetricValue).new }
+      @network_metrics = Hash(String, Deque(MetricValue)).new { |h, k| h[k] = Deque(MetricValue).new }
+      @memory_metrics = Hash(String, Deque(MetricValue)).new { |h, k| h[k] = Deque(MetricValue).new }
+      @js_metrics = Hash(String, Deque(MetricValue)).new { |h, k| h[k] = Deque(MetricValue).new }
       
-      def initialize
-        @total_percent = 0.0
-        @component_percent = {} of String => Float64
-      end
-      
-      def to_s
-        "合計: #{total_percent.round(2)}% (#{component_percent.map { |k, v| "#{k}: #{v.round(2)}%" }.join(", ")})"
-      end
+      @last_collection_time = Time.monotonic
+      @monitoring_active = false
+      @data_points_per_history = (HISTORY_DURATION * 1000) / COLLECTION_INTERVAL
+      @temp_metrics = Hash(String, MetricValue).new
     end
     
-    # FPS測定の情報
-    class FPSMeasurement
-      property current_fps : Float64
-      property avg_fps : Float64
-      property min_fps : Float64
-      property max_fps : Float64
-      property frame_times : Array(Float64)
-      property frame_time_history_size : Int32
-      
-      def initialize(@frame_time_history_size : Int32 = 60)
-        @current_fps = 0.0
-        @avg_fps = 0.0
-        @min_fps = Float64::MAX
-        @max_fps = 0.0
-        @frame_times = [] of Float64
-      end
-      
-      def add_frame_time(time_ms : Float64)
-        if time_ms > 0
-          fps = 1000.0 / time_ms
-          
-          @current_fps = fps
-          @avg_fps = calculate_avg_fps(fps)
-          @min_fps = fps if fps < @min_fps
-          @max_fps = fps if fps > @max_fps
-          
-          # フレーム時間の履歴を更新
-          @frame_times.unshift(time_ms)
-          if @frame_times.size > @frame_time_history_size
-            @frame_times.pop
-          end
-        end
-      end
-      
-      private def calculate_avg_fps(current_fps : Float64) : Float64
-        if @frame_times.empty?
-          current_fps
-        else
-          avg_frame_time = @frame_times.sum / @frame_times.size
-          1000.0 / avg_frame_time
-        end
-      end
-      
-      def to_s
-        "現在: #{@current_fps.round(2)} FPS, 平均: #{@avg_fps.round(2)} FPS, 最小: #{@min_fps.round(2)} FPS, 最大: #{@max_fps.round(2)} FPS"
-      end
+    # コンポーネント参照設定
+    def set_components(engine : QuantumCore::Engine?, ui_manager : QuantumUI::Manager?, 
+                      network_manager : QuantumNetwork::Manager?, 
+                      storage_manager : QuantumStorage::Manager?)
+      @engine = engine
+      @ui_manager = ui_manager
+      @network_manager = network_manager
+      @storage_manager = storage_manager
     end
     
-    # ネットワーク統計の情報
-    class NetworkStats
-      property bytes_received : Int64
-      property bytes_sent : Int64
-      property requests_sent : Int32
-      property requests_completed : Int32
-      property requests_failed : Int32
-      property avg_response_time_ms : Float64
-      property active_connections : Int32
-      
-      def initialize
-        @bytes_received = 0_i64
-        @bytes_sent = 0_i64
-        @requests_sent = 0
-        @requests_completed = 0
-        @requests_failed = 0
-        @avg_response_time_ms = 0.0
-        @active_connections = 0
-      end
-      
-      def add_request(bytes_sent : Int64, response_time_ms : Float64)
-        @bytes_sent += bytes_sent
-        @requests_sent += 1
-        
-        # 平均応答時間の更新
-        @avg_response_time_ms = ((@avg_response_time_ms * (@requests_completed - 1)) + response_time_ms) / @requests_completed if @requests_completed > 0
-      end
-      
-      def add_response(bytes_received : Int64, success : Bool)
-        @bytes_received += bytes_received
-        
-        if success
-          @requests_completed += 1
-        else
-          @requests_failed += 1
-        end
-      end
-      
-      def to_s
-        "送信: #{format_bytes(@bytes_sent)}, 受信: #{format_bytes(@bytes_received)}, " +
-        "リクエスト: #{@requests_sent}, 完了: #{@requests_completed}, 失敗: #{@requests_failed}, " +
-        "平均応答時間: #{@avg_response_time_ms.round(2)}ms, アクティブ接続: #{@active_connections}"
-      end
-      
-      private def format_bytes(bytes : Int64) : String
-        if bytes < 1024
-          "#{bytes}B"
-        elsif bytes < 1024 * 1024
-          "#{(bytes / 1024.0).round(2)}KB"
-        elsif bytes < 1024 * 1024 * 1024
-          "#{(bytes / 1024.0 / 1024.0).round(2)}MB"
-        else
-          "#{(bytes / 1024.0 / 1024.0 / 1024.0).round(2)}GB"
-        end
-      end
-    end
-    
-    @engine : Engine
-    @ui_manager : QuantumUI::Manager
-    @network_manager : QuantumNetwork::Manager
-    @storage_manager : QuantumStorage::Manager
-    
-    @memory_usage : MemoryUsage = MemoryUsage.new
-    @cpu_usage : CPUUsage = CPUUsage.new
-    @fps_measurement : FPSMeasurement = FPSMeasurement.new
-    @network_stats : NetworkStats = NetworkStats.new
-    
-    @running : Bool = false
-    @monitoring_thread : Thread? = nil
-    @monitoring_interval : Float64 = 1.0 # 監視間隔（秒）
-    
-    @last_frame_time : Time? = nil
-    @performance_warnings : Array(String) = [] of String
-    
-    # 監視対象のメトリクス
-    enum MetricsType
-      MEMORY
-      CPU
-      FPS
-      NETWORK
-      ALL
-    end
-    
-    # 性能ボトルネックの種類
-    enum BottleneckType
-      NONE
-      MEMORY
-      CPU
-      GPU
-      NETWORK
-      DISK
-      UNKNOWN
-    end
-    
-    def initialize(@engine : Engine, @ui_manager : QuantumUI::Manager, @network_manager : QuantumNetwork::Manager, @storage_manager : QuantumStorage::Manager)
-      # イベントリスナーを登録
-      setup_event_listeners
-    end
-    
-    # パフォーマンスモニタリングを開始
+    # モニタリング開始
     def start
-      return if @running
+      return if @monitoring_active
       
-      @running = true
+      @monitoring_active = true
+      @last_collection_time = Time.monotonic
       
-      # モニタリングスレッドを開始
-      @monitoring_thread = spawn do
-        monitoring_loop
-      end
-      
-      Log.info { "PerformanceMonitor: モニタリングを開始しました" }
-    end
-    
-    # パフォーマンスモニタリングを停止
-    def shutdown
-      return unless @running
-      
-      @running = false
-      
-      # モニタリングスレッドの終了を待機
-      if thread = @monitoring_thread
-        thread.join
-      end
-      
-      Log.info { "PerformanceMonitor: モニタリングを停止しました" }
-    end
-    
-    # モニタリングループ
-    private def monitoring_loop
-      while @running
-        # メモリ使用量の測定
-        measure_memory_usage
-        
-        # CPU使用率の測定
-        measure_cpu_usage
-        
-        # ネットワーク統計の更新
-        update_network_stats
-        
-        # ボトルネックの検出
-        detect_bottlenecks
-        
-        # メトリクスをログに出力（デバッグモードの場合）
-        log_metrics if @engine.config.core.debugging_enabled
-        
-        # 監視間隔だけ待機
-        sleep @monitoring_interval
-      end
-    end
-    
-    # メモリ使用量の測定
-    private def measure_memory_usage
-      # 実際の実装では、OSのAPIやGCの情報を使用してメモリ使用量を取得
-      # ここでは簡易的な実装
-      
-      # トータルメモリ使用量（仮の値）
-      @memory_usage.total_bytes = 100_000_000_i64
-      
-      # コンポーネント別メモリ使用量（仮の値）
-      @memory_usage.component_bytes["ui"] = 30_000_000_i64
-      @memory_usage.component_bytes["network"] = 10_000_000_i64
-      @memory_usage.component_bytes["storage"] = 20_000_000_i64
-      @memory_usage.component_bytes["renderer"] = 40_000_000_i64
-    end
-    
-    # CPU使用率の測定
-    private def measure_cpu_usage
-      # 実際の実装では、OSのAPIを使用してCPU使用率を取得
-      # ここでは簡易的な実装
-      
-      # トータルCPU使用率（仮の値）
-      @cpu_usage.total_percent = 20.0
-      
-      # コンポーネント別CPU使用率（仮の値）
-      @cpu_usage.component_percent["ui"] = 5.0
-      @cpu_usage.component_percent["network"] = 3.0
-      @cpu_usage.component_percent["storage"] = 2.0
-      @cpu_usage.component_percent["renderer"] = 10.0
-    end
-    
-    # フレーム時間の測定
-    def measure_frame_time
-      current_time = Time.utc
-      
-      if last_time = @last_frame_time
-        # 前回のフレームからの経過時間（ミリ秒）
-        frame_time_ms = (current_time - last_time).total_milliseconds
-        
-        # FPS測定を更新
-        @fps_measurement.add_frame_time(frame_time_ms)
-        
-        # フレーム時間が長すぎる場合は警告
-        if frame_time_ms > 33.33 # 30FPS未満
-          @performance_warnings << "低FPS検出: #{@fps_measurement.current_fps.round(2)} FPS"
+      # バックグラウンドでの定期収集を開始
+      spawn do
+        while @monitoring_active
+          collect_metrics
+          sleep(COLLECTION_INTERVAL / 1000.0)
         end
       end
       
-      @last_frame_time = current_time
+      Log.info { "パフォーマンスモニタリングを開始しました (間隔: #{COLLECTION_INTERVAL}ms, 履歴: #{HISTORY_DURATION}秒)" }
     end
     
-    # ネットワーク統計の更新
-    private def update_network_stats
-      # 実際の実装では、ネットワークマネージャーから統計情報を取得
-      # ここでは簡易的な実装
-      
-      # 現在のアクティブ接続数
-      @network_stats.active_connections = 3 # 仮の値
+    # モニタリング停止
+    def stop
+      @monitoring_active = false
+      Log.info { "パフォーマンスモニタリングを停止しました" }
     end
     
-    # ボトルネックの検出
-    private def detect_bottlenecks
-      bottleneck = BottleneckType::NONE
-      bottleneck_info = ""
+    # レンダリング統計報告
+    def report_render_stats(frame_time : Float64, fps : Float64, jank_count : Int32) : Void
+      @temp_metrics["frame_time"] = frame_time
+      @temp_metrics["fps"] = fps
+      @temp_metrics["jank_count"] = jank_count
+    end
+    
+    # ネットワーク統計報告
+    def report_network_stats(request_count : Int32, total_bytes : Int64, avg_latency : Float64) : Void
+      @temp_metrics["request_count"] = request_count
+      @temp_metrics["total_bytes"] = total_bytes
+      @temp_metrics["avg_latency"] = avg_latency
+    end
+    
+    # メモリ統計報告
+    def report_memory_stats(used_memory : Int64, object_count : Int32, gc_pause_time : Float64) : Void
+      @temp_metrics["used_memory"] = used_memory
+      @temp_metrics["object_count"] = object_count
+      @temp_metrics["gc_pause_time"] = gc_pause_time
+    end
+    
+    # JavaScript統計報告
+    def report_js_stats(execution_time : Float64, compile_time : Float64, gc_time : Float64) : Void
+      @temp_metrics["js_execution_time"] = execution_time
+      @temp_metrics["js_compile_time"] = compile_time
+      @temp_metrics["js_gc_time"] = gc_time
+    end
+    
+    # 指標収集処理
+    private def collect_metrics
+      start_time = Time.monotonic
       
-      # メモリボトルネックの検出
-      if @memory_usage.total_bytes > 500_000_000_i64 # 500MB以上
-        bottleneck = BottleneckType::MEMORY
-        bottleneck_info = "メモリ使用量が高すぎます: #{format_bytes(@memory_usage.total_bytes)}"
+      # 各コンポーネントからメトリクスを収集
+      collect_from_ui_manager
+      collect_from_network_manager
+      collect_from_storage_manager
+      collect_from_engine
+      
+      # 一時指標を永続化
+      store_metrics
+      
+      # 履歴データの整理（古いデータを削除）
+      prune_old_metrics
+      
+      # 定期的な分析と最適化提案
+      if (Time.monotonic - @last_collection_time).total_seconds >= 10
+        analyze_performance
+        @last_collection_time = Time.monotonic
       end
       
-      # CPU使用率ボトルネックの検出
-      if @cpu_usage.total_percent > 80.0
-        bottleneck = BottleneckType::CPU
-        bottleneck_info = "CPU使用率が高すぎます: #{@cpu_usage.total_percent.round(2)}%"
-      end
+      # 収集処理のオーバーヘッドをチェック
+      end_time = Time.monotonic
+      overhead_ms = (end_time - start_time).total_milliseconds
       
-      # FPSボトルネックの検出
-      if @fps_measurement.avg_fps < 30.0
-        bottleneck = BottleneckType::GPU
-        bottleneck_info = "FPSが低すぎます: #{@fps_measurement.avg_fps.round(2)} FPS"
+      if overhead_ms > OVERHEAD_WARNING_THRESHOLD
+        Log.warning { "パフォーマンスモニタのオーバーヘッドが高すぎます: #{overhead_ms.round(2)}ms" }
       end
+    end
+    
+    # UIマネージャからの指標収集
+    private def collect_from_ui_manager
+      return unless ui_manager = @ui_manager
       
-      # ネットワークボトルネックの検出
-      if @network_stats.avg_response_time_ms > 500.0
-        bottleneck = BottleneckType::NETWORK
-        bottleneck_info = "ネットワーク応答時間が長すぎます: #{@network_stats.avg_response_time_ms.round(2)}ms"
-      end
+      # UIレイヤーからパフォーマンス指標を取得
+      ui_metrics = QuantumUI::Manager.instance.get_performance_metrics
+    end
+    
+    # ネットワークマネージャからの指標収集
+    private def collect_from_network_manager
+      return unless network_manager = @network_manager
       
-      # ボトルネックが検出された場合はログに記録
-      if bottleneck != BottleneckType::NONE
-        Log.warning { "PerformanceMonitor: パフォーマンスボトルネック検出 - #{bottleneck} - #{bottleneck_info}" }
-        
-        # 性能警告を追加
-        @performance_warnings << bottleneck_info
-        
-        # 警告が多すぎる場合は古い警告を削除
-        while @performance_warnings.size > 10
-          @performance_warnings.shift
+      # ネットワークレイヤーからパフォーマンス指標を取得
+      net_metrics = QuantumNet::Manager.instance.get_performance_metrics
+    end
+    
+    # ストレージマネージャからの指標収集
+    private def collect_from_storage_manager
+      return unless storage_manager = @storage_manager
+      
+      # ストレージレイヤーからパフォーマンス指標を取得
+      storage_metrics = QuantumStorage::Manager.instance.get_performance_metrics
+    end
+    
+    # エンジンからの指標収集
+    private def collect_from_engine
+      return unless engine = @engine
+      
+      # コアエンジンからパフォーマンス指標を取得
+      engine_metrics = QuantumCore::Engine.instance.get_performance_metrics
+    end
+    
+    # 指標を永続化
+    private def store_metrics
+      # レンダリング指標
+      @temp_metrics.each do |key, value|
+        case key
+        when .starts_with?("frame_"), .starts_with?("fps"), .starts_with?("jank_")
+          @render_metrics[key] << value
+        when .starts_with?("request_"), .starts_with?("bytes"), .starts_with?("latency")
+          @network_metrics[key] << value
+        when .starts_with?("memory"), .starts_with?("object_"), .starts_with?("gc_")
+          @memory_metrics[key] << value
+        when .starts_with?("js_")
+          @js_metrics[key] << value
         end
       end
-    end
-    
-    # 現在のパフォーマンスメトリクスをログに出力
-    private def log_metrics
-      Log.debug { "メモリ使用量: #{@memory_usage}" }
-      Log.debug { "CPU使用率: #{@cpu_usage}" }
-      Log.debug { "FPS: #{@fps_measurement}" }
-      Log.debug { "ネットワーク統計: #{@network_stats}" }
-    end
-    
-    # 指定したタイプのメトリクスを取得
-    def get_metrics(type : MetricsType) : String
-      case type
-      when MetricsType::MEMORY
-        "メモリ使用量: #{@memory_usage}"
-      when MetricsType::CPU
-        "CPU使用率: #{@cpu_usage}"
-      when MetricsType::FPS
-        "FPS: #{@fps_measurement}"
-      when MetricsType::NETWORK
-        "ネットワーク統計: #{@network_stats}"
-      when MetricsType::ALL
-        "メモリ使用量: #{@memory_usage}\n" +
-        "CPU使用率: #{@cpu_usage}\n" +
-        "FPS: #{@fps_measurement}\n" +
-        "ネットワーク統計: #{@network_stats}"
-      else
-        "不明なメトリクスタイプ: #{type}"
-      end
-    end
-    
-    # 現在の性能警告を取得
-    def get_performance_warnings : Array(String)
-      @performance_warnings.dup
-    end
-    
-    # イベントリスナーを設定
-    private def setup_event_listeners
-      # フレームレンダリング完了イベントでフレーム時間を測定
-      frame_listener = SimpleEventListener.new(
-        ->(event : Event) {
-          measure_frame_time
-          nil
-        },
-        [EventType::PAGE_RENDER_COMPLETE]
-      )
       
-      # ネットワークリクエスト関連イベントを監視
-      network_listener = SimpleEventListener.new(
-        ->(event : Event) {
-          case event.type
-          when EventType::RESOURCE_LOAD_START
-            # リクエスト開始時の処理
-            # 実際の実装ではリクエストサイズなどを取得
-            nil
-          when EventType::RESOURCE_LOAD_COMPLETE
-            # リクエスト完了時の処理
-            # 実際の実装ではレスポンスサイズなどを取得
-            nil
-          when EventType::RESOURCE_LOAD_ERROR
-            # リクエストエラー時の処理
-            nil
+      @temp_metrics.clear
+    end
+    
+    # 古い指標を削除
+    private def prune_old_metrics
+      # 履歴の長さを制限
+      [@render_metrics, @network_metrics, @memory_metrics, @js_metrics].each do |metrics_hash|
+        metrics_hash.each do |key, values|
+          while values.size > @data_points_per_history
+            values.shift?
           end
-          nil
-        },
-        [
-          EventType::RESOURCE_LOAD_START,
-          EventType::RESOURCE_LOAD_COMPLETE,
-          EventType::RESOURCE_LOAD_ERROR
-        ]
-      )
-      
-      # イベントリスナーをエンジンに登録
-      @engine.event_dispatcher.add_listener(frame_listener)
-      @engine.event_dispatcher.add_listener(network_listener)
+        end
+      end
     end
     
-    # バイト数を読みやすい形式にフォーマット
-    private def format_bytes(bytes : Int64) : String
-      if bytes < 1024
-        "#{bytes}B"
-      elsif bytes < 1024 * 1024
-        "#{(bytes / 1024.0).round(2)}KB"
-      elsif bytes < 1024 * 1024 * 1024
-        "#{(bytes / 1024.0 / 1024.0).round(2)}MB"
-      else
-        "#{(bytes / 1024.0 / 1024.0 / 1024.0).round(2)}GB"
+    # パフォーマンス分析
+    private def analyze_performance
+      analyze_render_performance
+      analyze_network_performance
+      analyze_memory_usage
+      analyze_js_performance
+      
+      # 総合分析
+      analyze_overall_performance
+    end
+    
+    # レンダリングパフォーマンス分析
+    private def analyze_render_performance
+      return if @render_metrics["fps"].empty?
+      
+      # 平均FPSの計算
+      avg_fps = calculate_average(@render_metrics["fps"]) rescue 0.0
+      
+      # ジャンク（フレームスキップ）の分析
+      jank_rate = calculate_average(@render_metrics["jank_count"]) rescue 0.0
+      
+      if avg_fps < 55.0
+        Log.warning { "レンダリングパフォーマンスが低下しています: #{avg_fps.round(1)} FPS" }
+        suggest_render_optimizations(avg_fps, jank_rate)
       end
+    end
+    
+    # ネットワークパフォーマンス分析
+    private def analyze_network_performance
+      return if @network_metrics["avg_latency"].empty?
+      
+      # 平均レイテンシの計算
+      avg_latency = calculate_average(@network_metrics["avg_latency"]) rescue 0.0
+      
+      if avg_latency > 150.0
+        Log.warning { "ネットワークレイテンシが高くなっています: #{avg_latency.round(0)}ms" }
+        suggest_network_optimizations(avg_latency)
+      end
+    end
+    
+    # メモリ使用分析
+    private def analyze_memory_usage
+      return if @memory_metrics["used_memory"].empty?
+      
+      # メモリ使用量の計算
+      memory_usage_mb = (calculate_average(@memory_metrics["used_memory"]) rescue 0.0) / (1024 * 1024)
+      
+      if memory_usage_mb > 300.0
+        Log.warning { "メモリ使用量が多くなっています: #{memory_usage_mb.round(1)} MB" }
+        suggest_memory_optimizations(memory_usage_mb)
+      end
+    end
+    
+    # JavaScript性能分析
+    private def analyze_js_performance
+      return if @js_metrics["js_execution_time"].empty?
+      
+      # JS実行時間の計算
+      js_exec_time = calculate_average(@js_metrics["js_execution_time"]) rescue 0.0
+      
+      if js_exec_time > 10.0
+        Log.warning { "JavaScript実行に時間がかかっています: #{js_exec_time.round(1)}ms" }
+        suggest_js_optimizations(js_exec_time)
+      end
+    end
+    
+    # 総合パフォーマンス分析
+    private def analyze_overall_performance
+      # 各指標を総合的に評価
+      fps = calculate_average(@render_metrics["fps"]) rescue 0.0
+      latency = calculate_average(@network_metrics["avg_latency"]) rescue 0.0
+      memory_mb = (calculate_average(@memory_metrics["used_memory"]) rescue 0.0) / (1024 * 1024)
+      js_time = calculate_average(@js_metrics["js_execution_time"]) rescue 0.0
+      
+      # 総合スコアの計算 (0-100)
+      fps_score = Math.min(100, fps * 100 / 60)
+      latency_score = Math.max(0, 100 - (latency / 3))
+      memory_score = Math.max(0, 100 - (memory_mb / 5))
+      js_score = Math.max(0, 100 - (js_time / 0.5))
+      
+      total_score = (fps_score + latency_score + memory_score + js_score) / 4
+      
+      Log.info { "総合パフォーマンススコア: #{total_score.round(1)}/100" }
+      
+      if total_score < 60
+        Log.warning { "全体的なパフォーマンスが低下しています。最適化が必要です。" }
+      elsif total_score > 90
+        Log.info { "パフォーマンスは最適な状態です。" }
+      end
+    end
+    
+    # レンダリング最適化提案
+    private def suggest_render_optimizations(fps : Float64, jank_rate : Float64)
+      suggestions = [] of String
+      
+      if fps < 30
+        suggestions << "描画処理をメインスレッドから分離してください"
+        suggestions << "レンダリングレイヤーのGPU使用率を確認してください"
+      end
+      
+      if jank_rate > 2
+        suggestions << "アニメーションの複雑さを削減してください"
+        suggestions << "不要なレイアウト再計算を避けてください"
+      end
+      
+      unless suggestions.empty?
+        Log.info { "レンダリング最適化提案:" }
+        suggestions.each { |s| Log.info { " - #{s}" } }
+      end
+    end
+    
+    # ネットワーク最適化提案
+    private def suggest_network_optimizations(latency : Float64)
+      suggestions = [] of String
+      
+      if latency > 300
+        suggestions << "接続プールの使用を検討してください"
+        suggestions << "HTTP/3 (QUIC) への切り替えを検討してください"
+      end
+      
+      if latency > 150
+        suggestions << "リソースのプリフェッチを実装してください"
+        suggestions << "圧縮レベルを最適化してください"
+      end
+      
+      unless suggestions.empty?
+        Log.info { "ネットワーク最適化提案:" }
+        suggestions.each { |s| Log.info { " - #{s}" } }
+      end
+    end
+    
+    # メモリ最適化提案
+    private def suggest_memory_optimizations(memory_mb : Float64)
+      suggestions = [] of String
+      
+      if memory_mb > 500
+        suggestions << "メモリリークの可能性を確認してください"
+        suggestions << "アイドル状態のタブのメモリを解放してください"
+      end
+      
+      if memory_mb > 300
+        suggestions << "オブジェクトプーリングの使用を検討してください"
+        suggestions << "画像キャッシュのサイズを制限してください"
+      end
+      
+      unless suggestions.empty?
+        Log.info { "メモリ最適化提案:" }
+        suggestions.each { |s| Log.info { " - #{s}" } }
+      end
+    end
+    
+    # JavaScript最適化提案
+    private def suggest_js_optimizations(exec_time : Float64)
+      suggestions = [] of String
+      
+      if exec_time > 20
+        suggestions << "重いJavaScript処理をWeb Workerに移動してください"
+        suggestions << "JITコンパイラの最適化を確認してください"
+      end
+      
+      if exec_time > 10
+        suggestions << "不要なDOMアクセスを削減してください"
+        suggestions << "イベントハンドラの効率を改善してください"
+      end
+      
+      unless suggestions.empty?
+        Log.info { "JavaScript最適化提案:" }
+        suggestions.each { |s| Log.info { " - #{s}" } }
+      end
+    end
+    
+    # 平均値計算ヘルパー
+    private def calculate_average(values : Deque(MetricValue)) : Float64
+      return 0.0 if values.empty?
+      
+      sum = values.sum { |v| v.to_f }
+      sum / values.size
+    end
+    
+    # 最終的なシャットダウン処理
+    def shutdown
+      stop
+      
+      # 最終レポートの出力
+      generate_final_report
+      
+      Log.info { "パフォーマンスモニターをシャットダウンしました" }
+    end
+    
+    # 最終レポート生成
+    private def generate_final_report
+      Log.info { "=== パフォーマンス最終レポート ===" }
+      
+      # レンダリング統計
+      avg_fps = calculate_average(@render_metrics["fps"]) rescue 0.0
+      Log.info { "平均FPS: #{avg_fps.round(1)}" }
+      
+      # ネットワーク統計
+      avg_latency = calculate_average(@network_metrics["avg_latency"]) rescue 0.0
+      Log.info { "平均レイテンシ: #{avg_latency.round(1)}ms" }
+      
+      # メモリ統計
+      avg_memory = (calculate_average(@memory_metrics["used_memory"]) rescue 0.0) / (1024 * 1024)
+      Log.info { "平均メモリ使用量: #{avg_memory.round(1)} MB" }
+      
+      # JavaScript統計
+      avg_js_time = calculate_average(@js_metrics["js_execution_time"]) rescue 0.0
+      Log.info { "平均JavaScript実行時間: #{avg_js_time.round(1)}ms" }
+      
+      Log.info { "===============================" }
+    end
+    
+    # 最新の指標取得
+    def get_latest_metrics : Hash(String, MetricValue)
+      result = Hash(String, MetricValue).new
+      
+      # 各カテゴリの最新値を取得
+      [@render_metrics, @network_metrics, @memory_metrics, @js_metrics].each do |metrics_hash|
+        metrics_hash.each do |key, values|
+          result[key] = values.last? || 0.0 unless values.empty?
+        end
+      end
+      
+      result
+    end
+    
+    # 期間指定での指標取得
+    def get_metrics_history(duration_seconds : Int32) : Hash(String, Array(MetricValue))
+      result = Hash(String, Array(MetricValue)).new { |h, k| h[k] = [] of MetricValue }
+      
+      # 指定期間分のデータポイント数
+      points = (duration_seconds * 1000) / COLLECTION_INTERVAL
+      
+      # 各カテゴリの履歴を取得
+      [@render_metrics, @network_metrics, @memory_metrics, @js_metrics].each do |metrics_hash|
+        metrics_hash.each do |key, values|
+          # 指定期間分の値だけを取得
+          result[key] = values.to_a.last(points)
+        end
+      end
+      
+      result
     end
   end
 end 

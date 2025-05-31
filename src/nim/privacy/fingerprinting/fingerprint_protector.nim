@@ -269,75 +269,127 @@ proc getProtectionStatus*(protector: FingerprintProtector): JsonNode =
 # 偽装値の生成
 #----------------------------------------
 
-proc getSpoofedUserAgent*(protector: FingerprintProtector, originalUA: string, mode: UserAgentMode = uamGeneric): string =
-  ## 偽装UserAgentを取得
-  if not protector.isVectorProtected(fvUserAgent):
-    return originalUA
-  
-  case mode
-  of uamReal:
-    return originalUA
-  
-  of uamGeneric:
-    # 一般的なUAから選択
-    let idx = if protector.consistentValues:
-                deterministicRandom(protector.sessionKey, 0, STANDARD_USER_AGENTS.high)
-              else:
-                rand(0..STANDARD_USER_AGENTS.high)
-    return STANDARD_USER_AGENTS[idx]
-  
-  of uamRandom:
-    # 完全にランダムなUA（実際の実装ではもっと現実的なUAを生成）
-    var browsers = ["Chrome", "Firefox", "Safari", "Edge"]
-    var os = ["Windows NT 10.0", "Macintosh; Intel Mac OS X 10_15_7", "X11; Linux x86_64"]
+proc getSpoofedUserAgent*(protector: FingerprintProtector, mode: UserAgentMode = uamGeneric): string =
+  ## 偽装されたUserAgentを取得
+  ##
+  ## Parameters:
+  ## - mode: UserAgent偽装モード
+  ##
+  ## Returns:
+  ## - 偽装されたUserAgent文字列
+
+  if mode == uamReal:
+    # 実際のUserAgentを使用
+    return ""  # 呼び出し元がデフォルトのUAを使用
+
+  if mode == uamGeneric:
+    # 一般的なユーザーエージェントを使用
+    return STANDARD_USER_AGENTS[0]
+
+  if mode == uamRandom:
+    # セッションベースの乱数を使用して、現実的なユーザーエージェントを生成
+    let platforms = @["Windows", "Macintosh", "Linux", "Android", "iPhone"]
+    let browsers = @["Chrome", "Firefox", "Safari", "Edge"]
+    let osVersions = {
+      "Windows": @["10.0", "11.0"],
+      "Macintosh": @["10_15_7", "11_0_1", "12_0_1", "13_0"],
+      "Linux": @["x86_64"],
+      "Android": @["10", "11", "12", "13"],
+      "iPhone": @["14_4", "15_0", "16_0", "17_0"]
+    }.toTable
+    let browserVersions = {
+      "Chrome": @["100.0.4896.127", "103.0.5060.134", "108.0.0.0", "110.0.0.0", "120.0.0.0"],
+      "Firefox": @["100.0", "108.0", "110.0", "115.0", "123.0"],
+      "Safari": @["14.0.3", "15.4", "16.0", "17.0", "17.2"],
+      "Edge": @["99.0.1150.55", "100.0.1185.50", "108.0.1462.76", "110.0.1587.69", "120.0.0.0"]
+    }.toTable
+
+    # セッションキーと現在の日付に基づいた一貫した選択（日付は定期的な変更用）
+    let today = getTime().local().format("yyyyMMdd")
+    let seed = if protector.consistentValues: protector.sessionKey & today else: $rand(1000000)
     
-    let browserIdx = if protector.consistentValues:
-                      deterministicRandom(protector.sessionKey, 0, browsers.high)
-                     else:
-                      rand(0..browsers.high)
+    # プラットフォームとブラウザの選択
+    let platformIdx = deterministicRandom(seed & "platform", 0, platforms.len - 1)
+    let platform = platforms[platformIdx]
     
-    let osIdx = if protector.consistentValues:
-                  deterministicRandom(protector.sessionKey & "os", 0, os.high)
-                else:
-                  rand(0..os.high)
+    var browserIdx = deterministicRandom(seed & "browser", 0, browsers.len - 1)
+    
+    # プラットフォームとブラウザの互換性チェック
+    if platform == "iPhone" and browsers[browserIdx] != "Safari":
+      browserIdx = browsers.find("Safari")
     
     let browser = browsers[browserIdx]
-    let platform = os[osIdx]
     
-    case browser
-    of "Chrome":
-      let version = if protector.consistentValues:
-                     deterministicRandom(protector.sessionKey & "v", 90, 120)
-                    else:
-                     rand(90..120)
-      return fmt"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36"
+    # OSバージョンとブラウザバージョンの選択
+    let osVersionIdx = deterministicRandom(seed & "os", 0, osVersions[platform].len - 1)
+    let osVersion = osVersions[platform][osVersionIdx]
     
-    of "Firefox":
-      let version = if protector.consistentValues:
-                      deterministicRandom(protector.sessionKey & "v", 90, 120)
-                    else:
-                      rand(90..120)
-      return fmt"Mozilla/5.0 ({platform}; rv:{version}.0) Gecko/20100101 Firefox/{version}.0"
+    let browserVersionIdx = deterministicRandom(seed & "browser_ver", 0, browserVersions[browser].len - 1)
+    let browserVersion = browserVersions[browser][browserVersionIdx]
     
-    of "Safari":
-      return fmt"Mozilla/5.0 ({platform}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+    # UserAgentの構築
+    case platform
+    of "Windows":
+      case browser
+      of "Chrome":
+        return fmt"Mozilla/5.0 (Windows NT {osVersion}; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Safari/537.36"
+      of "Firefox":
+        return fmt"Mozilla/5.0 (Windows NT {osVersion}; Win64; x64; rv:{browserVersion.split('.')[0]}) Gecko/20100101 Firefox/{browserVersion}"
+      of "Edge":
+        return fmt"Mozilla/5.0 (Windows NT {osVersion}; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Safari/537.36 Edg/{browserVersion}"
+      of "Safari":
+        # WindowsでのSafariは現実的ではないが、一応対応
+        return fmt"Mozilla/5.0 (Windows NT {osVersion}; Win64; x64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15"
+      else:
+        return STANDARD_USER_AGENTS[0]
     
-    of "Edge":
-      let version = if protector.consistentValues:
-                      deterministicRandom(protector.sessionKey & "v", 90, 120)
-                    else:
-                      rand(90..120)
-      return fmt"Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36 Edg/{version}.0.0.0"
+    of "Macintosh":
+      case browser
+      of "Chrome":
+        return fmt"Mozilla/5.0 (Macintosh; Intel Mac OS X {osVersion}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Safari/537.36"
+      of "Firefox":
+        return fmt"Mozilla/5.0 (Macintosh; Intel Mac OS X {osVersion}; rv:{browserVersion.split('.')[0]}) Gecko/20100101 Firefox/{browserVersion}"
+      of "Safari":
+        return fmt"Mozilla/5.0 (Macintosh; Intel Mac OS X {osVersion}) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{browserVersion.split('.')[0]}.{browserVersion.split('.')[1]} Safari/605.1.15"
+      of "Edge":
+        return fmt"Mozilla/5.0 (Macintosh; Intel Mac OS X {osVersion}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Safari/537.36 Edg/{browserVersion}"
+      else:
+        return STANDARD_USER_AGENTS[1]
+    
+    of "Linux":
+      case browser
+      of "Chrome":
+        return fmt"Mozilla/5.0 (X11; Linux {osVersion}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Safari/537.36"
+      of "Firefox":
+        return fmt"Mozilla/5.0 (X11; Linux {osVersion}; rv:{browserVersion.split('.')[0]}) Gecko/20100101 Firefox/{browserVersion}"
+      else:
+        return fmt"Mozilla/5.0 (X11; Linux {osVersion}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Safari/537.36"
+    
+    of "Android":
+      case browser
+      of "Chrome":
+        return fmt"Mozilla/5.0 (Linux; Android {osVersion}; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Mobile Safari/537.36"
+      of "Firefox":
+        return fmt"Mozilla/5.0 (Android {osVersion}; Mobile; rv:{browserVersion.split('.')[0]}) Gecko/{browserVersion.split('.')[0]}.0 Firefox/{browserVersion} KAIOS/2.5"
+      else:
+        return fmt"Mozilla/5.0 (Linux; Android {osVersion}; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{browserVersion} Mobile Safari/537.36"
+    
+    of "iPhone":
+      # iPhoneはSafariが主流
+      return fmt"Mozilla/5.0 (iPhone; CPU iPhone OS {osVersion.replace('_', '')} like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/{browserVersion.split('.')[0]}.0 Mobile/15E148 Safari/604.1"
     
     else:
-      return originalUA
-  
-  of uamRotating:
-    # 時間経過で変化するUA
-    let timeBase = (toUnix(getTime()) div 3600) # 1時間ごとに変更
-    let seed = $timeBase & protector.sessionKey
-    let idx = deterministicRandom(seed, 0, STANDARD_USER_AGENTS.high)
+      return STANDARD_USER_AGENTS[0]
+
+  if mode == uamRotating:
+    # 定期的に変更するUAの場合、日付を取得して日付ごとに異なるUAを返す
+    let today = getTime().local().format("yyyyMMdd")
+    let seed = protector.sessionKey & today
+    let idx = deterministicRandom(seed, 0, STANDARD_USER_AGENTS.len - 1)
     return STANDARD_USER_AGENTS[idx]
+  
+  # デフォルトでは一般的なUAを返す
+  return STANDARD_USER_AGENTS[0]
 
 proc getSpoofedScreenResolution*(protector: FingerprintProtector, originalWidth, originalHeight: int): tuple[width, height: int] =
   ## 偽装画面解像度を取得

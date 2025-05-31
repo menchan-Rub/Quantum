@@ -234,371 +234,301 @@ proc checkFlush(self: DiskCache) =
 
 proc calculateDiskUsage(self: DiskCache): int =
   ## ディスクキャッシュの現在の使用量を計算する
-  self.totalSize
+  result = 0
+  
+  let dataDir = self.config.cacheDir / "data"
+  if not dirExists(dataDir):
+    return 0
+  
+  # ディレクトリ内のすべてのファイルサイズを合計
+  for kind, path in walkDir(dataDir):
+    if kind == pcFile:
+      try:
+        result += getFileSize(path)
+      except:
+        discard  # ファイルにアクセスできなかった場合は無視
 
-proc has*(self: DiskCache, key: string): bool =
-  ## キャッシュにキーが存在し、有効期限内かを確認する
+proc cleanupOldEntries(self: var DiskCache, bytesToFree: int = 0) {.async.} =
+  ## 古いエントリをクリーンアップする
+  ## bytesToFreeが指定された場合、少なくともその容量を解放しようとする
   
-  # まずメモリキャッシュを確認
-  if self.memoryCache.has(key):
-    return true
-  
-  # ディスクキャッシュを確認
-  if not self.index.keys.hasKey(key):
-    return false
-  
-  let fileName = self.index.keys[key]
+  # 1. 有効期限切れのエントリーを削除
+  var expiredFiles: seq[string] = @[]
   let now = getTime()
   
-  # 期限切れかどうかを確認
-  if self.index.expires.hasKey(fileName) and now > self.index.expires[fileName]:
-    # 自動的に期限切れのエントリを削除
+  for fileName, expireTime in self.index.expires:
+    if expireTime <= now:
+      expiredFiles.add(fileName)
+  
+  var freedBytes = 0
+  for fileName in expiredFiles:
     let filePath = self.config.cacheDir / "data" / fileName
     if fileExists(filePath):
       try:
+        let fileSize = getFileSize(filePath)
         removeFile(filePath)
+        freedBytes += fileSize
+        
+        # インデックスから削除
+        for key, fn in self.index.keys:
+          if fn == fileName:
+            self.index.keys.del(key)
+            break
+        
+        self.index.metadata.del(fileName)
+        self.index.created.del(fileName)
+        self.index.expires.del(fileName)
+        self.index.accessed.del(fileName)
+        self.index.counts.del(fileName)
+        self.index.sizes.del(fileName)
+        
+        self.dirty = true
+        self.totalSize -= fileSize
       except:
-        discard
-    
-    # インデックスから削除
-    if self.index.sizes.hasKey(fileName):
-      self.totalSize -= self.index.sizes[fileName]
-      
-    self.index.keys.del(key)
-    self.index.metadata.del(fileName)
-    self.index.created.del(fileName)
-    self.index.expires.del(fileName)
-    self.index.accessed.del(fileName)
-    self.index.counts.del(fileName)
-    self.index.sizes.del(fileName)
-    
-    self.dirty = true
-    return false
+        echo "キャッシュファイルの削除に失敗しました: ", filePath
   
-  # ファイルが存在するか確認
-  let filePath = self.config.cacheDir / "data" / fileName
-  if not fileExists(filePath):
-    # インデックスから削除
-    self.index.keys.del(key)
-    if self.index.sizes.hasKey(fileName):
-      self.totalSize -= self.index.sizes[fileName]
-    
-    self.index.metadata.del(fileName)
-    self.index.created.del(fileName)
-    self.index.expires.del(fileName)
-    self.index.accessed.del(fileName)
-    self.index.counts.del(fileName)
-    self.index.sizes.del(fileName)
-    
-    self.dirty = true
-    return false
-  
-  return true
-
-proc updateAccessStats(self: DiskCache, fileName: string) =
-  ## アクセス統計を更新する
-  let now = getTime()
-  self.index.accessed[fileName] = now
-  
-  if self.index.counts.hasKey(fileName):
-    self.index.counts[fileName] = self.index.counts[fileName] + 1
-  else:
-    self.index.counts[fileName] = 1
-    
-  self.dirty = true
-
-proc get*(self: DiskCache, key: string): tuple[found: bool, content: string, metadata: CacheEntryMetadata] =
-  ## キャッシュからコンテンツを取得する
-  
-  # メモリキャッシュを確認
-  if self.memoryCache.has(key):
-    let content = self.memoryCache.get(key)
-    let metadata = self.memoryCache.getEntryMetadata(key)
-    self.hitCount += 1
-    return (found: true, content: content, metadata: metadata)
-  
-  # ディスクキャッシュを確認
-  if not self.has(key):
-    self.missCount += 1
-    return (found: false, content: "", metadata: CacheEntryMetadata())
-  
-  let fileName = self.index.keys[key]
-  let filePath = self.config.cacheDir / "data" / fileName
-  
-  try:
-    # ファイルからコンテンツを読み込む
-    let content = readFile(filePath)
-    
-    # アクセス統計を更新
-    self.updateAccessStats(fileName)
-    
-    # メモリキャッシュにも保存
-    var metadata = CacheEntryMetadata()
-    if self.index.metadata.hasKey(fileName):
-      metadata = self.index.metadata[fileName]
-    
-    var ttl = -1
-    if self.index.expires.hasKey(fileName):
-      let now = getTime()
-      let ttlSecs = (self.index.expires[fileName] - now).inSeconds
-      if ttlSecs > 0:
-        ttl = ttlSecs.int
-    
-    self.memoryCache.set(key, content, metadata, ttl)
-    
-    self.hitCount += 1
-    return (found: true, content: content, metadata: metadata)
-  except:
-    # ファイル読み込みに失敗した場合
-    self.index.keys.del(key)
-    if self.index.sizes.hasKey(fileName):
-      self.totalSize -= self.index.sizes[fileName]
-    
-    self.index.metadata.del(fileName)
-    self.index.created.del(fileName)
-    self.index.expires.del(fileName)
-    self.index.accessed.del(fileName)
-    self.index.counts.del(fileName)
-    self.index.sizes.del(fileName)
-    
-    self.dirty = true
-    self.missCount += 1
-    return (found: false, content: "", metadata: CacheEntryMetadata())
-
-proc get*(self: DiskCache, key: string, default: string): string =
-  ## キャッシュからコンテンツを取得する（簡易版）
-  let result = self.get(key)
-  if result.found:
-    return result.content
-  else:
-    return default
-
-proc pruneExpired(self: DiskCache): int =
-  ## 期限切れのエントリを削除する
-  let now = getTime()
-  var removed = 0
-  var filesToRemove: seq[string] = @[]
-  var keysToRemove: seq[string] = @[]
-  
-  # 期限切れのエントリを特定
-  for key, fileName in self.index.keys:
-    if self.index.expires.hasKey(fileName) and now > self.index.expires[fileName]:
-      filesToRemove.add(fileName)
-      keysToRemove.add(key)
-  
-  # ファイルを削除
-  for fileName in filesToRemove:
-    let filePath = self.config.cacheDir / "data" / fileName
-    if fileExists(filePath):
-      try:
-        removeFile(filePath)
-        removed += 1
-      except:
-        discard
-    
-    # サイズを更新
-    if self.index.sizes.hasKey(fileName):
-      self.totalSize -= self.index.sizes[fileName]
-    
-    # インデックスから削除
-    self.index.metadata.del(fileName)
-    self.index.created.del(fileName)
-    self.index.expires.del(fileName)
-    self.index.accessed.del(fileName)
-    self.index.counts.del(fileName)
-    self.index.sizes.del(fileName)
-  
-  # キーマッピングを削除
-  for key in keysToRemove:
-    self.index.keys.del(key)
-  
-  if removed > 0:
-    self.dirty = true
-    
-  return removed
-
-proc findFilesToEvict(self: DiskCache, requiredSpace: int): seq[string] =
-  ## 追い出すファイルを見つける
-  let maxSize = self.config.maxSizeMb * 1024 * 1024
-  var neededSpace = max(0, self.totalSize + requiredSpace - maxSize)
-  
-  if neededSpace <= 0:
-    return @[]
-  
-  # アクセス時間でソートされたエントリのリスト
-  var files: seq[tuple[fileName: string, accessed: Time]] = @[]
-  for fileName, accessTime in self.index.accessed:
-    files.add((fileName: fileName, accessed: accessTime))
-  
-  # 最も古いアクセス順にソート
-  files.sort(proc(x, y: tuple[fileName: string, accessed: Time]): int =
-    cmp(x.accessed, y.accessed))
-  
-  var result: seq[string] = @[]
-  var freedSpace = 0
-  
-  for file in files:
-    if self.index.sizes.hasKey(file.fileName):
-      let fileSize = self.index.sizes[file.fileName]
-      result.add(file.fileName)
-      freedSpace += fileSize
-      
-      if freedSpace >= neededSpace:
-        break
-  
-  return result
-
-proc evictEntries(self: DiskCache, filesToEvict: seq[string]): int =
-  ## エントリを追い出す
-  var removed = 0
-  var keysToRemove: seq[string] = @[]
-  
-  # 削除するキーを特定
-  for key, fileName in self.index.keys:
-    if filesToEvict.contains(fileName):
-      keysToRemove.add(key)
-  
-  # ファイルを削除
-  for fileName in filesToEvict:
-    let filePath = self.config.cacheDir / "data" / fileName
-    if fileExists(filePath):
-      try:
-        removeFile(filePath)
-        removed += 1
-        self.evictionCount += 1
-      except:
-        discard
-    
-    # サイズを更新
-    if self.index.sizes.hasKey(fileName):
-      self.totalSize -= self.index.sizes[fileName]
-    
-    # インデックスから削除
-    self.index.metadata.del(fileName)
-    self.index.created.del(fileName)
-    self.index.expires.del(fileName)
-    self.index.accessed.del(fileName)
-    self.index.counts.del(fileName)
-    self.index.sizes.del(fileName)
-  
-  # キーマッピングを削除
-  for key in keysToRemove:
-    self.index.keys.del(key)
-  
-  if removed > 0:
-    self.dirty = true
-    
-  return removed
-
-proc set*(self: DiskCache, key: string, content: string, metadata: CacheEntryMetadata = CacheEntryMetadata(), ttl: int = -1) =
-  ## コンテンツをキャッシュに保存する
-  let now = getTime()
-  let contentSize = content.len
-  
-  # キャッシュサイズをチェック
-  if contentSize > self.config.maxSizeMb * 1024 * 1024:
-    # サイズが大きすぎる場合は保存しない
+  # 有効期限切れの削除だけで十分な空き容量が確保できた場合は終了
+  if freedBytes >= bytesToFree:
+    self.checkFlush()
     return
   
-  # メモリキャッシュに保存
-  self.memoryCache.set(key, content, metadata, ttl)
+  # 2. 十分な容量が確保できなかった場合、アクセス頻度・時間に基づいて追加で削除
+  let stillNeeded = bytesToFree - freedBytes
+  if stillNeeded <= 0:
+    return
   
-  # ファイル名を生成
+  # ファイル名、アクセス回数、最終アクセス時間、サイズのタプルのリストを作成
+  var fileScores: seq[tuple[fileName: string, score: float, size: int]] = @[]
+  
+  for fileName, accessCount in self.index.counts:
+    if not self.index.accessed.hasKey(fileName) or not self.index.sizes.hasKey(fileName):
+      continue
+    
+    let lastAccess = self.index.accessed[fileName]
+    let size = self.index.sizes[fileName]
+    
+    # スコア計算: アクセス数が少なく、最終アクセスが古いほど高スコア（削除優先度が高い）
+    let ageScore = (now - lastAccess).inSeconds.float / 86400.0  # 日数
+    let countScore = 1.0 / max(1, accessCount).float
+    let score = (ageScore * 0.7) + (countScore * 0.3)  # 日数70%、アクセス回数30%で重み付け
+    
+    fileScores.add((fileName, score, size))
+  
+  # スコアの高い順（削除優先度の高い順）にソート
+  fileScores.sort(proc(a, b: tuple[fileName: string, score: float, size: int]): int =
+    result = cmp(b.score, a.score)  # 降順
+  )
+  
+  # 必要な容量を確保するまで削除
+  var additionalFreed = 0
+  for entry in fileScores:
+    if additionalFreed >= stillNeeded:
+      break
+    
+    let filePath = self.config.cacheDir / "data" / entry.fileName
+    if fileExists(filePath):
+      try:
+        removeFile(filePath)
+        additionalFreed += entry.size
+        
+        # インデックスから削除
+        for key, fn in self.index.keys:
+          if fn == entry.fileName:
+            self.index.keys.del(key)
+            break
+        
+        self.index.metadata.del(entry.fileName)
+        self.index.created.del(entry.fileName)
+        self.index.expires.del(entry.fileName)
+        self.index.accessed.del(entry.fileName)
+        self.index.counts.del(entry.fileName)
+        self.index.sizes.del(entry.fileName)
+        
+        self.dirty = true
+        self.totalSize -= entry.size
+        self.evictionCount += 1
+      except:
+        echo "キャッシュファイルの削除に失敗しました: ", filePath
+  
+  self.checkFlush()
+
+proc ensureSpace(self: var DiskCache, requiredBytes: int): Future[bool] {.async.} =
+  ## キャッシュに指定されたバイト数の空き容量を確保する
+  
+  # 現在の使用量を再計算
+  self.totalSize = self.calculateDiskUsage()
+  
+  # 最大キャッシュサイズ（バイト）
+  let maxBytes = self.config.maxSizeMb * 1024 * 1024
+  
+  # 現在の使用量 + 必要なバイト数が最大サイズ以下なら追加の操作は不要
+  if self.totalSize + requiredBytes <= maxBytes:
+    return true
+  
+  # 確保する必要のある容量
+  let bytesToFree = (self.totalSize + requiredBytes) - maxBytes
+  if bytesToFree <= 0:
+    return true
+  
+  # 古いエントリーをクリーンアップ
+  await self.cleanupOldEntries(bytesToFree)
+  
+  # 再度容量を確認
+  return (self.totalSize + requiredBytes) <= maxBytes
+
+proc put*(self: var DiskCache, key: string, data: string, metadata: CacheEntryMetadata): Future[bool] {.async.} =
+  ## キャッシュにデータを保存する
+  
   let fileName = generateFileName(key)
   let filePath = self.config.cacheDir / "data" / fileName
+  let dataSize = data.len
   
-  # 期限切れのエントリをクリーンアップ
-  discard self.pruneExpired()
-  
-  # スペースを確保
-  let filesToEvict = self.findFilesToEvict(contentSize)
-  discard self.evictEntries(filesToEvict)
-  
-
-  let actualTtl = if ttl < 0: self.config.defaultTtlSeconds else: ttl
-  
-  try:
-    # ファイルに書き込む
-    writeFile(filePath, content)
+  # 古いエントリが存在する場合は削除
+  if self.index.keys.hasKey(key):
+    let oldFileName = self.index.keys[key]
+    let oldFilePath = self.config.cacheDir / "data" / oldFileName
     
-    # 既存のエントリを更新
-    if self.index.keys.hasKey(key):
-      let oldFileName = self.index.keys[key]
-      if oldFileName != fileName and fileExists(self.config.cacheDir / "data" / oldFileName):
-        try:
-          removeFile(self.config.cacheDir / "data" / oldFileName)
-        except:
-          discard
-      
-      # 古いサイズを引く
-      if self.index.sizes.hasKey(oldFileName):
-        self.totalSize -= self.index.sizes[oldFileName]
-      
-      # 古いエントリの関連情報を削除
-      self.index.metadata.del(oldFileName)
-      self.index.created.del(oldFileName)
-      self.index.expires.del(oldFileName)
-      self.index.accessed.del(oldFileName)
-      self.index.counts.del(oldFileName)
-      self.index.sizes.del(oldFileName)
+    try:
+      if fileExists(oldFilePath):
+        let oldSize = getFileSize(oldFilePath)
+        removeFile(oldFilePath)
+        self.totalSize -= oldSize
+    except:
+      echo "古いキャッシュファイルの削除に失敗しました: ", oldFilePath
+  
+  # 十分な空き容量を確保
+  if not await self.ensureSpace(dataSize):
+    return false
+  
+  # メモリキャッシュにも保存
+  self.memoryCache.put(key, data, metadata)
+  
+  # ディスクに保存
+  try:
+    writeFile(filePath, data)
     
     # インデックスを更新
     self.index.keys[key] = fileName
     self.index.metadata[fileName] = metadata
-    self.index.created[fileName] = now
-    self.index.expires[fileName] = now + initDuration(seconds = actualTtl)
-    self.index.accessed[fileName] = now
-    self.index.counts[fileName] = 0
-    self.index.sizes[fileName] = contentSize
+    self.index.created[fileName] = getTime()
+    self.index.expires[fileName] = metadata.expires
+    self.index.accessed[fileName] = getTime()
+    self.index.counts[fileName] = 1
+    self.index.sizes[fileName] = dataSize
     
-    # 合計サイズを更新
-    self.totalSize += contentSize
-    
+    self.totalSize += dataSize
     self.dirty = true
     self.checkFlush()
+    
+    return true
   except:
-    echo "キャッシュへの書き込みに失敗しました: ", getCurrentExceptionMsg()
-
-proc set*(self: DiskCache, key: string, content: string, ttl: int = -1) =
-  ## コンテンツをキャッシュに保存する（簡易版）
-  let metadata = CacheEntryMetadata()
-  self.set(key, content, metadata, ttl)
-
-proc remove*(self: DiskCache, key: string): bool =
-  ## キャッシュからエントリを削除する
-  if not self.index.keys.hasKey(key):
+    echo "キャッシュファイルの書き込みに失敗しました: ", filePath
     return false
+
+proc get*(self: var DiskCache, key: string): Future[Option[tuple[data: string, metadata: CacheEntryMetadata]]] {.async.} =
+  ## キャッシュからデータを取得する
   
-  # メモリキャッシュから削除
-  discard self.memoryCache.remove(key)
+  # まずメモリキャッシュを確認
+  let memResult = self.memoryCache.get(key)
+  if memResult.isSome:
+    self.hitCount += 1
+    return memResult
+  
+  # ディスクキャッシュを確認
+  if not self.index.keys.hasKey(key):
+    self.missCount += 1
+    return none(tuple[data: string, metadata: CacheEntryMetadata])
   
   let fileName = self.index.keys[key]
   let filePath = self.config.cacheDir / "data" / fileName
   
-  # ファイルを削除
-  if fileExists(filePath):
-    try:
-      removeFile(filePath)
-    except:
-      discard
-  
-  # サイズを更新
-  if self.index.sizes.hasKey(fileName):
-    self.totalSize -= self.index.sizes[fileName]
-  
-  # インデックスから削除
-  self.index.keys.del(key)
-  self.index.metadata.del(fileName)
-  self.index.created.del(fileName)
-  self.index.expires.del(fileName)
-  self.index.accessed.del(fileName)
-  self.index.counts.del(fileName)
-  self.index.sizes.del(fileName)
-  
-  self.dirty = true
-  return true
+  try:
+    if not fileExists(filePath):
+      # ファイルが存在しない場合はインデックスから削除
+      self.index.keys.del(key)
+      self.index.metadata.del(fileName)
+      self.index.created.del(fileName)
+      self.index.expires.del(fileName)
+      self.index.accessed.del(fileName)
+      self.index.counts.del(fileName)
+      self.index.sizes.del(fileName)
+      
+      self.dirty = true
+      self.missCount += 1
+      return none(tuple[data: string, metadata: CacheEntryMetadata])
+    
+    # メタデータが存在しない場合
+    if not self.index.metadata.hasKey(fileName):
+      self.missCount += 1
+      return none(tuple[data: string, metadata: CacheEntryMetadata])
+    
+    # 有効期限をチェック
+    if self.index.expires.hasKey(fileName) and getTime() > self.index.expires[fileName]:
+      # 有効期限切れの場合はクリーンアップ対象としてマーク
+      asyncCheck self.cleanupOldEntries()
+      self.missCount += 1
+      return none(tuple[data: string, metadata: CacheEntryMetadata])
+    
+    # ファイルからデータを読み込む
+    let data = readFile(filePath)
+    let metadata = self.index.metadata[fileName]
+    
+    # アクセス統計を更新
+    self.index.accessed[fileName] = getTime()
+    if self.index.counts.hasKey(fileName):
+      self.index.counts[fileName] += 1
+    else:
+      self.index.counts[fileName] = 1
+    
+    self.dirty = true
+    self.hitCount += 1
+    
+    # メモリキャッシュに追加（次回のアクセスを高速化）
+    self.memoryCache.put(key, data, metadata)
+    
+    return some((data, metadata))
+  except:
+    echo "キャッシュファイルの読み込みに失敗しました: ", filePath
+    self.missCount += 1
+    return none(tuple[data: string, metadata: CacheEntryMetadata])
 
-proc clear*(self: DiskCache) =
+proc delete*(self: var DiskCache, key: string): Future[bool] {.async.} =
+  ## キャッシュからエントリを削除する
+  
+  # メモリキャッシュから削除
+  discard self.memoryCache.delete(key)
+  
+  # ディスクキャッシュから削除
+  if not self.index.keys.hasKey(key):
+    return false
+  
+  let fileName = self.index.keys[key]
+  let filePath = self.config.cacheDir / "data" / fileName
+  
+  try:
+    if fileExists(filePath):
+      let fileSize = getFileSize(filePath)
+      removeFile(filePath)
+      self.totalSize -= fileSize
+    
+    # インデックスから削除
+    self.index.keys.del(key)
+    self.index.metadata.del(fileName)
+    self.index.created.del(fileName)
+    self.index.expires.del(fileName)
+    self.index.accessed.del(fileName)
+    self.index.counts.del(fileName)
+    self.index.sizes.del(fileName)
+    
+    self.dirty = true
+    self.checkFlush()
+    
+    return true
+  except:
+    echo "キャッシュファイルの削除に失敗しました: ", filePath
+    return false
+
+proc clear*(self: var DiskCache): Future[void] {.async.} =
   ## キャッシュを完全にクリアする
   
   # メモリキャッシュをクリア
@@ -606,107 +536,118 @@ proc clear*(self: DiskCache) =
   
   # ディスクキャッシュをクリア
   let dataDir = self.config.cacheDir / "data"
-  try:
-    for file in walkFiles(dataDir / "*"):
-      removeFile(file)
-  except:
-    echo "キャッシュディレクトリのクリアに失敗しました: ", getCurrentExceptionMsg()
+  if dirExists(dataDir):
+    try:
+      # すべてのファイルを削除
+      for kind, path in walkDir(dataDir):
+        if kind == pcFile:
+          removeFile(path)
+      
+      # ディレクトリを再作成（空の状態に）
+      removeDir(dataDir)
+      createDir(dataDir)
+    except:
+      echo "キャッシュディレクトリのクリアに失敗しました: ", dataDir
   
-  # インデックスをクリア
-  self.index.keys.clear()
-  self.index.metadata.clear()
-  self.index.created.clear()
-  self.index.expires.clear()
-  self.index.accessed.clear()
-  self.index.counts.clear()
-  self.index.sizes.clear()
+  # インデックスをリセット
+  self.index = CacheIndex(
+    keys: initTable[string, string](),
+    metadata: initTable[string, CacheEntryMetadata](),
+    created: initTable[string, Time](),
+    expires: initTable[string, Time](),
+    accessed: initTable[string, Time](),
+    counts: initTable[string, int](),
+    sizes: initTable[string, int]()
+  )
   
   self.totalSize = 0
   self.dirty = true
-  self.saveIndex()  # 即座に保存
+  self.saveIndex()
 
-proc getStats*(self: DiskCache): tuple[entries: int, size: int, utilization: float, hitCount: int, missCount: int, hitRatio: float] =
-  ## キャッシュの統計情報を取得する
-  let maxSize = self.config.maxSizeMb * 1024 * 1024
-  let utilization = if maxSize > 0: self.totalSize.float / maxSize.float * 100.0 else: 0.0
-  let total = self.hitCount + self.missCount
-  let hitRatio = if total > 0: self.hitCount.float / total.float * 100.0 else: 0.0
+proc vacuum*(self: var DiskCache): Future[int] {.async.} =
+  ## 未使用のファイルを削除し、キャッシュをコンパクトにする
+  ## 解放されたバイト数を返す
   
-  return (
-    entries: self.index.keys.len,
-    size: self.totalSize,
-    utilization: utilization,
-    hitCount: self.hitCount,
-    missCount: self.missCount,
-    hitRatio: hitRatio
-  )
-
-proc getMemoryStats*(self: DiskCache): tuple[entries: int, size: int, utilization: float, hitCount: int, missCount: int, hitRatio: float] =
-  ## メモリキャッシュの統計情報を取得する
-  return self.memoryCache.getStats()
-
-proc close*(self: DiskCache) =
-  ## キャッシュを閉じる
-  if self.dirty:
-    self.saveIndex()
-
-proc getMetadata*(self: DiskCache, key: string): CacheEntryMetadata =
-  ## エントリのメタデータを取得する
-  if self.memoryCache.has(key):
-    return self.memoryCache.getEntryMetadata(key)
+  var freedBytes = 0
   
-  if not self.has(key):
-    return CacheEntryMetadata()
+  # 1. 有効なファイル名のセットを作成
+  var validFiles = initHashSet[string]()
+  for _, fileName in self.index.keys:
+    validFiles.incl(fileName)
   
-  let fileName = self.index.keys[key]
-  if self.index.metadata.hasKey(fileName):
-    return self.index.metadata[fileName]
+  # 2. ディスク上の実際のファイルをスキャン
+  let dataDir = self.config.cacheDir / "data"
+  if dirExists(dataDir):
+    for kind, path in walkDir(dataDir):
+      if kind == pcFile:
+        let fileName = extractFilename(path)
+        
+        # インデックスに存在しないファイルを削除
+        if not validFiles.contains(fileName):
+          try:
+            let fileSize = getFileSize(path)
+            removeFile(path)
+            freedBytes += fileSize
+          except:
+            echo "不要なキャッシュファイルの削除に失敗しました: ", path
   
-  return CacheEntryMetadata()
-
-proc touchEntry*(self: DiskCache, key: string): bool =
-  ## エントリのアクセス時間を更新する
-  if self.memoryCache.has(key):
-    discard self.memoryCache.touchEntry(key)
+  # 3. インデックスのインテグリティチェック
+  var orphanedEntries: seq[string] = @[]
   
-  if not self.index.keys.hasKey(key):
-    return false
+  for key, fileName in self.index.keys:
+    let filePath = self.config.cacheDir / "data" / fileName
+    if not fileExists(filePath):
+      orphanedEntries.add(key)
   
-  let fileName = self.index.keys[key]
-  self.updateAccessStats(fileName)
-  return true
-
-proc updateExpiration*(self: DiskCache, key: string, ttl: int): bool =
-  ## エントリの有効期限を更新する
-  if self.memoryCache.has(key):
-    discard self.memoryCache.updateExpiration(key, ttl)
+  # 存在しないファイルの参照をインデックスから削除
+  for key in orphanedEntries:
+    let fileName = self.index.keys[key]
+    self.index.keys.del(key)
+    self.index.metadata.del(fileName)
+    self.index.created.del(fileName)
+    self.index.expires.del(fileName)
+    self.index.accessed.del(fileName)
+    self.index.counts.del(fileName)
+    self.index.sizes.del(fileName)
+    
+    self.dirty = true
   
-  if not self.index.keys.hasKey(key):
-    return false
+  # 4. ファイルサイズの再計算
+  self.totalSize = self.calculateDiskUsage()
   
-  let fileName = self.index.keys[key]
-  let now = getTime()
-  self.index.expires[fileName] = now + initDuration(seconds = ttl)
-  
-  self.dirty = true
-  return true
-
-proc optimize*(self: DiskCache) {.async.} =
-  ## キャッシュを最適化する（バックグラウンドで実行）
-  ## - 期限切れのエントリを削除
-  ## - 断片化を解消
-  ## - インデックスを保存
-  
-  # 期限切れのエントリを削除
-  discard self.pruneExpired()
-  
-  # ディスクの断片化を解消
-  var oldSize = self.totalSize
-  
-  # インデックスを保存
+  # 5. インデックスの保存
   self.saveIndex()
   
-  echo "キャッシュ最適化完了: ", oldSize - self.totalSize, " バイト削減"
+  return freedBytes
+
+proc optimize*(self: var DiskCache): Future[void] {.async.} =
+  ## キャッシュを最適化する
+  ## - 未使用ファイルの削除
+  ## - 有効期限切れエントリの削除
+  ## - インデックスの整合性確保
+  ## - ディスク使用量の最適化
+  
+  # 1. 未使用のファイルを削除
+  discard await self.vacuum()
+  
+  # 2. 有効期限切れのエントリを削除
+  await self.cleanupOldEntries()
+  
+  # 3. メモリキャッシュの最適化
+  self.memoryCache.optimize()
+  
+  # 4. ディスク容量が上限に近い場合、追加の削除を実行
+  let maxBytes = self.config.maxSizeMb * 1024 * 1024
+  let usageRatio = self.totalSize.float / maxBytes.float
+  
+  if usageRatio > 0.9:  # 90%以上使用している場合
+    # 20%の容量を確保するように削除
+    let bytesToFree = (self.totalSize - (maxBytes * 0.8).int)
+    if bytesToFree > 0:
+      await self.cleanupOldEntries(bytesToFree)
+  
+  # 5. インデックスの最終保存
+  self.saveIndex()
 
 when isMainModule:
   # テスト用のメイン関数
@@ -749,10 +690,10 @@ when isMainModule:
     echo "キャッシュからデータを取得中..."
     
     let result1 = cache.get("key1")
-    echo "key1: ", if result1.found: result1.content else: "<見つかりません>"
+    echo "key1: ", if result1.isSome: result1.get().data else: "<見つかりません>"
     
     let result2 = cache.get("key2")
-    echo "key2: ", if result2.found: result2.content else: "<見つかりません>"
+    echo "key2: ", if result2.isSome: result2.get().data else: "<見つかりません>"
     
     # 簡易版のget
     echo "key3: ", cache.get("key3", "<見つかりません>")
@@ -777,7 +718,7 @@ when isMainModule:
     
     # エントリの削除
     echo "キャッシュからkey2を削除中..."
-    discard cache.remove("key2")
+    discard cache.delete("key2")
     
     # キャッシュの内容を確認
     echo "key1存在: ", cache.has("key1")

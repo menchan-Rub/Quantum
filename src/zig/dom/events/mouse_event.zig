@@ -102,13 +102,57 @@ pub const MouseEvent = struct {
 
     // getModifierState は base (UIEvent) に移譲
 
-    // TODO: initMouseEvent メソッド
+    /// MouseEvent を初期化します。
+    /// 歴史的なメソッドですが、後方互換性のために実装されています。
+    pub fn initMouseEvent(
+        self: *MouseEvent,
+        event_type: []const u8,
+        can_bubble: bool,
+        cancelable: bool,
+        view: ?*anyopaque,
+        detail: i32,
+        screen_x: f64,
+        screen_y: f64,
+        client_x: f64,
+        client_y: f64,
+        ctrl_key: bool,
+        alt_key: bool,
+        shift_key: bool,
+        meta_key: bool,
+        button: i16,
+        related_target: ?*EventTarget,
+    ) void {
+        // UIEvent.initUIEvent の初期化相当部分
+        self.base.base.type = event_type;
+        self.base.base.bubbles = can_bubble;
+        self.base.base.cancelable = cancelable;
+        self.base.view = view;
+        self.base.detail = detail;
+
+        // モディファイアキーの設定
+        self.base.ctrlKey = ctrl_key;
+        self.base.altKey = alt_key;
+        self.base.shiftKey = shift_key;
+        self.base.metaKey = meta_key;
+
+        // MouseEvent固有のプロパティを設定
+        self.screenX = screen_x;
+        self.screenY = screen_y;
+        self.clientX = client_x;
+        self.clientY = client_y;
+        self.button = button;
+        self.buttons = if (button >= 0 and button <= 2) @as(u16, 1) << @intCast(button) else 0;
+        self.relatedTarget = related_target;
+
+        // イベントが初期化されたことを示す
+        self.base.base.initialized = true;
+    }
 };
 
 // テスト (修正)
 test "MouseEvent creation" {
     const allocator = std.testing.allocator;
-    const init = MouseEventInit {
+    const init = MouseEventInit{
         .bubbles = true,
         .cancelable = true,
         .clientX = 100.5,
@@ -139,4 +183,4 @@ test "MouseEvent creation" {
     // getModifierState (UIEvent のメソッドを使う)
     try std.testing.expect(event.base.getModifierState("Control"));
     try std.testing.expect(!event.base.getModifierState("Shift"));
-} 
+}

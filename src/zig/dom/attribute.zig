@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const mem = @import("../memory/allocator.zig"); // Global allocator
-const errors = @import("../util/error.zig");   // Common errors
+const errors = @import("../util/error.zig"); // Common errors
 const validation = @import("../util/validation.zig"); // Validation functions
 
 // Forward declaration needed for owner_element
@@ -40,7 +40,7 @@ pub const Attribute = struct {
         // 属性名を検証
         try validation.validateName(local_name);
         if (prefix) |p| {
-             try validation.validateName(p);
+            try validation.validateName(p);
         }
 
         const attr = try allocator.create(Attribute);
@@ -86,16 +86,45 @@ pub const Attribute = struct {
     // value 文字列の所有権管理に注意。
     // 通常は Element.setAttribute() 経由で変更されるべき。
     pub fn setValue(self: *Attribute, allocator: std.mem.Allocator, new_value: []const u8) void {
-        // TODO: 属性値の変更を通知するメカニズム (例: MutationObserver)
-        //      この属性が要素に接続されている場合、関連する要素に変更イベントを発火させる必要がある。
-        //      例: self.owner_element.?.dispatchAttributeChanged(self.local_name, self.value, new_value);
+        const old_value = self.value;
+
+        // 属性値の変更を通知するメカニズム
+        if (self.owner_element) |owner| {
+            // 変更前の値を保存
+            if (owner.node.owner_document) |doc| {
+                if (doc.hasMutationObservers()) {
+                    // 古い値を保存する前に、MutationRecordを作成
+                    const MutationRecord = @import("./mutations/mutation_record.zig").MutationRecord;
+                    const MutationType = @import("./mutations/mutation_record.zig").MutationType;
+
+                    var record = MutationRecord.create(allocator, .attributes, &owner.node) catch |err| {
+                        std.log.err("Failed to create MutationRecord for attribute change: {}", .{err});
+                        return;
+                    };
+
+                    // 属性に関する情報を設定
+                    record.attributeName = allocator.dupe(u8, self.local_name) catch null;
+                    record.attributeNamespace = if (self.namespace_uri) |ns|
+                        allocator.dupe(u8, ns) catch null
+                    else
+                        null;
+                    record.oldValue = allocator.dupe(u8, old_value) catch null;
+
+                    // ドキュメントのキューに追加
+                    doc.queueMutationRecord(record) catch {
+                        // キューイングに失敗した場合、リソースを解放
+                        record.destroy();
+                    };
+                }
+            }
+        }
 
         // 古い value 文字列を解放 (この属性が所有権を持っていたと仮定)
         // 新しい値は呼び出し元が所有権を持っているか、ここで dupe されたものを受け取る。
         // ここでは渡されたスライスをそのまま保持する (所有権は移譲されたとみなす)。
         // 注意: Element.setAttribute などで呼び出される場合、新しい値は Element が所有権を持つべき。
         //       単純なプロパティアクセスとして使う場合は注意が必要。
-        allocator.free(self.value); // 解放する前に所有権を確認する必要があるかもしれない
+        allocator.free(old_value); // 解放する前に所有権を確認する必要があるかもしれない
         self.value = new_value;
     }
 
@@ -194,4 +223,4 @@ test "Attribute matches" {
     try std.testing.expect(attr_html.matchesHTML("CLASS"));
     try std.testing.expect(!attr_html.matchesHTML("id"));
     try std.testing.expect(!attr_ns.matchesHTML("myAttr"));
-} 
+}

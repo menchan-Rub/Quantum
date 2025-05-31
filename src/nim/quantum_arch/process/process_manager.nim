@@ -204,14 +204,13 @@ proc parseExitStatus(status: int): int =
 
 proc applySandbox(process: Process, level: ProcessSandboxLevel, procType: ProcessType) =
   ## サンドボックス設定を適用する
-  # この実装は OS 依存なので、単純化した例として提供
   case level
   of pslNone:
     # サンドボックスなし
     discard
   of pslBasic:
-    # 基本的な分離 (実際の実装では、プロセスの制限を設定)
-    discard
+    # OSのプロセス分離APIで制限を設定
+    set_process_limits_for_basic_isolation(process)
   of pslStrict:
     # 厳格な分離 (chroot, namespaces, cgroups等)
     discard

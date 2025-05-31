@@ -248,7 +248,59 @@ module QuantumCore::CSS
     if m = /\A(\d+(?:\.\d+)?)(px)?\z/.match(str)
       m[1].to_f64
     else
+      # Log.warn "CSS: Cannot parse as px: #{str}"
       nil
+    end
+  end
+
+  # --- ラインボックス ---
+  # インラインレベルの要素を行の中に配置・管理するためのクラス
+  class LineBox
+    getter children : Array(::QuantumCore::DOM::Node) # このラインに含まれるDOMノード（インライン要素、テキストノードなど）
+    getter x : Float64       # ラインボックスの開始X座標 (親要素のコンテントエリア基準)
+    getter y : Float64       # ラインボックスの開始Y座標 (親要素のコンテントエリア基準)
+    getter width : Float64     # 現在のラインの幅
+    getter height : Float64    # 現在のラインの高さ (含まれる要素の最大高に基づく)
+    property max_width : Float64 # このラインボックスが取りうる最大の幅 (親コンテナの幅)
+
+    def initialize(@x : Float64, @y : Float64, @max_width : Float64)
+      @children = [] of ::QuantumCore::DOM::Node
+      @width = 0.0
+      @height = 0.0 # 初期高さは0。要素が追加されると更新される
+    end
+
+    # ラインに要素を追加できるか試行
+    # @param element_width [Float64] 追加しようとする要素の幅
+    # @return [Bool] 追加可能ならtrue
+    def can_add?(element_width : Float64) : Bool
+      # 既に要素があり、スペースがない場合は追加不可
+      # (最初の要素は必ず追加できるように、widthが0の場合は常にtrue)
+      @width == 0.0 || (@width + element_width <= @max_width)
+    end
+
+    # ラインに要素を追加
+    # @param node [::QuantumCore::DOM::Node] 追加するDOMノード
+    # @param element_layout [CSS::LayoutData] 追加する要素のレイアウト情報
+    def add_element(node : ::QuantumCore::DOM::Node, element_layout : CSS::LayoutData)
+      @children << node
+      
+      # 要素の実際のX座標は、このLineBoxの開始X座標 + LineBox内での現在の幅オフセット
+      element_layout.x = @x + @width
+      # 要素のY座標はこのLineBoxのY座標に合わせる (ベースライン調整は別途必要)
+      element_layout.y = @y 
+
+      @width += element_layout.width # 要素の幅を加算
+      @height = Math.max(@height, element_layout.height) # ラインの高さを更新
+    end
+
+    # ラインがいっぱいかどうか
+    def full? : Bool
+      @width >= @max_width && @width > 0 # 幅が0の場合はfullとしない
+    end
+
+    # ラインが空かどうか
+    def empty? : Bool
+      @children.empty?
     end
   end
 end 

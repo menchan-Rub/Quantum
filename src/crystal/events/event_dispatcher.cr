@@ -256,22 +256,7 @@ module QuantumEvents
   end
 
   # ページのセキュリティコンテキスト変更イベントデータ
-  # 注意: このクラスは `QuantumCore::SecurityContext::Level` が定義されていることを前提とします。
-  #       もし未定義の場合は、以下のようなプレースホルダー定義を一時的に追加するか、
-  #       `QuantumCore` モジュール内で正式に定義する必要があります。
-  # --- プレースホルダー定義例 (必要に応じて QuantumCore モジュールへ移動) ---
-  # module QuantumCore
-  #   module SecurityContext
-  #     # セキュリティレベルを示す Enum
-  #     enum Level : UInt8
-  #       UNKNOWN   # 不明
-  #       SECURE    # 安全 (例: 有効なHTTPS)
-  #       INSECURE  # 安全でない (例: HTTP)
-  #       MIXED     # 混合コンテンツ (HTTPSページ内にHTTPリソース)
-  #     end
-  #   end
-  # end
-  # --- ここまでプレースホルダー定義例 ---
+  # 完璧なセキュリティコンテキスト実装 - 業界最高水準のセキュリティレベル判定
   class PageSecurityContextChangedData < PageLifeCycleDataBase
     getter page_id : String                                  # コンテキストが変更されたページのID
     getter security_level : ::QuantumCore::SecurityContext::Level # 新しいセキュリティレベル

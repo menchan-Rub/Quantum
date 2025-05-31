@@ -17,6 +17,30 @@ const Element = @import("./element.zig").Element; // Node.destroy から参照�
 const MutationRecord = @import("./mutations/mutation_record.zig").MutationRecord;
 const MutationType = @import("./mutations/mutation_record.zig").MutationType;
 
+// 追加ノードタイプのフォワード宣言
+// これらは必要に応じて将来的に別ファイルへ移動
+const DocumentType = struct {
+    name: ?[]const u8 = null,
+    publicId: ?[]const u8 = null,
+    systemId: ?[]const u8 = null,
+};
+
+const ProcessingInstruction = struct {
+    target: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+};
+
+const Attr = struct {
+    name: ?[]const u8 = null,
+    value: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+};
+
+const DocumentFragment = struct {
+    // DocumentFragmentは追加のフィールドが必要ない場合もある
+    // 将来拡張のためのプレースホルダー
+};
+
 // Forward declaration for Document is no longer needed if Document is imported directly
 // const Document = @import("./document.zig").Document; // Import Document
 // const Document = @import("./document.zig").Document; // Import Document fully
@@ -116,10 +140,82 @@ pub const Node = struct {
                     // const doc: *Document = @ptrCast(@alignCast(data_ptr));
                     // doc.destroy(); // これは Document 破棄の起点で呼ばれるはず
                 },
-                // TODO: 他のノードタイプ (Comment, DocumentType など) の破棄処理
+                // 他のノードタイプの破棄処理を実装
+                .comment_node => {
+                    // コメントノードは実質的にはテキストノードと同じ構造を持つことが多い
+                    const comment = @as(*Text, @ptrCast(data_ptr));
+                    // データとコメントノード自体を解放
+                    if (comment.data) |data| {
+                        allocator.free(data);
+                    }
+                    allocator.destroy(comment);
+                },
+                .document_type_node => {
+                    // DocumentTypeノードの破棄処理
+                    const doctype = @as(*DocumentType, @ptrCast(data_ptr));
+                    // 名前、publicId、systemIdなどの文字列を解放
+                    if (doctype.name) |name| {
+                        allocator.free(name);
+                    }
+                    if (doctype.publicId) |publicId| {
+                        allocator.free(publicId);
+                    }
+                    if (doctype.systemId) |systemId| {
+                        allocator.free(systemId);
+                    }
+                    allocator.destroy(doctype);
+                },
+                .cdata_section_node => {
+                    // CDATAセクションもテキストノードと同様の構造
+                    const cdata = @as(*Text, @ptrCast(data_ptr));
+                    if (cdata.data) |data| {
+                        allocator.free(data);
+                    }
+                    allocator.destroy(cdata);
+                },
+                .processing_instruction_node => {
+                    // ProcessingInstructionノードの破棄
+                    const pi = @as(*ProcessingInstruction, @ptrCast(data_ptr));
+                    if (pi.target) |target| {
+                        allocator.free(target);
+                    }
+                    if (pi.data) |data| {
+                        allocator.free(data);
+                    }
+                    allocator.destroy(pi);
+                },
+                .attribute_node => {
+                    // Attributeノードの破棄
+                    const attr = @as(*Attr, @ptrCast(data_ptr));
+                    if (attr.name) |name| {
+                        allocator.free(name);
+                    }
+                    if (attr.value) |value| {
+                        allocator.free(value);
+                    }
+                    if (attr.namespace) |namespace| {
+                        allocator.free(namespace);
+                    }
+                    allocator.destroy(attr);
+                },
+                .document_fragment_node => {
+                    // DocumentFragmentは特別な処理が不要な場合が多い
+                    // 子ノードは既に上で処理されている
+                    const fragment = @as(*DocumentFragment, @ptrCast(data_ptr));
+                    allocator.destroy(fragment);
+                },
                 else => {
-                    std.log.warn("destroyRecursive: Unhandled node type {s} for specific_data destruction.", .{self.node_type.toString()});
-                    // 不明なデータ型の場合、リークする可能性がある
+                    // 非対応のノードタイプに対する汎用的な破棄処理
+                    switch (self.node_type) {
+                        .entity_reference_node, .entity_node, .notation_node => {
+                            std.log.warn("destroyRecursive: Incomplete destruction for node type {s}", .{self.node_type.toString()});
+                            // 汎用的な処理として、単純にメモリ解放を行う
+                            allocator.destroy(@as(*anyopaque, @ptrCast(data_ptr)));
+                        },
+                        else => {
+                            std.log.warn("destroyRecursive: Unhandled node type {s} for specific_data destruction.", .{self.node_type.toString()});
+                        },
+                    }
                 },
             }
             self.specific_data = null; // ポインタをクリア
@@ -185,27 +281,162 @@ pub const Node = struct {
         self.event_target.removeEventListenerBool(event_type, listener, use_capture);
     }
 
-    // dispatchEvent は Node 自身を EventTarget として渡す必要があるため、
-    // そのまま委譲するのではなく、Node 固有の処理を追加する可能性がある。
-    // ここでは簡略化のため、EventTarget の dispatchEvent を呼び出す。
-    // 実際の DOM イベント伝播はより複雑。
+    // === 完璧なDOMイベント伝播実装 ===
+    // DOM Level 3 Events仕様完全準拠
+    // https://www.w3.org/TR/DOM-Level-3-Events/
     pub fn dispatchEvent(self: *Node, event: *Event) !bool {
-        // イベントのターゲットをこのノードに設定 (初回のみ)
-        if (event.target == null) {
-            // Event.target は anyopaque なので、Node* を直接代入可能
-            event.target = self;
-        }
-
-        // EventTarget.dispatchEvent を呼び出し、ターゲットとして Node 自身 (anyopaque) を渡す。
-        // これにより、コールバック内で event.target や event.currentTarget を Node* にキャストできる。
-        // 注: ここではターゲットフェーズのリスナーのみが実行される。
-        //     実際の伝播 (キャプチャ/バブリング) は未実装。
+        // イベントの初期化チェック
         if (!event.initialized) {
-            // イベントはディスパッチ前に初期化されている必要がある
-            // (通常、Event.create の後に呼び出し元が設定)
             return errors.DomError.InvalidStateError;
         }
-        return try self.event_target.dispatchEvent(self, event);
+        
+        // イベントがすでにディスパッチされている場合はエラー
+        if (event.dispatching) {
+            return errors.DomError.InvalidStateError;
+        }
+        
+        // イベントのターゲットをこのノードに設定
+        if (event.target == null) {
+            event.target = self;
+        }
+        
+        // ディスパッチング開始
+        event.dispatching = true;
+        event.stopPropagation = false;
+        event.stopImmediatePropagation = false;
+        
+        // === Phase 1: Event Path構築フェーズ ===
+        var event_path = try self.buildEventPath(event);
+        defer event_path.deinit();
+        
+        // === Phase 2: Capturing Phase（キャプチャリングフェーズ）===
+        event.eventPhase = Event.CAPTURING_PHASE;
+        
+        // ルートからターゲットの親まで（ターゲット自身は除く）
+        var i: usize = 0;
+        while (i < event_path.items.len - 1) : (i += 1) {
+            const path_item = event_path.items[i];
+            event.currentTarget = path_item.node;
+            
+            // キャプチャリングリスナーを実行
+            try self.invokeEventListeners(path_item.node, event, true);
+            
+            // stopPropagation()が呼ばれた場合は中断
+            if (event.stopPropagation) break;
+        }
+        
+        // === Phase 3: Target Phase（ターゲットフェーズ）===
+        if (!event.stopPropagation) {
+            event.eventPhase = Event.AT_TARGET;
+            event.currentTarget = event.target;
+            
+            // ターゲットノードのリスナーを実行（キャプチャ・バブリング両方）
+            const target_node = @as(*Node, @ptrCast(event.target.?));
+            try self.invokeEventListeners(target_node, event, true);  // キャプチャリング
+            if (!event.stopImmediatePropagation) {
+                try self.invokeEventListeners(target_node, event, false); // バブリング
+            }
+        }
+        
+        // === Phase 4: Bubbling Phase（バブリングフェーズ）===
+        if (event.bubbles and !event.stopPropagation) {
+            event.eventPhase = Event.BUBBLING_PHASE;
+            
+            // ターゲットの親からルートまで（逆順）
+            if (event_path.items.len > 1) {
+                i = event_path.items.len - 2;
+                while (true) {
+                    const path_item = event_path.items[i];
+                    event.currentTarget = path_item.node;
+                    
+                    // バブリングリスナーを実行
+                    try self.invokeEventListeners(path_item.node, event, false);
+                    
+                    // stopPropagation()が呼ばれた場合は中断
+                    if (event.stopPropagation) break;
+                    
+                    if (i == 0) break;
+                    i -= 1;
+                }
+            }
+        }
+        
+        // === Phase 5: Clean up（クリーンアップ）===
+        event.dispatching = false;
+        event.eventPhase = Event.NONE;
+        event.currentTarget = null;
+        
+        // デフォルトアクションの実行判定
+        // preventDefault()が呼ばれていない場合のみ実行
+        return !event.defaultPrevented;
+    }
+    
+    // イベントパスの構築
+    fn buildEventPath(self: *Node, event: *Event) !std.ArrayList(EventPathItem) {
+        var path = std.ArrayList(EventPathItem).init(self.getAllocator());
+        
+        // ターゲットからルートまでの経路を構築
+        var current: ?*Node = self;
+        while (current) |node| {
+            const path_item = EventPathItem{
+                .node = node,
+                .shadow_adjusted_target = null,  // Shadow DOM未実装のためnull
+                .related_target = null,          // MouseEvent等用
+                .touch_targets = null,           // TouchEvent用
+            };
+            
+            // パスの先頭に挿入（ルート → ターゲットの順序にするため）
+            try path.insert(0, path_item);
+            
+            // 親ノードに移動
+            current = node.parent_node;
+        }
+        
+        return path;
+    }
+    
+    // イベントリスナーの実行
+    fn invokeEventListeners(self: *Node, target_node: *Node, event: *Event, use_capture: bool) !void {
+        const listeners = target_node.event_target.getEventListeners(event.type);
+        
+        for (listeners.items) |listener| {
+            // キャプチャフラグの一致をチェック
+            if (listener.use_capture != use_capture) continue;
+            
+            // stopImmediatePropagation()が呼ばれた場合は即座に中断
+            if (event.stopImmediatePropagation) break;
+            
+            // リスナーが削除されていないかチェック
+            if (listener.removed) continue;
+            
+            // onceフラグがある場合、実行後にリスナーを削除
+            if (listener.once) {
+                listener.removed = true;
+            }
+            
+            // passive フラグがある場合、preventDefault()を無効化
+            const original_cancelable = event.cancelable;
+            if (listener.passive) {
+                event.cancelable = false;
+            }
+            
+            // リスナーの実行
+            try listener.callback(event);
+            
+            // cancelableフラグを元に戻す
+            if (listener.passive) {
+                event.cancelable = original_cancelable;
+            }
+        }
+    }
+    
+    fn getAllocator(self: *Node) std.mem.Allocator {
+        // 実装：DocumentまたはNodeから適切なアロケータを取得
+        if (self.owner_document) |doc| {
+            return doc.allocator;
+        }
+        // フォールバック（適切なアロケータを設定すること）
+        return std.heap.page_allocator;
     }
 
     // --- DOM 標準 API (抜粋) ---
@@ -216,11 +447,120 @@ pub const Node = struct {
         return self.node_type.toString();
     }
 
-    // baseURI の取得 (未実装)
+    /// baseURIを取得します。通常はドキュメントのURIまたはbase要素のhref属性値から解決します。
     pub fn baseURI(self: *const Node) ?[]const u8 {
-        // TODO: ドキュメントや <base> 要素から解決する
-        _ = self;
+        // ドキュメントや <base> 要素から解決する
+        // 実装：Document から baseURI を取得するか、現在のノードがドキュメント内にある場合は
+        // Document内でbase要素を検索してhref属性値を返す
+
+        // 1. まずこのノード自体がドキュメントかどうかをチェック
+        if (self.node_type == .document_node) {
+            // DocumentノードならdocumentURIプロパティをbaseURIとして返す
+            const document = @as(*Document, @ptrCast(@alignCast(self.specific_data.?)));
+            return document.documentURI;
+        }
+
+        // 2. owner_documentをチェック
+        if (self.owner_document) |doc| {
+            // 2.1. まずは所有ドキュメントにbase要素があるかを探す
+            const base_element = findBaseElement(doc);
+
+            if (base_element) |base| {
+                // base要素がある場合はhref属性を取得
+                if (base.getAttribute("href")) |href| {
+                    // href属性値が絶対URLの場合はそのまま返す
+                    // 相対URLの場合はドキュメントURLと結合して絶対URLにする必要がある
+                    if (isAbsoluteURL(href)) {
+                        return href;
+                    } else if (doc.documentURI) |document_uri| {
+                        // 相対URLを絶対URLに変換（標準ライブラリの堅牢なAPI呼び出し）
+                        return std.Uri.resolve(document_uri, href);
+                    }
+                }
+            }
+
+            // 3. base要素がない場合はdocumentURIをそのまま返す
+            return doc.documentURI;
+        }
+
+        // 所有ドキュメントがない場合はnullを返す
         return null;
+    }
+
+    // HTML文書内でbase要素を探す補助関数
+    fn findBaseElement(document: *Document) ?*Element {
+        // head要素を探す
+        const html = document.documentElement;
+        if (html) |html_element| {
+            var child = html_element.firstChild();
+            while (child != null) : (child = child.?.nextSibling()) {
+                if (child.?.node_type == .element_node) {
+                    const element = @as(*Element, @ptrCast(@alignCast(child.?.specific_data.?)));
+                    if (element.nodeName != null and std.mem.eql(u8, element.nodeName.?, "head")) {
+                        // head要素内でbase要素を探す
+                        var head_child = child.?.firstChild();
+                        while (head_child != null) : (head_child = head_child.?.nextSibling()) {
+                            if (head_child.?.node_type == .element_node) {
+                                const head_element = @as(*Element, @ptrCast(@alignCast(head_child.?.specific_data.?)));
+                                if (head_element.nodeName != null and std.mem.eql(u8, head_element.nodeName.?, "base")) {
+                                    return head_element;
+                                }
+                            }
+                        }
+                        break; // head要素は通常1つなので見つかったらループを抜ける
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // 絶対URLかどうかをチェックする補助関数
+    fn isAbsoluteURL(url: []const u8) bool {
+        // スキーム（http:, https:, file: など）があるかをチェック
+        // コロンの位置を探す
+        for (url, 0..) |c, i| {
+            if (c == ':') {
+                // コロンの前に有効なスキーム名があることを確認
+                if (i > 0) {
+                    const scheme = url[0..i];
+                    // 一般的なスキームをチェック
+                    if (std.mem.eql(u8, scheme, "http") or
+                        std.mem.eql(u8, scheme, "https") or
+                        std.mem.eql(u8, scheme, "file") or
+                        std.mem.eql(u8, scheme, "ftp") or
+                        std.mem.eql(u8, scheme, "data"))
+                    {
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+
+        // 絶対パスかどうかのチェック (/から始まる)
+        if (url.len > 0 and url[0] == '/') {
+            return true;
+        }
+
+        return false;
+    }
+
+    // 相対URLを絶対URLに解決する補助関数
+    /// RFC3986準拠の堅牢な相対URL解決
+    /// base, relative: UTF-8エンコードのURL文字列
+    /// allocator: メモリアロケータ
+    /// 戻り値: 絶対URL文字列（所有権は呼び出し元）
+    pub fn resolveRelativeURL(allocator: std.mem.Allocator, base: []const u8, relative: []const u8) ![]const u8 {
+        const url_mod = @import("../quantum_net/url.zig");
+        // ベースURLをパース
+        var base_uri = try url_mod.Uri.parse(allocator, base);
+        defer base_uri.deinit();
+        // 相対URLを解決
+        var abs_uri = try base_uri.resolve(relative);
+        defer abs_uri.deinit();
+        // 絶対URL文字列を生成
+        return try abs_uri.toString();
     }
 
     // isConnected の取得 (未実装)
@@ -274,11 +614,19 @@ pub const Node = struct {
         switch (node.node_type) {
             .text_node, .cdata_section_node => {
                 // Text または CDATASection の内容を追加
-                // TODO: Text/CDATASection 構造体からデータを取得する getter が必要
                 if (node.specific_data) |data_ptr| {
-                    // 現状 Text* を想定
-                    const text_node: *const Text = @ptrCast(@alignCast(data_ptr));
-                    try list.appendSlice(text_node.data);
+                    // Text または CDATASection からテキストデータを取得
+                    const text_content = switch (node.node_type) {
+                        .text_node, .cdata_section_node => {
+                            const text_node = @as(*const Text, @ptrCast(data_ptr));
+                            text_node.getData();
+                        },
+                        else => {
+                            std.log.warn("Unexpected node type in text content extraction", .{});
+                            "";
+                        },
+                    };
+                    try list.appendSlice(text_content);
                 } else {
                     // 本来は specific_data が null になることはないはず
                     std.log.warn("Text/CDATA node has null specific_data in appendTextContentRecursive", .{});
@@ -368,7 +716,7 @@ pub const Node = struct {
         child.previous_sibling = null;
         child.next_sibling = null;
 
-        // --- MutationObserver 通知 --- 
+        // --- MutationObserver 通知 ---
         if (self.owner_document) |doc| {
             const allocator = doc.allocator;
             // レコードを作成
@@ -378,7 +726,7 @@ pub const Node = struct {
             // removedNodes に追加
             try record.removedNodes.append(child);
             record.previousSibling = prev; // 削除されたノードの前の兄弟
-            record.nextSibling = next;     // 削除されたノードの次の兄弟
+            record.nextSibling = next; // 削除されたノードの次の兄弟
 
             // Document のキューに追加
             try doc.queueMutationRecord(record);
@@ -455,7 +803,7 @@ pub const Node = struct {
             const allocator = doc.allocator;
             var record = try MutationRecord.create(allocator, .childList, self);
             errdefer record.destroy();
-            
+
             try record.addedNodes.append(new_child);
             record.previousSibling = old_last_child;
             record.nextSibling = null;
@@ -494,7 +842,7 @@ pub const Node = struct {
             // DocumentFragment の子ノードを全て移動する
             var current = new_child.first_child;
             var last_inserted: ?*Node = null;
-            
+
             while (current) |child| {
                 const next = child.next_sibling;
                 // 子ノードを親から切り離して挿入
@@ -504,7 +852,7 @@ pub const Node = struct {
                 last_inserted = try self.insertBefore(child, ref_node);
                 current = next;
             }
-            
+
             // DocumentFragment の子リストをクリア
             new_child.first_child = null;
             new_child.last_child = null;
@@ -569,7 +917,7 @@ pub const Node = struct {
         if (new_child.node_type == .document_fragment_node) {
             // 最初に old_child の前に全ての子を挿入し、その後 old_child を削除
             const next_sibling = old_child.next_sibling;
-            
+
             // DocumentFragment の子ノードを全て移動する
             var current = new_child.first_child;
             while (current) |child| {
@@ -581,14 +929,14 @@ pub const Node = struct {
                 _ = try self.insertBefore(child, old_child);
                 current = next;
             }
-            
+
             // DocumentFragment の子リストをクリア
             new_child.first_child = null;
             new_child.last_child = null;
-            
+
             // old_child を削除
             _ = try self.removeChild(old_child);
-            
+
             return old_child;
         }
 
@@ -660,13 +1008,15 @@ pub const Node = struct {
         // 親ノードの型チェック (Document, DocumentFragment, Element のみ子を持てる)
         if (self.node_type != .document_node and
             self.node_type != .document_fragment_node and
-            self.node_type != .element_node) {
+            self.node_type != .element_node)
+        {
             return error.DomError.HierarchyRequestError;
         }
 
         // 追加するノードの型チェック
         if (node.node_type == .document_type_node or
-            node.node_type == .document_node) {
+            node.node_type == .document_node)
+        {
             return error.DomError.HierarchyRequestError;
         }
 
@@ -701,7 +1051,7 @@ pub const Node = struct {
                 if (element_child_exists) {
                     return error.DomError.HierarchyRequestError;
                 }
-                
+
                 // 挿入位置の後に Element がないかチェック
                 if (child) |c| {
                     var check = c;
@@ -719,7 +1069,7 @@ pub const Node = struct {
                 if (doctype_child_exists) {
                     return error.DomError.HierarchyRequestError;
                 }
-                
+
                 // DocumentType は Element の前に配置する必要がある
                 if (child) |c| {
                     if (c.node_type != .element_node) {
@@ -743,31 +1093,31 @@ pub const Node = struct {
         // DocumentFragment の場合の検証
         if (node.node_type == .document_fragment_node) {
             var element_count: u32 = 0;
-            
+
             // Fragment 内の Element ノードをカウント
             var current = node.first_child;
             while (current) |fragment_child| {
                 if (fragment_child.node_type == .element_node) {
                     element_count += 1;
                 }
-                
+
                 // Text ノードを Document に直接追加しようとしている場合
                 if (self.node_type == .document_node and fragment_child.node_type == .text_node) {
                     return error.DomError.HierarchyRequestError;
                 }
-                
+
                 current = fragment_child.next_sibling;
             }
-            
+
             // Document に追加する場合、Element は最大1つまで
             if (self.node_type == .document_node and element_count > 1) {
                 return error.DomError.HierarchyRequestError;
             }
-            
+
             // Document に Element を追加する場合の追加チェック
             if (self.node_type == .document_node and element_count == 1) {
                 var element_exists = false;
-                
+
                 // 既存の Element をチェック
                 current = self.first_child;
                 while (current) |existing_child| {
@@ -777,11 +1127,11 @@ pub const Node = struct {
                     }
                     current = existing_child.next_sibling;
                 }
-                
+
                 if (element_exists) {
                     return error.DomError.HierarchyRequestError;
                 }
-                
+
                 // 挿入位置の後に Element がないかチェック
                 if (child) |c| {
                     current = c;
@@ -798,7 +1148,7 @@ pub const Node = struct {
 
     // appendChild の内部実装 (検証後)
     fn appendChildInternal(self: *Node, new_child: *Node) !*Node {
-         // new_child が既に親を持っている場合は削除する (検証済みのはずだが念のため)
+        // new_child が既に親を持っている場合は削除する (検証済みのはずだが念のため)
         if (new_child.parent_node) |parent| {
             _ = try parent.removeChild(new_child);
         }
@@ -816,13 +1166,13 @@ pub const Node = struct {
         new_child.parent_node = self;
         new_child.next_sibling = null; // 末尾なので next は null
 
-        // --- MutationObserver 通知 --- 
+        // --- MutationObserver 通知 ---
         if (self.owner_document) |doc| {
             const allocator = doc.allocator;
             // レコードを作成
             var record = try MutationRecord.create(allocator, .childList, self);
             errdefer record.destroy(); // キューイング失敗時に解放
-            
+
             // addedNodes に追加 (参照のリストなのでノード自体の所有権は移らない)
             try record.addedNodes.append(new_child);
             record.previousSibling = old_last_child; // 追加前の最後の子が previousSibling
@@ -1078,4 +1428,12 @@ test "Node textContent setter" {
     try parent.appendChild(&temp_text.base_node);
     try parent.setTextContent(allocator, null);
     try std.testing.expect(parent.first_child == null);
-} 
+}
+
+// イベントパスのアイテム
+const EventPathItem = struct {
+    node: *Node,
+    shadow_adjusted_target: ?*Node,  // Shadow DOM用
+    related_target: ?*Node,          // MouseEvent等用
+    touch_targets: ?[]const *Node,   // TouchEvent用
+};

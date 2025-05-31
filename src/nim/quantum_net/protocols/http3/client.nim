@@ -198,18 +198,30 @@ proc close*(client: Http3Client) {.async.} =
   if client.isClosed():
     return
     
-  # GOAWAYフレームを送信
-  let controlStreamOption = client.streams.getStream(client.controlStreamId)
-  if controlStreamOption.isSome:
-    let controlStream = controlStreamOption.get()
-    # 最後に受信したストリームID = 0（簡略化のため）
-    controlStream.sendGoaway(0)
+  # 接続レベルのクリーンアップ
+  if client.isConnected():
+    # Perfect Stream ID Tracking - RFC 9114準拠
+    # 最後に処理されたサーバー発ストリームIDを正確に追跡
+    let lastServerBidirectionalId = client.getLastProcessedServerStreamId(sdBidirectional)
+    let lastServerUnidirectionalId = client.getLastProcessedServerStreamId(sdUnidirectional)
     
-  # すべてのストリームを閉じる
-  for id, stream in client.streams.streams:
-    stream.closeStream()
+    # RFC 9114 Section 5.2: GOAWAY frame should contain the highest-numbered stream ID
+    # that was or might be processed by the sending endpoint
+    let lastProcessedStreamId = max(lastServerBidirectionalId, lastServerUnidirectionalId)
     
-  client.state.store(csClosed)
+    let controlStreamOption = client.streams.getStream(client.controlStreamId)
+    if controlStreamOption.isSome:
+      let controlStream = controlStreamOption.get()
+      controlStream.sendGoaway(lastProcessedStreamId)
+      client.logger.info(&"Perfect GOAWAY送信完了。Last Bidirectional: {lastServerBidirectionalId}, Last Unidirectional: {lastServerUnidirectionalId}, Selected: {lastProcessedStreamId}")
+    else:
+      client.logger.warn("シャットダウン時にQUICコントロールストリームが見つかりませんでした。")
+
+    # すべてのストリームを閉じる
+    for id, stream in client.streams.streams:
+      stream.closeStream()
+    
+    client.state.store(csClosed)
 
 proc abort*(client: Http3Client, error: Http3Error) {.async.} =
   ## エラーによりコネクションを終了
@@ -651,3 +663,190 @@ proc closeWebTransport*(session: WebTransportSession) {.async.} =
   if streamOption.isSome:
     let stream = streamOption.get()
     await stream.closeStream()
+
+# Perfect Stream ID Tracking Implementation - RFC 9114準拠
+
+proc getLastProcessedServerStreamId*(client: Http3Client, direction: StreamDirection): uint64 =
+  ## サーバー開始ストリームの最後に処理されたIDを取得
+  ## RFC 9114 Section 2.1: Stream ID management
+  var maxProcessedId: uint64 = 0
+  
+  case direction
+  of sdBidirectional:
+    # サーバー開始双方向ストリーム: ID = 1, 5, 9, 13, ... (4n + 1)
+    for id, stream in client.streams.streams:
+      if isServerInitiatedBidirectional(id) and stream.isProcessed():
+        maxProcessedId = max(maxProcessedId, id)
+    
+    # If no streams processed, return the last valid server-initiated ID
+    if maxProcessedId == 0:
+      # Return a hypothetical ID that indicates no server streams were processed
+      maxProcessedId = 1  # First possible server bidirectional stream ID
+    
+  of sdUnidirectional:
+    # サーバー開始単方向ストリーム: ID = 3, 7, 11, 15, ... (4n + 3)
+    for id, stream in client.streams.streams:
+      if isServerInitiatedUnidirectional(id) and stream.isProcessed():
+        maxProcessedId = max(maxProcessedId, id)
+    
+    if maxProcessedId == 0:
+      maxProcessedId = 3  # First possible server unidirectional stream ID
+  
+  return maxProcessedId
+
+proc isServerInitiatedBidirectional*(streamId: uint64): bool {.inline.} =
+  ## サーバー開始双方向ストリームかどうか判定
+  ## RFC 9114: Server-initiated bidirectional streams have IDs of the form 4n + 1
+  return (streamId and 0x3) == 1
+
+proc isServerInitiatedUnidirectional*(streamId: uint64): bool {.inline.} =
+  ## サーバー開始単方向ストリームかどうか判定
+  ## RFC 9114: Server-initiated unidirectional streams have IDs of the form 4n + 3
+  return (streamId and 0x3) == 3
+
+proc isClientInitiatedBidirectional*(streamId: uint64): bool {.inline.} =
+  ## クライアント開始双方向ストリームかどうか判定
+  ## RFC 9114: Client-initiated bidirectional streams have IDs of the form 4n
+  return (streamId and 0x3) == 0
+
+proc isClientInitiatedUnidirectional*(streamId: uint64): bool {.inline.} =
+  ## クライアント開始単方向ストリームかどうか判定
+  ## RFC 9114: Client-initiated unidirectional streams have IDs of the form 4n + 2
+  return (streamId and 0x3) == 2
+
+proc updateMaxStreamLimits*(client: Http3Client, streamId: uint64) =
+  ## ストリーム制限を更新
+  ## RFC 9114 Section 4.6: Stream concurrency management
+  
+  if isServerInitiatedBidirectional(streamId):
+    client.maxServerBidirectionalStreamId = max(client.maxServerBidirectionalStreamId, streamId)
+    client.serverBidirectionalStreamCount += 1
+    
+    # Enforce MAX_CONCURRENT_STREAMS
+    if client.serverBidirectionalStreamCount > client.settings.maxConcurrentStreams:
+      client.logger.warn(&"サーバー双方向ストリーム数が上限を超過: {client.serverBidirectionalStreamCount}/{client.settings.maxConcurrentStreams}")
+      
+  elif isServerInitiatedUnidirectional(streamId):
+    client.maxServerUnidirectionalStreamId = max(client.maxServerUnidirectionalStreamId, streamId)
+    client.serverUnidirectionalStreamCount += 1
+    
+  elif isClientInitiatedBidirectional(streamId):
+    client.maxClientBidirectionalStreamId = max(client.maxClientBidirectionalStreamId, streamId)
+    
+  elif isClientInitiatedUnidirectional(streamId):
+    client.maxClientUnidirectionalStreamId = max(client.maxClientUnidirectionalStreamId, streamId)
+
+proc allocateNextClientStreamId*(client: Http3Client, direction: StreamDirection): uint64 =
+  ## 次のクライアント開始ストリームIDを割り当て
+  ## RFC 9114準拠のストリームID生成
+  
+  case direction
+  of sdBidirectional:
+    # Client bidirectional: 0, 4, 8, 12, ... (4n)
+    let nextId = client.maxClientBidirectionalStreamId + 4
+    client.maxClientBidirectionalStreamId = nextId
+    return nextId
+    
+  of sdUnidirectional:
+    # Client unidirectional: 2, 6, 10, 14, ... (4n + 2)
+    let nextId = if client.maxClientUnidirectionalStreamId == 0:
+      2'u64  # First client unidirectional stream
+    else:
+      client.maxClientUnidirectionalStreamId + 4
+    client.maxClientUnidirectionalStreamId = nextId
+    return nextId
+
+proc validateStreamId*(client: Http3Client, streamId: uint64): bool =
+  ## ストリームIDの妥当性を検証
+  ## RFC 9114 Section 2.1: Stream ID validation
+  
+  # Check if stream ID follows correct pattern
+  if isServerInitiatedBidirectional(streamId):
+    return streamId <= client.maxServerBidirectionalStreamId + 4
+  elif isServerInitiatedUnidirectional(streamId):
+    return streamId <= client.maxServerUnidirectionalStreamId + 4
+  elif isClientInitiatedBidirectional(streamId):
+    return streamId <= client.maxClientBidirectionalStreamId
+  elif isClientInitiatedUnidirectional(streamId):
+    return streamId <= client.maxClientUnidirectionalStreamId
+  else:
+    return false
+
+proc enforceStreamConcurrencyLimits*(client: Http3Client): bool =
+  ## ストリーム同時接続数制限を強制
+  ## RFC 9114 Section 4.6: Stream concurrency control
+  
+  let activeBidirectionalStreams = client.streams.streams.values.toSeq.countIt(
+    it.state.load() in {sOpen, sHalfClosedLocal, sHalfClosedRemote} and
+    isClientInitiatedBidirectional(it.id)
+  )
+  
+  let activeUnidirectionalStreams = client.streams.streams.values.toSeq.countIt(
+    it.state.load() in {sOpen, sHalfClosedLocal, sHalfClosedRemote} and
+    isClientInitiatedUnidirectional(it.id)
+  )
+  
+  # Check against peer's MAX_CONCURRENT_STREAMS setting
+  let maxConcurrent = client.peerSettings.maxConcurrentStreams
+  
+  if activeBidirectionalStreams >= maxConcurrent:
+    client.logger.warn(&"双方向ストリーム同時接続数上限到達: {activeBidirectionalStreams}/{maxConcurrent}")
+    return false
+  
+  if activeUnidirectionalStreams >= maxConcurrent:
+    client.logger.warn(&"単方向ストリーム同時接続数上限到達: {activeUnidirectionalStreams}/{maxConcurrent}")
+    return false
+  
+  return true
+
+proc processStreamStateTransition*(client: Http3Client, streamId: uint64, newState: StreamState) =
+  ## ストリーム状態遷移の処理
+  ## RFC 9114 Section 3: Stream states
+  
+  let streamOption = client.streams.getStream(streamId)
+  if streamOption.isNone:
+    return
+    
+  let stream = streamOption.get()
+  let oldState = stream.state.load()
+  
+  # Validate state transition
+  if not isValidStateTransition(oldState, newState):
+    client.logger.error(&"不正なストリーム状態遷移: {oldState} -> {newState} (Stream {streamId})")
+    return
+  
+  stream.state.store(newState)
+  
+  # Update stream counts when closing
+  if newState == sClosed:
+    if isServerInitiatedBidirectional(streamId):
+      client.serverBidirectionalStreamCount -= 1
+    elif isServerInitiatedUnidirectional(streamId):
+      client.serverUnidirectionalStreamCount -= 1
+    
+    # Mark stream as processed for GOAWAY calculation
+    stream.markAsProcessed()
+  
+  client.logger.debug(&"ストリーム状態遷移: {streamId} {oldState} -> {newState}")
+
+proc isValidStateTransition*(from: StreamState, to: StreamState): bool =
+  ## ストリーム状態遷移の妥当性を検証
+  ## RFC 9114 Section 3: Valid stream state transitions
+  
+  case from
+  of sIdle:
+    return to in {sOpen, sReservedLocal, sReservedRemote}
+  of sReservedLocal:
+    return to in {sOpen, sClosed}
+  of sReservedRemote:
+    return to in {sHalfClosedLocal, sClosed}
+  of sOpen:
+    return to in {sHalfClosedLocal, sHalfClosedRemote, sClosed}
+  of sHalfClosedLocal:
+    return to in {sClosed}
+  of sHalfClosedRemote:
+    return to in {sClosed}
+  of sClosed:
+    return false  # No transitions from closed state
+  of sReset:
+    return false  # No transitions from reset state
