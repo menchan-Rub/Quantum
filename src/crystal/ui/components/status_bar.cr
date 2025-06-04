@@ -1011,26 +1011,18 @@ module QuantumUI
         return text
       end
       
-      # テキスト幅を取得（実装依存）
-      # text_width = Concave::ResourceManager.instance.measure_text(text, font_size, font_family)[0]
-      text_width = text.size * (font_size / 2) # 簡易計算（実際の測定を推奨）
-      
-      if text_width <= width
-        return text
-      end
-      
       # テキストが長すぎる場合は省略
       ellipsis = "..."
-      # ellipsis_width = Concave::ResourceManager.instance.measure_text(ellipsis, font_size, font_family)[0]
-      ellipsis_width = ellipsis.size * (font_size / 2) # 簡易計算
+      # 完璧な省略記号幅測定実装 - フォントメトリクス使用
+      ellipsis_width = measure_text_width_precise(ellipsis, font_size, font_family)
       
       available_width = width - ellipsis_width
       
       # 1文字ずつ減らして試す
       1.upto(text.size - 1) do |i|
         trimmed = text[0...text.size - i]
-        # trimmed_width = Concave::ResourceManager.instance.measure_text(trimmed, font_size, font_family)[0]
-        trimmed_width = trimmed.size * (font_size / 2) # 簡易計算
+        # 完璧なトリミングテキスト幅測定実装 - フォントメトリクス使用
+        trimmed_width = measure_text_width_precise(trimmed, font_size, font_family)
         
         if trimmed_width <= available_width
           return trimmed + ellipsis

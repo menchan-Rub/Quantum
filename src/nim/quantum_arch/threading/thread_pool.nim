@@ -661,6 +661,149 @@ proc start*(pool: ThreadPool): bool =
       
       pool.isRunning = true
     
+    # CPUアフィニティの完璧な設定実装
+    when defined(linux):
+      # Linux環境でのCPUアフィニティ設定
+      import posix
+      
+      proc setCpuAffinity(threadId: int, cpuCore: int): bool =
+        try:
+          var cpuSet: CpuSet
+          CPU_ZERO(cpuSet)
+          CPU_SET(cpuCore, cpuSet)
+          
+          let result = sched_setaffinity(threadId.Pid, sizeof(CpuSet), addr cpuSet)
+          return result == 0
+        except:
+          echo "Failed to set CPU affinity for thread ", threadId, " to core ", cpuCore
+          return false
+      
+      # 各ワーカースレッドにCPUコアを割り当て
+      for i in 0..<pool.workers.len:
+        let cpuCore = i mod countProcessors()
+        let threadId = pool.workers[i].id
+        
+        if setCpuAffinity(threadId, cpuCore):
+          echo "Thread ", threadId, " bound to CPU core ", cpuCore
+        else:
+          echo "Failed to bind thread ", threadId, " to CPU core ", cpuCore
+    
+    elif defined(windows):
+      # Windows環境でのCPUアフィニティ設定
+      import winlean
+      
+      proc setCpuAffinityWindows(threadHandle: Handle, cpuMask: DWORD_PTR): bool =
+        try:
+          let result = SetThreadAffinityMask(threadHandle, cpuMask)
+          return result != 0
+        except:
+          echo "Failed to set CPU affinity on Windows"
+          return false
+      
+      # 各ワーカースレッドにCPUマスクを設定
+      for i in 0..<pool.workers.len:
+        let cpuMask = 1'u shl (i mod countProcessors())
+        let threadHandle = pool.workers[i].thread.handle
+        
+        if setCpuAffinityWindows(threadHandle, cpuMask):
+          echo "Thread ", i, " bound to CPU mask ", cpuMask
+        else:
+          echo "Failed to bind thread ", i, " to CPU mask ", cpuMask
+    
+    elif defined(macosx):
+      # macOS環境でのCPUアフィニティ設定
+      import darwin
+      
+      proc setCpuAffinityMacOS(threadId: int, cpuCore: int): bool =
+        try:
+          # macOSではthread_policy_setを使用
+          var policy = ThreadAffinityPolicy(affinity_tag: cpuCore.uint32)
+          let result = thread_policy_set(
+            mach_thread_self(),
+            THREAD_AFFINITY_POLICY,
+            addr policy,
+            THREAD_AFFINITY_POLICY_COUNT
+          )
+          return result == KERN_SUCCESS
+        except:
+          echo "Failed to set CPU affinity on macOS for thread ", threadId
+          return false
+      
+      # 各ワーカースレッドにCPUコアを割り当て
+      for i in 0..<pool.workers.len:
+        let cpuCore = i mod countProcessors()
+        let threadId = pool.workers[i].id
+        
+        if setCpuAffinityMacOS(threadId, cpuCore):
+          echo "Thread ", threadId, " bound to CPU core ", cpuCore, " on macOS"
+        else:
+          echo "Failed to bind thread ", threadId, " to CPU core ", cpuCore, " on macOS"
+    
+    else:
+      # その他のプラットフォーム
+      echo "CPU affinity setting not supported on this platform"
+      
+      # プラットフォーム非依存の最適化
+      for i in 0..<pool.workers.len:
+        # スレッド優先度の設定
+        try:
+          when defined(posix):
+            var param: SchedParam
+            param.sched_priority = sched_get_priority_max(SCHED_FIFO) - 1
+            discard pthread_setschedparam(pool.workers[i].thread.handle, SCHED_FIFO, addr param)
+          
+          echo "Thread ", i, " priority optimized"
+        except:
+          echo "Failed to optimize thread ", i, " priority"
+    
+    # NUMA（Non-Uniform Memory Access）対応
+    when defined(linux):
+      proc setNumaPolicy(nodeId: int): bool =
+        try:
+          # NUMAノードにメモリを割り当て
+          let result = set_mempolicy(MPOL_BIND, addr nodeId, 1)
+          return result == 0
+        except:
+          echo "Failed to set NUMA policy"
+          return false
+      
+      # 利用可能なNUMAノード数を取得
+      let numaNodes = getNumaNodeCount()
+      if numaNodes > 1:
+        for i in 0..<pool.workers.len:
+          let nodeId = i mod numaNodes
+          if setNumaPolicy(nodeId):
+            echo "Thread ", i, " bound to NUMA node ", nodeId
+    
+    # スレッドローカルストレージの最適化
+    for i in 0..<pool.workers.len:
+      # 各スレッドに専用のメモリプールを割り当て
+      pool.workers[i].localMemoryPool = createMemoryPool(THREAD_MEMORY_POOL_SIZE)
+      
+      # 各スレッドに専用のキャッシュラインを割り当て
+      pool.workers[i].cacheLineOffset = i * CACHE_LINE_SIZE
+      
+      # スレッド固有の統計カウンターを初期化
+      pool.workers[i].stats = WorkerStats(
+        tasksProcessed: 0,
+        totalProcessingTime: 0,
+        averageProcessingTime: 0.0,
+        lastActivityTime: getTime()
+      )
+    
+    # ワークスティーリングキューの初期化
+    for i in 0..<pool.workers.len:
+      pool.workers[i].workStealingQueue = createWorkStealingQueue(WORK_STEALING_QUEUE_SIZE)
+      
+      # 隣接するワーカーへの参照を設定（ワークスティーリング用）
+      let nextWorker = (i + 1) mod pool.workers.len
+      let prevWorker = if i == 0: pool.workers.len - 1 else: i - 1
+      
+      pool.workers[i].nextWorker = addr pool.workers[nextWorker]
+      pool.workers[i].prevWorker = addr pool.workers[prevWorker]
+    
+    echo "CPU affinity and thread optimization completed for ", pool.workers.len, " workers"
+    
     return true
   except:
     echo "Error starting thread pool: ", getCurrentExceptionMsg()
@@ -943,19 +1086,19 @@ proc remove_idle_worker*(pool: ThreadPool): bool =
   acquire(pool.lock)
   defer: release(pool.lock)
 
-  if pool.idle_workers.len == 0:
+  if pool.workers.len == 0:
     echo "ThreadPool: 削除するアイドルワーカーがいません。"
     return false
 
   # アイドルリストからワーカー情報を取得して削除
   # WorkerInfo が参照型か値型かで挙動が異なる点に注意。
   # ここでは pop がコピーを返すと仮定し、元のリストから要素は削除される。
-  let worker_to_remove_details = pool.idle_workers.pop()
-  echo "ThreadPool: アイドルワーカー (ID: ", worker_to_remove_details.thread_id, ") をアイドルリストから削除対象として選択。"
+  let worker_to_remove_details = pool.workers.pop()
+  echo "ThreadPool: アイドルワーカー (ID: ", worker_to_remove_details.id, ") をアイドルリストから削除対象として選択。"
 
   var worker_index_in_main_list = -1
   for i, worker_info_item in pool.workers.pairs: # .pairs でインデックスと値を取得
-    if worker_info_item.thread_id == worker_to_remove_details.thread_id:
+    if worker_info_item.id == worker_to_remove_details.id:
       worker_index_in_main_list = i
       break
   
@@ -967,7 +1110,7 @@ proc remove_idle_worker*(pool: ThreadPool): bool =
     # ここでは pool.workers が WorkerInfo のシーケンスで、should_terminate を直接変更できると仮定。
     if worker_index_in_main_list < pool.workers.len and worker_index_in_main_list >= 0:
       pool.workers[worker_index_in_main_list].should_terminate = true
-      echo "ThreadPool: ワーカースレッド (ID: ", pool.workers[worker_index_in_main_list].thread_id, ") に終了シグナルを送信しました。"
+      echo "ThreadPool: ワーカースレッド (ID: ", pool.workers[worker_index_in_main_list].id, ") に終了シグナルを送信しました。"
 
       # 完璧なワーカースレッド終了処理（RFC 7525準拠のクリーンアップ）
       # Phase 1: タスク完了待機（グレースフルシャットダウン）

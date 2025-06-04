@@ -1545,6 +1545,1553 @@ module QuantumCore
               # グリフの描画サイズを計算
               glyph_width = glyph.width
               glyph_height = glyph.height
+require "./config"
+require "./layout_engine"
+require "./dom/node"
+require "./dom/css"
+require "log"
+
+# Logの初期設定
+Log.setup_from_env
+module_log = Log.for("quantum_core")
+module_log.level = Log::Severity::Info
+
+module QuantumCore
+  # レンダリングエンジン「QuantumRender」
+  # 革新的レンダリングパイプラインの実装
+  class RenderingEngine
+    # レンダリングコンテキスト
+    # マルチバックエンド対応（Vulkan/Metal/DirectX/ソフトウェア）
+    class RenderingContext
+      # キャンバスの幅
+      property canvas_width : Int32
+      # キャンバスの高さ
+      property canvas_height : Int32
+      # ハードウェアアクセラレーション使用フラグ
+      property hardware_accelerated : Bool
+      # レンダリングバックエンド種別
+      property backend_type : Symbol
+      # 現在のフレームレート
+      property current_fps : Float64
+      # 適応型レンダリング解像度の倍率
+      property resolution_scale : Float64
+      # コマンドバッファ
+      @command_buffer : Array(RenderCommand)
+      # フレームカウンター
+      @frame_counter : UInt64
+      # 最後のフレーム時間
+      @last_frame_time : Time
+      # 電力使用モード
+      @power_mode : Symbol
+      
+      # クラス変数
+      class_property gpu_initialized : Bool = false
+      class_property rendering_api : String = "None"
+      class_property available_backends : Array(Symbol) = [] of Symbol
+      
+      # 初期化
+      def initialize(@canvas_width : Int32, @canvas_height : Int32, @hardware_accelerated : Bool)
+        @backend_type = @hardware_accelerated ? :gpu : :software
+        @current_fps = 60.0
+        @resolution_scale = 1.0
+        @command_buffer = [] of RenderCommand
+        @frame_counter = 0_u64
+        @last_frame_time = Time.monotonic
+        @power_mode = :balanced
+        
+        # 利用可能なバックエンドを検出
+        detect_available_backends if @@available_backends.empty?
+        
+        # 初期設定
+        setup_rendering_context
+        Log.info { "レンダリングコンテキストを初期化しました: #{@canvas_width}x#{@canvas_height}, バックエンド: #{@backend_type}" }
+      end
+      
+      # 利用可能なレンダリングバックエンドを検出
+      private def detect_available_backends
+        @@available_backends = [] of Symbol
+        
+        # Vulkanサポートの検出
+        if check_vulkan_support
+          @@available_backends << :vulkan
+        end
+        
+        # Metal/DirectXサポートの検出（プラットフォーム依存）
+        {% if flag?(:darwin) %}
+          if check_metal_support
+            @@available_backends << :metal
+          end
+        {% elsif flag?(:windows) %}
+          if check_directx_support
+            @@available_backends << :directx
+          end
+        {% end %}
+        
+        # OpenGLサポートの検出
+        if check_opengl_support
+          @@available_backends << :opengl
+        end
+        
+        # ソフトウェアレンダリングは常に利用可能
+        @@available_backends << :software
+        
+        Log.info { "利用可能なレンダリングバックエンド: #{@@available_backends.join(", ")}" }
+      end
+      
+      # Vulkanサポートの確認
+      private def check_vulkan_support : Bool
+        Log.debug { "Vulkanサポートを確認中..." }
+        begin
+          # Vulkanライブラリの存在確認
+          lib_path = {% if flag?(:linux) %}
+            "/usr/lib/libvulkan.so.1"
+          {% elsif flag?(:darwin) %}
+            "/usr/local/lib/libvulkan.1.dylib"
+          {% elsif flag?(:windows) %}
+            "vulkan-1.dll"
+          {% else %}
+            ""
+          {% end %}
+          
+          # ライブラリファイルの存在確認
+          if !File.exists?(lib_path)
+            Log.debug { "Vulkanライブラリが見つかりません: #{lib_path}" }
+            return false
+          end
+          
+          # FFIを使用してVulkanの基本機能をチェック
+          vulkan_version = LibVulkan.get_version
+          if vulkan_version < LibVulkan::MIN_SUPPORTED_VERSION
+            Log.debug { "Vulkanバージョンが古すぎます: #{vulkan_version}" }
+            return false
+          end
+          
+          # GPUデバイスの検出
+          device_count = LibVulkan.enumerate_physical_devices
+          if device_count <= 0
+            Log.debug { "Vulkan対応GPUデバイスが見つかりません" }
+            return false
+          end
+          
+          # 必要な拡張機能のサポート確認
+          required_extensions = ["VK_KHR_swapchain", "VK_KHR_surface"]
+          if !LibVulkan.check_extensions_support(required_extensions)
+            Log.debug { "必要なVulkan拡張機能がサポートされていません" }
+            return false
+          end
+          
+          Log.info { "Vulkanサポートを確認: 利用可能 (#{device_count}デバイス検出)" }
+          return true
+        rescue ex
+          Log.error { "Vulkanサポート確認中にエラーが発生: #{ex.message}" }
+          return false
+        end
+      end
+      
+      # OpenGLサポートの確認
+      private def check_opengl_support : Bool
+        Log.debug { "OpenGLサポートを確認中..." }
+        begin
+          # OpenGLライブラリの存在確認
+          lib_path = {% if flag?(:linux) %}
+            "/usr/lib/libGL.so.1"
+          {% elsif flag?(:darwin) %}
+            "/System/Library/Frameworks/OpenGL.framework/OpenGL"
+          {% elsif flag?(:windows) %}
+            "opengl32.dll"
+          {% else %}
+            ""
+          {% end %}
+          
+          # ライブラリファイルの存在確認
+          if !File.exists?(lib_path)
+            Log.debug { "OpenGLライブラリが見つかりません: #{lib_path}" }
+            return false
+          end
+          
+          # 一時的なウィンドウコンテキストを作成してOpenGL情報を取得
+          context = LibGL.create_temporary_context
+          if context.null?
+            Log.debug { "OpenGLコンテキストを作成できません" }
+            return false
+          end
+          
+          begin
+            # バージョン確認
+            version = LibGL.get_string(LibGL::VERSION)
+            vendor = LibGL.get_string(LibGL::VENDOR)
+            renderer = LibGL.get_string(LibGL::RENDERER)
+            
+            major, minor = LibGL.get_gl_version
+            if major < 3 || (major == 3 && minor < 3)
+              Log.debug { "OpenGL 3.3以上が必要です。検出: #{major}.#{minor}" }
+              return false
+            end
+            
+            # 必要な拡張機能の確認
+            required_extensions = ["GL_ARB_compute_shader", "GL_ARB_separate_shader_objects"]
+            if !LibGL.check_extensions_support(required_extensions)
+              Log.debug { "必要なOpenGL拡張機能がサポートされていません" }
+              return false
+            end
+            
+            Log.info { "OpenGLサポートを確認: 利用可能 (#{version}, #{vendor}, #{renderer})" }
+            return true
+          ensure
+            LibGL.destroy_context(context)
+          end
+        rescue ex
+          Log.error { "OpenGLサポート確認中にエラーが発生: #{ex.message}" }
+          return false
+        end
+      end
+      
+      # Metalサポートの確認（macOSのみ）
+      {% if flag?(:darwin) %}
+      private def check_metal_support : Bool
+        Log.debug { "Metalサポートを確認中..." }
+        begin
+          # Metalフレームワークの存在確認
+          framework_path = "/System/Library/Frameworks/Metal.framework/Metal"
+          if !File.exists?(framework_path)
+            Log.debug { "Metalフレームワークが見つかりません: #{framework_path}" }
+            return false
+          end
+          
+          # システムバージョンの確認（macOS 10.11以降が必要）
+          system_version = LibSystem.get_os_version
+          if system_version < LibSystem::MIN_METAL_OS_VERSION
+            Log.debug { "MetalにはmacOS 10.11以降が必要です。検出: #{system_version}" }
+            return false
+          end
+          
+          # Metal対応GPUの検出
+          device_count = LibMetal.enumerate_devices
+          if device_count <= 0
+            Log.debug { "Metal対応GPUデバイスが見つかりません" }
+            return false
+          end
+          
+          # 必要な機能のサポート確認
+          if !LibMetal.check_feature_support
+            Log.debug { "必要なMetal機能がサポートされていません" }
+            return false
+          end
+          
+          Log.info { "Metalサポートを確認: 利用可能 (#{device_count}デバイス検出)" }
+          return true
+        rescue ex
+          Log.error { "Metalサポート確認中にエラーが発生: #{ex.message}" }
+          return false
+        end
+      end
+      {% end %}
+      
+      # DirectXサポートの確認（Windowsのみ）
+      {% if flag?(:windows) %}
+      private def check_directx_support : Bool
+        Log.debug { "DirectXサポートを確認中..." }
+        begin
+          # DirectX DLLの存在確認
+          d3d12_path = "C:\\Windows\\System32\\d3d12.dll"
+          dxgi_path = "C:\\Windows\\System32\\dxgi.dll"
+          
+          if !File.exists?(d3d12_path) || !File.exists?(dxgi_path)
+            Log.debug { "DirectX 12ライブラリが見つかりません" }
+            return false
+          end
+          
+          # Windows 10以降の確認（DirectX 12に必要）
+          windows_version = LibWindows.get_os_version
+          if windows_version < LibWindows::MIN_DX12_OS_VERSION
+            Log.debug { "DirectX 12にはWindows 10以降が必要です。検出: #{windows_version}" }
+            return false
+          end
+          
+          # DirectX 12対応GPUの検出
+          adapter_count = LibDX12.enumerate_adapters
+          if adapter_count <= 0
+            Log.debug { "DirectX 12対応GPUアダプタが見つかりません" }
+            return false
+          end
+          
+          # ハードウェア機能レベルの確認
+          feature_level = LibDX12.check_max_feature_level
+          if feature_level < LibDX12::FEATURE_LEVEL_11_0
+            Log.debug { "必要なDirectX機能レベルがサポートされていません" }
+            return false
+          end
+          
+          Log.info { "DirectXサポートを確認: 利用可能 (#{adapter_count}アダプタ検出, 機能レベル: #{feature_level})" }
+          return true
+        rescue ex
+          Log.error { "DirectXサポート確認中にエラーが発生: #{ex.message}" }
+          return false
+        end
+      end
+      {% end %}
+      # レンダリングコンテキストの設定
+      private def setup_rendering_context
+        if @hardware_accelerated
+          # 最適なGPUバックエンドを選択
+          select_optimal_gpu_backend
+        else
+          # ソフトウェアレンダリングの初期化
+          initialize_software_backend
+        end
+      end
+      
+      # 最適なGPUバックエンドを選択
+      private def select_optimal_gpu_backend
+        # 利用可能なバックエンドから最適なものを選択
+        if @@available_backends.includes?(:vulkan)
+          initialize_vulkan_backend
+        elsif @@available_backends.includes?(:metal)
+          initialize_metal_backend
+        elsif @@available_backends.includes?(:directx)
+          initialize_directx_backend
+        elsif @@available_backends.includes?(:opengl)
+          initialize_opengl_backend
+        else
+          # GPUバックエンドが利用できない場合はソフトウェアにフォールバック
+          @hardware_accelerated = false
+          @backend_type = :software
+          initialize_software_backend
+        end
+      end
+      
+      # Vulkanバックエンドの初期化
+      private def initialize_vulkan_backend
+        # Vulkan APIの初期化
+        @backend_type = :vulkan
+        @@rendering_api = "Vulkan"
+        
+        # インスタンスの作成
+        instance_info = VulkanInstanceCreateInfo.new
+        instance_info.application_name = "Quantum Browser"
+        instance_info.application_version = Version.new(1, 0, 0)
+        
+        # 必要な拡張機能の設定
+        required_extensions = ["VK_KHR_surface", "VK_KHR_xcb_surface"]
+        instance_info.enabled_extensions = required_extensions
+        
+        # バリデーションレイヤーの設定（デバッグビルドのみ）
+        {% if flag?(:debug) %}
+        instance_info.enable_validation = true
+        {% end %}
+        
+        # インスタンス作成
+        @vulkan_instance = VulkanInstance.new(instance_info)
+        
+        # 物理デバイスの選択
+        physical_devices = @vulkan_instance.enumerate_physical_devices
+        if physical_devices.empty?
+          Log.error { "Vulkan対応のGPUが見つかりません" }
+          raise RenderingError.new("Vulkan対応のGPUが見つかりません")
+        end
+        
+        # 最適なデバイスを選択（専用GPUを優先）
+        @physical_device = select_optimal_device(physical_devices)
+        Log.info { "選択されたGPU: #{@physical_device.properties.device_name}" }
+        
+        # 論理デバイスとキューの作成
+        queue_family_index = find_graphics_queue_family(@physical_device)
+        device_create_info = VulkanDeviceCreateInfo.new
+        device_create_info.queue_family_index = queue_family_index
+        device_create_info.enabled_features = VulkanPhysicalDeviceFeatures.new
+        
+        @vulkan_device = @physical_device.create_logical_device(device_create_info)
+        @graphics_queue = @vulkan_device.get_queue(queue_family_index, 0)
+        
+        # コマンドプールの作成
+        command_pool_info = VulkanCommandPoolCreateInfo.new
+        command_pool_info.queue_family_index = queue_family_index
+        command_pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+        @command_pool = @vulkan_device.create_command_pool(command_pool_info)
+        
+        # スワップチェーンの設定
+        setup_vulkan_swapchain
+        
+        # レンダーパスの作成
+        create_vulkan_render_pass
+        
+        # フレームバッファの作成
+        create_vulkan_framebuffers
+        
+        # シェーダーモジュールの読み込み
+        load_vulkan_shaders
+        
+        # パイプラインの作成
+        create_vulkan_graphics_pipeline
+        
+        # 同期オブジェクトの作成
+        create_vulkan_sync_objects
+        
+        @@gpu_initialized = true
+        Log.info { "Vulkanレンダリングバックエンドを初期化しました" }
+      end
+      
+      # OpenGLバックエンドの初期化
+      private def initialize_opengl_backend
+        # OpenGL APIの初期化
+        @backend_type = :opengl
+        @@rendering_api = "OpenGL"
+        
+        # OpenGLコンテキストの作成
+        @gl_context = GLContext.create(@window_handle)
+        
+        # OpenGLバージョンの確認
+        gl_version = LibGL.get_string(LibGL::VERSION)
+        gl_renderer = LibGL.get_string(LibGL::RENDERER)
+        gl_vendor = LibGL.get_string(LibGL::VENDOR)
+        
+        Log.info { "OpenGL情報: バージョン #{gl_version}, レンダラー #{gl_renderer}, ベンダー #{gl_vendor}" }
+        
+        # 拡張機能のサポート確認
+        check_opengl_extensions
+        
+        # シェーダーの読み込み
+        @shader_program = create_shader_program("shaders/vertex.glsl", "shaders/fragment.glsl")
+        
+        # VAOとVBOの設定
+        setup_opengl_buffers
+        
+        # フレームバッファオブジェクトの作成
+        create_opengl_framebuffer
+        
+        # テクスチャの初期化
+        initialize_opengl_textures
+        
+        # デプスバッファの設定
+        setup_opengl_depth_buffer
+        
+        # アンチエイリアシングの設定
+        if @antialiasing_enabled
+          LibGL.enable(LibGL::MULTISAMPLE)
+        end
+        
+        # 初期ビューポートの設定
+        LibGL.viewport(0, 0, @canvas_width, @canvas_height)
+        
+        @@gpu_initialized = true
+        Log.info { "OpenGLレンダリングバックエンドを初期化しました" }
+      end
+      
+      # Metalバックエンドの初期化（macOSのみ）
+      {% if flag?(:darwin) %}
+      private def initialize_metal_backend
+        # Metal APIの初期化
+        @backend_type = :metal
+        @@rendering_api = "Metal"
+        
+        # Metalデバイスの取得
+        @metal_device = MTLCreateSystemDefaultDevice()
+        if @metal_device.nil?
+          Log.error { "Metal対応のGPUが見つかりません" }
+          raise RenderingError.new("Metal対応のGPUが見つかりません")
+        end
+        
+        # デバイス情報のログ出力
+        device_name = @metal_device.name.to_s
+        Log.info { "Metal GPU: #{device_name}" }
+        
+        # コマンドキューの作成
+        @command_queue = @metal_device.newCommandQueue
+        
+        # レイヤーの設定
+        @metal_layer = CAMetalLayer.layer
+        @metal_layer.device = @metal_device
+        @metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm
+        @metal_layer.framebufferOnly = true
+        @metal_layer.frame = CGRect.new(0, 0, @canvas_width, @canvas_height)
+        
+        # ビューにレイヤーを追加
+        @view.layer = @metal_layer
+        
+        # ライブラリの読み込み
+        default_library = @metal_device.newDefaultLibrary
+        
+        # シェーダー関数の取得
+        vertex_function = default_library.newFunctionWithName("vertexShader")
+        fragment_function = default_library.newFunctionWithName("fragmentShader")
+        
+        # レンダーパイプラインの設定
+        pipeline_descriptor = MTLRenderPipelineDescriptor.new
+        pipeline_descriptor.vertexFunction = vertex_function
+        pipeline_descriptor.fragmentFunction = fragment_function
+        pipeline_descriptor.colorAttachments[0].pixelFormat = @metal_layer.pixelFormat
+        
+        # パイプラインステートの作成
+        @pipeline_state = @metal_device.newRenderPipelineStateWithDescriptor(pipeline_descriptor)
+        
+        # デプスステンシルステートの作成
+        depth_descriptor = MTLDepthStencilDescriptor.new
+        depth_descriptor.depthCompareFunction = MTLCompareFunctionLess
+        depth_descriptor.depthWriteEnabled = true
+        @depth_state = @metal_device.newDepthStencilStateWithDescriptor(depth_descriptor)
+        
+        # バッファの作成
+        @vertex_buffer = create_metal_vertex_buffer
+        @uniform_buffer = create_metal_uniform_buffer
+        
+        @@gpu_initialized = true
+        Log.info { "Metalレンダリングバックエンドを初期化しました" }
+      end
+      {% end %}
+      
+      # DirectXバックエンドの初期化（Windowsのみ）
+      {% if flag?(:windows) %}
+      private def initialize_directx_backend
+        # DirectX APIの初期化
+        @backend_type = :directx
+        @@rendering_api = "DirectX"
+        
+        # デバッグレイヤーの有効化（デバッグビルドのみ）
+        {% if flag?(:debug) %}
+        LibDX12.enable_debug_layer
+        {% end %}
+        
+        # ファクトリーの作成
+        @dxgi_factory = LibDX12.create_factory
+        
+        # アダプターの列挙と選択
+        adapters = @dxgi_factory.enumerate_adapters
+        if adapters.empty?
+          Log.error { "DirectX 12対応のGPUが見つかりません" }
+          raise RenderingError.new("DirectX 12対応のGPUが見つかりません")
+        end
+        
+        # 最適なアダプターを選択
+        @adapter = select_optimal_dx_adapter(adapters)
+        adapter_desc = @adapter.get_description
+        Log.info { "選択されたGPU: #{adapter_desc.description}" }
+        
+        # デバイスの作成
+        @device = LibDX12.create_device(@adapter)
+        
+        # コマンドキューの作成
+        queue_desc = D3D12_COMMAND_QUEUE_DESC.new
+        queue_desc.type = D3D12_COMMAND_LIST_TYPE_DIRECT
+        @command_queue = @device.create_command_queue(queue_desc)
+        
+        # スワップチェーンの作成
+        swap_chain_desc = DXGI_SWAP_CHAIN_DESC1.new
+        swap_chain_desc.width = @canvas_width
+        swap_chain_desc.height = @canvas_height
+        swap_chain_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM
+        swap_chain_desc.sample_desc.count = 1
+        swap_chain_desc.buffer_count = FRAME_COUNT
+        swap_chain_desc.buffer_usage = DXGI_USAGE_RENDER_TARGET_OUTPUT
+        swap_chain_desc.swap_effect = DXGI_SWAP_EFFECT_FLIP_DISCARD
+        
+        @swap_chain = @dxgi_factory.create_swap_chain_for_hwnd(
+          @command_queue,
+          @window_handle,
+          swap_chain_desc
+        )
+        
+        # ディスクリプタヒープの作成
+        create_dx_descriptor_heaps
+        
+        # レンダーターゲットビューの作成
+        create_dx_render_target_views
+        
+        # コマンドアロケーターとリストの作成
+        @command_allocator = @device.create_command_allocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+        @command_list = @device.create_command_list(
+          0,
+          D3D12_COMMAND_LIST_TYPE_DIRECT,
+          @command_allocator
+        )
+        @command_list.close
+        
+        # フェンスの作成
+        @fence = @device.create_fence(0)
+        @fence_value = 1
+        @fence_event = LibWindows.create_event_handle
+        
+        # ルートシグネチャの作成
+        create_dx_root_signature
+        
+        # パイプラインステートの作成
+        create_dx_pipeline_state
+        
+        # 頂点バッファの作成
+        create_dx_vertex_buffer
+        
+        # 定数バッファの作成
+        create_dx_constant_buffer
+        
+        @@gpu_initialized = true
+        Log.info { "DirectXレンダリングバックエンドを初期化しました" }
+      end
+      {% end %}
+      
+      # ソフトウェアレンダリングバックエンドの初期化
+      private def initialize_software_backend
+        # ソフトウェアレンダリングの初期化
+        @backend_type = :software
+        @@rendering_api = "Software"
+        
+        # ピクセルバッファの作成
+        @pixel_buffer = Pointer(UInt32).malloc(@canvas_width * @canvas_height)
+        
+        # Zバッファの作成
+        @z_buffer = Pointer(Float32).malloc(@canvas_width * @canvas_height)
+        
+        # ラスタライザーの初期化
+        @rasterizer = SoftwareRasterizer.new(@canvas_width, @canvas_height, @pixel_buffer, @z_buffer)
+        
+        # テクスチャマネージャーの初期化
+        @texture_manager = TextureManager.new
+        
+        # シェーダーの初期化
+        @vertex_shader = DefaultVertexShader.new
+        @fragment_shader = DefaultFragmentShader.new
+        
+        # レンダリングパイプラインの設定
+        @pipeline = SoftwarePipeline.new(
+          @rasterizer,
+          @vertex_shader,
+          @fragment_shader,
+          @texture_manager
+        )
+        
+        # 最適化設定
+        @use_simd = CPU.supports_simd?
+        @use_multithreading = true
+        @thread_count = CPU.core_count
+        
+        if @use_multithreading
+          # スレッドプールの初期化
+          @thread_pool = ThreadPool.new(@thread_count)
+          Log.info { "ソフトウェアレンダリング: マルチスレッドモード (#{@thread_count}スレッド)" }
+        end
+        
+        if @use_simd
+          Log.info { "ソフトウェアレンダリング: SIMDアクセラレーション有効" }
+        end
+        
+        @@gpu_initialized = false
+        Log.info { "ソフトウェアレンダリングバックエンドを初期化しました" }
+      end
+      
+      # ハードウェアアクセラレーションを使用したコンテキストの初期化（クラスメソッド）
+      def self.initialize_hardware_accelerated
+        # 利用可能なGPUバックエンドを検出
+        detect_available_backends if @@available_backends.empty?
+        
+        # 最適なGPUバックエンドを選択
+        if @@available_backends.includes?(:vulkan)
+          @@rendering_api = "Vulkan"
+          # Vulkanインスタンスの作成
+          instance_info = VulkanInstanceCreateInfo.new
+          instance_info.application_name = "Quantum Browser"
+          instance_info.application_version = Version.new(1, 0, 0)
+          @@vulkan_instance = VulkanInstance.new(instance_info)
+          
+          # 物理デバイスの列挙
+          physical_devices = @@vulkan_instance.enumerate_physical_devices
+          if !physical_devices.empty?
+            # 最適なデバイスを選択
+            @@physical_device = select_optimal_device(physical_devices)
+            Log.info { "Vulkan: 選択されたGPU: #{@@physical_device.properties.device_name}" }
+          end
+        elsif @@available_backends.includes?(:metal)
+          @@rendering_api = "Metal"
+          # Metalデバイスの取得
+          @@metal_device = MTLCreateSystemDefaultDevice()
+          if !@@metal_device.nil?
+            Log.info { "Metal: 選択されたGPU: #{@@metal_device.name}" }
+          end
+        elsif @@available_backends.includes?(:directx)
+          @@rendering_api = "DirectX"
+          # DirectXファクトリーの作成
+          @@dxgi_factory = LibDX12.create_factory
+          
+          # アダプターの列挙
+          adapters = @@dxgi_factory.enumerate_adapters
+          if !adapters.empty?
+            # 最適なアダプターを選択
+            @@dx_adapter = select_optimal_dx_adapter(adapters)
+            adapter_desc = @@dx_adapter.get_description
+            Log.info { "DirectX: 選択されたGPU: #{adapter_desc.description}" }
+          end
+        elsif @@available_backends.includes?(:opengl)
+          @@rendering_api = "OpenGL"
+          # OpenGLコンテキストの作成
+          begin
+            # OpenGLバージョンの検出
+            gl_version = LibGL.get_string(LibGL::VERSION)
+            gl_renderer = LibGL.get_string(LibGL::RENDERER)
+            gl_vendor = LibGL.get_string(LibGL::VENDOR)
+            
+            # 拡張機能のサポート確認
+            extensions = get_gl_extensions
+            
+            # シェーダーサポートの確認
+            shader_support = {
+              vertex: LibGL.is_shader_supported(LibGL::VERTEX_SHADER),
+              fragment: LibGL.is_shader_supported(LibGL::FRAGMENT_SHADER),
+              geometry: LibGL.is_shader_supported(LibGL::GEOMETRY_SHADER),
+              compute: LibGL.is_shader_supported(LibGL::COMPUTE_SHADER)
+            }
+            
+            # FBOサポートの確認
+            fbo_supported = LibGL.is_extension_supported("GL_ARB_framebuffer_object")
+            
+            # VBOサポートの確認
+            vbo_supported = LibGL.is_extension_supported("GL_ARB_vertex_buffer_object")
+            
+            # 最大テクスチャサイズの取得
+            max_texture_size = LibGL.get_integer(LibGL::MAX_TEXTURE_SIZE)
+            
+            # マルチサンプリングサポートの確認
+            max_samples = LibGL.get_integer(LibGL::MAX_SAMPLES)
+            
+            # シェーダーコンパイラの初期化
+            @@gl_shader_compiler = GLShaderCompiler.new if shader_support[:vertex] && shader_support[:fragment]
+            
+            # レンダリングコンテキストの設定
+            @@gl_context_config = {
+              double_buffer: true,
+              depth_bits: 24,
+              stencil_bits: 8,
+              samples: [max_samples, 4].min, # 最大4xMSAAまで使用
+              vsync: true
+            }
+            
+            Log.info { "OpenGL: バージョン #{gl_version} (#{gl_vendor} - #{gl_renderer})" }
+            Log.info { "OpenGL: シェーダーサポート: #{shader_support.select { |_, v| v }.keys.join(", ")}" }
+            Log.info { "OpenGL: FBO サポート: #{fbo_supported}, VBO サポート: #{vbo_supported}" }
+            Log.info { "OpenGL: 最大テクスチャサイズ: #{max_texture_size}px, MSAA: #{max_samples}x" }
+            
+            # 初期化成功
+            @@gl_initialized = true
+          rescue ex
+            Log.error { "OpenGL初期化エラー: #{ex.message}" }
+            Log.warn { "OpenGLの初期化に失敗したため、ソフトウェアレンダリングにフォールバックします" }
+            @@rendering_api = "Software"
+            return initialize_software
+          end
+        else
+          @@rendering_api = "Software"
+          Log.warn { "GPUバックエンドが利用できないため、ソフトウェアレンダリングにフォールバックします" }
+          return initialize_software
+        end
+        
+        @@gpu_initialized = true
+        Log.info { "ハードウェアアクセラレーションを初期化しました（#{@@rendering_api}）" }
+      end
+      # ソフトウェアレンダリングを使用したコンテキストの初期化（クラスメソッド）
+      def self.initialize_software
+        # ソフトウェアレンダリングの初期化
+        @@gpu_initialized = false
+        @@rendering_api = "Software"
+        
+        # CPUの機能を検出
+        cpu_info = CPU.get_info
+        
+        # SIMD命令セットのサポート確認
+        simd_support = {
+          sse: CPU.supports_sse?,
+          sse2: CPU.supports_sse2?,
+          avx: CPU.supports_avx?,
+          avx2: CPU.supports_avx2?,
+          neon: CPU.supports_neon?
+        }
+        
+        # 最適化設定
+        @@use_simd = simd_support.values.any?
+        @@use_multithreading = true
+        @@thread_count = CPU.core_count
+        
+        # 最適化情報のログ出力
+        if @@use_simd
+          supported_sets = simd_support.select { |_, v| v }.keys.join(", ")
+          Log.info { "ソフトウェアレンダリング: SIMD最適化有効 (#{supported_sets})" }
+        end
+        
+        if @@use_multithreading
+          Log.info { "ソフトウェアレンダリング: マルチスレッド最適化有効 (#{@@thread_count}コア)" }
+        end
+        
+        Log.info { "ソフトウェアレンダリングを初期化しました" }
+      end
+      
+      # コンテキストの解放（クラスメソッド）
+      def self.cleanup
+        # リソースの解放
+        if @@gpu_initialized
+          # GPUリソースの解放
+          case @@rendering_api
+          when "Vulkan"
+            # Vulkanリソースの解放
+            if @@vulkan_instance
+              # デバイスの解放
+              if @@vulkan_device
+                # コマンドプールの解放
+                if @@command_pool
+                  @@vulkan_device.destroy_command_pool(@@command_pool)
+                end
+                
+                # スワップチェーンの解放
+                if @@swapchain
+                  @@swapchain.destroy
+                end
+                
+                # レンダーパスの解放
+                if @@render_pass
+                  @@vulkan_device.destroy_render_pass(@@render_pass)
+                end
+                
+                # フレームバッファの解放
+                @@framebuffers.each do |framebuffer|
+                  @@vulkan_device.destroy_framebuffer(framebuffer)
+                end
+                
+                # シェーダーモジュールの解放
+                if @@vertex_shader_module
+                  @@vulkan_device.destroy_shader_module(@@vertex_shader_module)
+                end
+                
+                if @@fragment_shader_module
+                  @@vulkan_device.destroy_shader_module(@@fragment_shader_module)
+                end
+                
+                # パイプラインの解放
+                if @@pipeline
+                  @@vulkan_device.destroy_pipeline(@@pipeline)
+                end
+                
+                # パイプラインレイアウトの解放
+                if @@pipeline_layout
+                  @@vulkan_device.destroy_pipeline_layout(@@pipeline_layout)
+                end
+                
+                # 同期オブジェクトの解放
+                @@image_available_semaphores.each do |semaphore|
+                  @@vulkan_device.destroy_semaphore(semaphore)
+                end
+                
+                @@render_finished_semaphores.each do |semaphore|
+                  @@vulkan_device.destroy_semaphore(semaphore)
+                end
+                
+                @@in_flight_fences.each do |fence|
+                  @@vulkan_device.destroy_fence(fence)
+                end
+                
+                # 論理デバイスの解放
+                @@vulkan_device.destroy
+              end
+              
+              # インスタンスの解放
+              @@vulkan_instance.destroy
+            end
+            
+            Log.info { "Vulkanリソースを解放しました" }
+          when "OpenGL"
+            # OpenGLリソースの解放
+            if @@shader_program
+              LibGL.delete_program(@@shader_program)
+            end
+            
+            if @@vao
+              LibGL.delete_vertex_arrays(1, pointerof(@@vao))
+            end
+            
+            if @@vbo
+              LibGL.delete_buffers(1, pointerof(@@vbo))
+            end
+            
+            if @@framebuffer
+              LibGL.delete_framebuffers(1, pointerof(@@framebuffer))
+            end
+            
+            if @@texture
+              LibGL.delete_textures(1, pointerof(@@texture))
+            end
+            
+            # OpenGLコンテキストの解放
+            if @@gl_context
+              @@gl_context.destroy
+            end
+            
+            Log.info { "OpenGLリソースを解放しました" }
+          when "Metal"
+            # Metalリソースの解放
+            # 明示的な解放は不要（ARC）
+            Log.info { "Metalリソースを解放しました" }
+          when "DirectX"
+            # DirectXリソースの解放
+            if @@fence_event
+              LibWindows.close_handle(@@fence_event)
+            end
+            
+            # COMオブジェクトの解放
+            [
+              @@vertex_buffer, @@constant_buffer,
+              @@pipeline_state, @@root_signature,
+              @@rtv_heap, @@cbv_heap,
+              @@command_list, @@command_allocator,
+              @@fence, @@command_queue,
+              @@swap_chain, @@device,
+              @@adapter, @@dxgi_factory
+            ].each do |com_obj|
+              if com_obj
+                com_obj.release
+              end
+            end
+            
+            Log.info { "DirectXリソースを解放しました" }
+          end
+        else
+          # ソフトウェアレンダリングリソースの解放
+          if @@pixel_buffer
+            @@pixel_buffer.free
+          end
+          
+          if @@z_buffer
+            @@z_buffer.free
+          end
+          
+          if @@thread_pool
+            @@thread_pool.shutdown
+          end
+        end
+        
+        # その他のリソース解放
+        Log.info { "レンダリングコンテキストをクリーンアップしました" }
+        
+        @@gpu_initialized = false
+        @@rendering_api = "None"
+      end
+      
+      # キャンバスのサイズ変更
+      def resize(width : Int32, height : Int32)
+        @canvas_width = width
+        @canvas_height = height
+        
+        # レンダリングバッファのリサイズ
+        if @hardware_accelerated
+          case @backend_type
+          when :vulkan
+            # Vulkanスワップチェーンのリサイズ
+            wait_device_idle
+            
+            # 古いスワップチェーンリソースの解放
+            cleanup_vulkan_swapchain
+            
+            # 新しいスワップチェーンの作成
+            setup_vulkan_swapchain
+            
+            # レンダーパスの再作成
+            create_vulkan_render_pass
+            
+            # フレームバッファの再作成
+            create_vulkan_framebuffers
+            
+            # パイプラインの再作成
+            create_vulkan_graphics_pipeline
+            
+            Log.debug { "Vulkanスワップチェーンをリサイズしました: #{width}x#{height}" }
+          when :opengl
+            # OpenGLビューポートのリサイズ
+            LibGL.viewport(0, 0, width, height)
+            
+            # フレームバッファのリサイズ
+            if @framebuffer
+              LibGL.delete_framebuffers(1, pointerof(@framebuffer))
+            end
+            
+            if @texture
+              LibGL.delete_textures(1, pointerof(@texture))
+            }
+            
+            # 新しいフレームバッファの作成
+            create_opengl_framebuffer
+            
+            Log.debug { "OpenGLビューポートをリサイズしました: #{width}x#{height}" }
+          when :metal
+            # Metalドローアブルのリサイズ
+            @metal_layer.frame = CGRect.new(0, 0, width, height)
+            
+            Log.debug { "Metalドローアブルをリサイズしました: #{width}x#{height}" }
+          when :directx
+            # DirectXスワップチェーンのリサイズ
+            # コマンドリストの実行完了を待機
+            wait_for_gpu
+            
+            # レンダーターゲットビューの解放
+            @render_target_views.each do |rtv|
+              rtv.release if rtv
+            end
+            
+            # スワップチェーンのリサイズ
+            @swap_chain.resize_buffers(FRAME_COUNT, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0)
+            
+            # 新しいレンダーターゲットビューの作成
+            create_dx_render_target_views
+            
+            Log.debug { "DirectXスワップチェーンをリサイズしました: #{width}x#{height}" }
+          end
+        else
+          # ソフトウェアバッファのリサイズ
+          if @pixel_buffer
+            @pixel_buffer.free
+          end
+          
+          if @z_buffer
+            @z_buffer.free
+          end
+          
+          # 新しいバッファの割り当て
+          @pixel_buffer = Pointer(UInt32).malloc(width * height)
+          @z_buffer = Pointer(Float32).malloc(width * height)
+          
+          # ラスタライザーの更新
+          @rasterizer.resize(width, height, @pixel_buffer, @z_buffer)
+          
+          Log.debug { "ソフトウェアレンダリングバッファをリサイズしました: #{width}x#{height}" }
+        end
+        
+        # 適応型レンダリング解像度の調整
+        adjust_resolution_scale
+      end
+      # 適応型レンダリング解像度の調整
+      def adjust_resolution_scale
+        # 現在のフレームレートとシステムリソースに基づいて解像度スケールを調整
+        current_memory_usage = get_system_memory_usage
+        current_gpu_usage = get_gpu_usage if @hardware_accelerated
+        
+        # パフォーマンスメトリクスの収集
+        performance_score = calculate_performance_score(
+          fps: @current_fps,
+          memory_usage: current_memory_usage,
+          gpu_usage: current_gpu_usage,
+          battery_level: get_battery_level
+        )
+        
+        # 動的解像度スケーリングの適用
+        if performance_score < @performance_threshold_low && @resolution_scale > @min_resolution_scale
+          # パフォーマンスが低い場合は解像度を段階的に下げる
+          reduction_rate = Math.min(0.1, (@performance_threshold_low - performance_score) / 100.0)
+          @resolution_scale = Math.max(@min_resolution_scale, @resolution_scale - reduction_rate)
+          Log.debug { "パフォーマンス向上のため解像度スケールを下げました: #{@resolution_scale} (スコア: #{performance_score})" }
+        elsif performance_score > @performance_threshold_high && @resolution_scale < @max_resolution_scale
+          # パフォーマンスが十分高い場合は解像度を段階的に上げる
+          increase_rate = Math.min(0.05, (performance_score - @performance_threshold_high) / 100.0)
+          @resolution_scale = Math.min(@max_resolution_scale, @resolution_scale + increase_rate)
+          Log.debug { "品質向上のため解像度スケールを上げました: #{@resolution_scale} (スコア: #{performance_score})" }
+        end
+        
+
+        actual_width = ((@canvas_width.to_f64 * @resolution_scale) / 2.0).to_i * 2
+        actual_height = ((@canvas_height.to_f64 * @resolution_scale) / 2.0).to_i * 2
+        
+        # 最小解像度を保証
+        actual_width = Math.max(actual_width, @min_render_width)
+        actual_height = Math.max(actual_height, @min_render_height)
+        
+        # レンダリングバッファのサイズを調整
+        if @hardware_accelerated
+          case @backend_type
+          when :opengl
+            # OpenGLフレームバッファのリサイズ
+            resize_opengl_framebuffer(actual_width, actual_height)
+          when :vulkan
+            # Vulkanレンダリングターゲットのリサイズ
+            resize_vulkan_render_target(actual_width, actual_height)
+          when :metal
+            # Metalレンダリングターゲットのリサイズ
+            resize_metal_drawable(actual_width, actual_height)
+          when :directx
+            # DirectXレンダリングターゲットのリサイズ
+            resize_directx_render_target(actual_width, actual_height)
+          end
+          
+          # アップスケーリング品質の調整
+          adjust_upscaling_quality
+          
+          Log.debug { "ハードウェアレンダリングターゲットを調整: #{actual_width}x#{actual_height} (元の解像度: #{@canvas_width}x#{@canvas_height})" }
+        else
+          # ソフトウェアレンダリングバッファのリサイズ
+          resize_software_buffer(actual_width, actual_height)
+          Log.debug { "ソフトウェアレンダリングバッファを調整: #{actual_width}x#{actual_height}" }
+        end
+        
+        # 現在の解像度設定を保存
+        @current_render_width = actual_width
+        @current_render_height = actual_height
+        
+        # レンダリングパイプラインに解像度変更を通知
+        notify_resolution_change(actual_width, actual_height)
+      end
+      
+      # 電力使用モードの設定
+      def set_power_mode(mode : Symbol)
+        @power_mode = mode
+        
+        case mode
+        when :performance
+          # 最高パフォーマンスモード
+          @resolution_scale = 1.0
+          Log.info { "パフォーマンス優先モードに設定しました" }
+        when :balanced
+          # バランスモード
+          @resolution_scale = 0.9
+          Log.info { "バランスモードに設定しました" }
+        when :power_saving
+          # 省電力モード
+          @resolution_scale = 0.7
+          Log.info { "省電力モードに設定しました" }
+        when :ultra_power_saving
+          # 超省電力モード
+          @resolution_scale = 0.5
+          Log.info { "超省電力モードに設定しました" }
+        end
+      end
+      
+      # クラスメソッド：利用可能なバックエンドを検出
+      private def self.detect_available_backends
+        @@available_backends = [] of Symbol
+        
+        # 各バックエンドのサポート確認
+        # OpenGLサポートの確認
+        if LibGL.gl_supported?
+          @@available_backends << :opengl
+          Log.debug { "OpenGLバックエンドが利用可能です" }
+        end
+        
+        # Vulkanサポートの確認
+        if LibVulkan.vulkan_supported?
+          @@available_backends << :vulkan
+          Log.debug { "Vulkanバックエンドが利用可能です" }
+        end
+        
+        # Metal (macOS/iOS) サポートの確認
+        {% if flag?(:darwin) %}
+          if LibMetal.metal_supported?
+            @@available_backends << :metal
+            Log.debug { "Metalバックエンドが利用可能です" }
+          end
+        {% end %}
+        
+        # Direct3D (Windows) サポートの確認
+        {% if flag?(:windows) %}
+          if LibD3D.d3d_supported?
+            @@available_backends << :direct3d
+            Log.debug { "Direct3Dバックエンドが利用可能です" }
+          end
+        {% end %}
+        
+        # WebGPU サポートの確認
+        if LibWebGPU.webgpu_supported?
+          @@available_backends << :webgpu
+          Log.debug { "WebGPUバックエンドが利用可能です" }
+        end
+        
+        # ソフトウェアレンダリングは常に利用可能
+        @@available_backends << :software
+        
+        # ハードウェアアクセラレーションが一つも利用できない場合の警告
+        if @@available_backends.size == 1 && @@available_backends.includes?(:software)
+          Log.warn { "ハードウェアアクセラレーションが利用できません。パフォーマンスが低下する可能性があります。" }
+        end
+        
+        Log.info { "利用可能なレンダリングバックエンド: #{@@available_backends.join(", ")}" }
+      end
+      
+      # キャンバスのクリア
+      def clear(color : Color = Color.white)
+        # パフォーマンス計測開始
+        start_time = Time.monotonic
+        
+        # 画面をクリア
+        if @hardware_accelerated
+          # OpenGLのclearColor + clear呼び出し相当
+          r = color.r.to_f32 / 255.0
+          g = color.g.to_f32 / 255.0
+          b = color.b.to_f32 / 255.0
+          a = color.a.to_f32 / 255.0
+          
+          case @backend
+          when :opengl
+            LibGL.clear_color(r, g, b, a)
+            LibGL.clear(LibGL::COLOR_BUFFER_BIT | LibGL::DEPTH_BUFFER_BIT)
+          when :vulkan
+            @vulkan_renderer.clear_color(r, g, b, a)
+          when :metal
+            @metal_renderer.clear_color(r, g, b, a)
+          when :direct3d
+            @d3d_renderer.clear_color(r, g, b, a)
+          when :webgpu
+            @webgpu_renderer.clear_color(r, g, b, a)
+          end
+          
+          Log.debug { "ハードウェアアクセラレーションでキャンバスをクリアしました: RGBA(#{r}, #{g}, #{b}, #{a})" }
+        else
+          # ソフトウェアバッファの全ピクセルを指定色で塗りつぶし
+          pixel_value = (color.a.to_u32 << 24) | (color.b.to_u32 << 16) | (color.g.to_u32 << 8) | color.r.to_u32
+          
+          # 最適化：メモリブロックとして一括設定
+          @pixel_buffer.fill(pixel_value)
+          
+          Log.debug { "ソフトウェアバッファをクリアしました: #{color.r}, #{color.g}, #{color.b}, #{color.a}" }
+        end
+        
+        # パフォーマンス計測終了
+        end_time = Time.monotonic
+        @clear_time = (end_time - start_time).total_milliseconds
+        
+        # パフォーマンスモニタリング
+        if @performance_monitoring && @clear_time > 1.0
+          Log.warn { "キャンバスクリアに時間がかかっています: #{@clear_time.round(2)}ms" }
+        end
+      end
+      
+      # 矩形の描画
+      def draw_rect(x : Float64, y : Float64, width : Float64, height : Float64, color : Color)
+        # パフォーマンス計測開始
+        start_time = Time.monotonic
+        
+        # 解像度スケールを適用
+        scaled_x = x * @resolution_scale
+        scaled_y = y * @resolution_scale
+        scaled_width = width * @resolution_scale
+        scaled_height = height * @resolution_scale
+        
+        # 矩形を描画
+        if @hardware_accelerated
+          # GPUでの矩形描画（シェーダを使用）
+          r = color.r.to_f32 / 255.0
+          g = color.g.to_f32 / 255.0
+          b = color.b.to_f32 / 255.0
+          a = color.a.to_f32 / 255.0
+          
+          # 矩形の頂点データを計算
+          x2 = scaled_x + scaled_width
+          y2 = scaled_y + scaled_height
+          
+          case @backend
+          when :opengl
+            # OpenGLでの矩形描画
+            @rect_shader.use
+            @rect_shader.set_uniform_4f("u_Color", r, g, b, a)
+            @rect_vao.bind
+            
+            # 頂点データを更新
+            vertices = [
+              scaled_x, scaled_y,    # 左上
+              x2, scaled_y,          # 右上
+              x2, y2,                # 右下
+              scaled_x, y2           # 左下
+            ]
+            @rect_vbo.update_data(vertices)
+            
+            # 描画
+            LibGL.draw_elements(LibGL::TRIANGLES, 6, LibGL::UNSIGNED_INT, nil)
+            @rect_vao.unbind
+          when :vulkan
+            # Vulkanでの矩形描画
+            @vulkan_renderer.draw_rect(scaled_x, scaled_y, scaled_width, scaled_height, r, g, b, a)
+          when :metal
+            # Metalでの矩形描画
+            @metal_renderer.draw_rect(scaled_x, scaled_y, scaled_width, scaled_height, r, g, b, a)
+          when :direct3d
+            # Direct3Dでの矩形描画
+            @d3d_renderer.draw_rect(scaled_x, scaled_y, scaled_width, scaled_height, r, g, b, a)
+          when :webgpu
+            # WebGPUでの矩形描画
+            @webgpu_renderer.draw_rect(scaled_x, scaled_y, scaled_width, scaled_height, r, g, b, a)
+          end
+          
+          Log.debug { "GPU矩形描画: (#{scaled_x}, #{scaled_y}) - (#{x2}, #{y2}), RGBA(#{r}, #{g}, #{b}, #{a})" }
+        else
+          # ソフトウェアレンダリングでの矩形描画
+          # キャンバスのピクセルバッファに直接描画
+          
+          # 整数座標に変換
+          ix = scaled_x.to_i
+          iy = scaled_y.to_i
+          iw = scaled_width.to_i
+          ih = scaled_height.to_i
+          
+          # クリッピング（ビューポート外の描画を防止）
+          return if ix >= @canvas_width || iy >= @canvas_height || ix + iw < 0 || iy + ih < 0
+          
+
+          start_x = Math.max(0, ix)
+          start_y = Math.max(0, iy)
+          end_x = Math.min(@canvas_width - 1, ix + iw)
+          end_y = Math.min(@canvas_height - 1, iy + ih)
+          
+          # ピクセル値を計算
+          pixel_value = (color.a.to_u32 << 24) | (color.b.to_u32 << 16) | (color.g.to_u32 << 8) | color.r.to_u32
+          
+          # 最適化：行ごとにメモリブロックとして設定
+          stride = @canvas_width
+          (start_y..end_y).each do |y|
+            offset = y * stride + start_x
+            length = end_x - start_x + 1
+            @pixel_buffer[offset, length] = pixel_value
+          end
+          
+          Log.debug { "ソフトウェア矩形描画: (#{ix}, #{iy}) - (#{ix + iw}, #{iy + ih}), RGBA(#{color.r}, #{color.g}, #{color.b}, #{color.a})" }
+        end
+        
+        # パフォーマンス計測終了
+        end_time = Time.monotonic
+        @rect_draw_time = (end_time - start_time).total_milliseconds
+        
+        # 描画統計の更新
+        @rect_count += 1
+        @total_draw_time += @rect_draw_time
+        
+        # パフォーマンスモニタリング
+        if @performance_monitoring && @rect_draw_time > 5.0
+          Log.warn { "矩形描画に時間がかかっています: #{@rect_draw_time.round(2)}ms" }
+        end
+      end
+      
+      # 画像の描画
+      def draw_image(x : Float64, y : Float64, width : Float64, height : Float64, image : Image)
+        # パフォーマンス計測開始
+        start_time = Time.monotonic
+        
+        # 座標とサイズをデバイスピクセル比でスケーリング
+        scaled_x = x * @resolution_scale
+        scaled_y = y * @resolution_scale
+        scaled_width = width * @resolution_scale
+        scaled_height = height * @resolution_scale
+        
+        # 画像が読み込まれていない場合は警告を出して終了
+        if !image.loaded?
+          Log.warn { "読み込まれていない画像を描画しようとしました: #{image.url}" }
+          return
+        end
+        
+        if @hardware_accelerated
+          # GPUでの画像描画（テクスチャマッピング）
+          case @backend
+          when :opengl
+            # OpenGLでの画像描画
+            # テクスチャをバインド
+            texture_id = image.texture_id
+            LibGL.active_texture(LibGL::TEXTURE0)
+            LibGL.bind_texture(LibGL::TEXTURE_2D, texture_id)
+            
+            # シェーダープログラムをバインド
+            @image_shader.use
+            
+            # ユニフォーム変数を設定
+            @image_shader.set_uniform_1i("u_texture", 0)
+            @image_shader.set_uniform_mat4("u_model_matrix", calculate_model_matrix(scaled_x, scaled_y, scaled_width, scaled_height))
+            @image_shader.set_uniform_mat4("u_view_projection_matrix", @view_projection_matrix)
+            @image_shader.set_uniform_1f("u_opacity", image.opacity)
+            
+            # 矩形の頂点データを設定
+            @rect_vao.bind
+            
+            # 描画
+            LibGL.draw_elements(LibGL::TRIANGLES, 6, LibGL::UNSIGNED_INT, nil)
+            @rect_vao.unbind
+            
+            # テクスチャのバインドを解除
+            LibGL.bind_texture(LibGL::TEXTURE_2D, 0)
+          when :vulkan
+            # Vulkanでの画像描画
+            @vulkan_renderer.draw_image(scaled_x, scaled_y, scaled_width, scaled_height, image)
+          when :metal
+            # Metalでの画像描画
+            @metal_renderer.draw_image(scaled_x, scaled_y, scaled_width, scaled_height, image)
+          when :direct3d
+            # Direct3Dでの画像描画
+            @d3d_renderer.draw_image(scaled_x, scaled_y, scaled_width, scaled_height, image)
+          when :webgpu
+            # WebGPUでの画像描画
+            @webgpu_renderer.draw_image(scaled_x, scaled_y, scaled_width, scaled_height, image)
+          end
+          
+          Log.debug { "GPU画像描画: (#{scaled_x}, #{scaled_y}) - (#{scaled_x + scaled_width}, #{scaled_y + scaled_height}), 画像: #{image.url}" }
+        else
+          # ソフトウェアレンダリングでの画像描画
+          # 整数座標に変換
+          ix = scaled_x.to_i
+          iy = scaled_y.to_i
+          iw = scaled_width.to_i
+          ih = scaled_height.to_i
+          
+          # クリッピング（ビューポート外の描画を防止）
+          return if ix >= @canvas_width || iy >= @canvas_height || ix + iw < 0 || iy + ih < 0
+          
+
+          start_x = Math.max(0, ix)
+          start_y = Math.max(0, iy)
+          end_x = Math.min(@canvas_width - 1, ix + iw)
+          end_y = Math.min(@canvas_height - 1, iy + ih)
+          
+          # 画像のスケーリング係数を計算
+          scale_x = image.width / scaled_width
+          scale_y = image.height / scaled_height
+          
+          # ピクセルバッファに画像データをコピー
+          stride = @canvas_width
+          (start_y..end_y).each do |y|
+            img_y = ((y - iy) * scale_y).to_i
+            img_y = Math.clamp(img_y, 0, image.height - 1)
+            
+            (start_x..end_x).each do |x|
+              img_x = ((x - ix) * scale_x).to_i
+              img_x = Math.clamp(img_x, 0, image.width - 1)
+              
+              # 画像からピクセルを取得
+              pixel = image.get_pixel(img_x, img_y)
+              
+              # アルファブレンディング
+              if pixel.a < 255
+                bg_offset = y * stride + x
+                bg_pixel = @pixel_buffer[bg_offset]
+                
+                # 背景色を抽出
+                bg_r = bg_pixel & 0xFF
+                bg_g = (bg_pixel >> 8) & 0xFF
+                bg_b = (bg_pixel >> 16) & 0xFF
+                bg_a = (bg_pixel >> 24) & 0xFF
+                
+                # アルファブレンディングを適用
+                alpha = pixel.a / 255.0
+                r = (pixel.r * alpha + bg_r * (1 - alpha)).to_u8
+                g = (pixel.g * alpha + bg_g * (1 - alpha)).to_u8
+                b = (pixel.b * alpha + bg_b * (1 - alpha)).to_u8
+                a = Math.max(pixel.a, bg_a).to_u8
+                
+                # ブレンド済みピクセルを設定
+                blended_pixel = (a.to_u32 << 24) | (b.to_u32 << 16) | (g.to_u32 << 8) | r.to_u32
+                @pixel_buffer[bg_offset] = blended_pixel
+              else
+                # 完全不透明なピクセルは直接設定
+                offset = y * stride + x
+                pixel_value = (pixel.a.to_u32 << 24) | (pixel.b.to_u32 << 16) | (pixel.g.to_u32 << 8) | pixel.r.to_u32
+                @pixel_buffer[offset] = pixel_value
+              end
+            end
+          end
+          
+          Log.debug { "ソフトウェア画像描画: (#{ix}, #{iy}) - (#{ix + iw}, #{iy + ih}), 画像: #{image.url}" }
+        end
+        
+        # パフォーマンス計測終了
+        end_time = Time.monotonic
+        @image_draw_time = (end_time - start_time).total_milliseconds
+        
+        # 描画統計の更新
+        @image_count += 1
+        @total_draw_time += @image_draw_time
+      end
+      # テキストの描画
+      def draw_text(x : Float64, y : Float64, text : String, font : Font, color : Color)
+        # テキストを描画
+        if text.empty?
+          return
+        end
+        # パフォーマンス計測開始
+        start_time = Time.monotonic
+        
+        if @hardware_accelerated
+          # GPUでのテキスト描画（テクスチャアトラスからグリフを組み合わせる）
+          r = color.r.to_f32 / 255.0
+          g = color.g.to_f32 / 255.0
+          b = color.b.to_f32 / 255.0
+          a = color.a.to_f32 / 255.0
+          
+          # フォント情報からグリフを取得
+          font_css = font.to_css_string
+          font_size = font.size
+          font_weight = font.weight
+          # テキストの各文字に対してグリフを描画
+          cursor_x = x
+          last_char = nil
+          
+          text.each_char do |char|
+            # グリフデータをフォントキャッシュから取得
+            glyph = @font_cache.get_glyph(char, font)
+            
+            # グリフが見つからない場合はフォールバックフォントを試行
+            if glyph.nil? && @font_fallback_enabled
+              @fallback_fonts.each do |fallback_font|
+                combined_font = Font.new(
+                  family: fallback_font,
+                  size: font.size,
+                  weight: font.weight,
+                  style: font.style
+                )
+                glyph = @font_cache.get_glyph(char, combined_font)
+                break if glyph
+              end
+            end
+            if glyph
+              # グリフのテクスチャ座標を取得
+              tex_coords = glyph.texture_coordinates
+              
+              # グリフの描画サイズを計算
+              glyph_width = glyph.width * (font_size / glyph.base_size)
+              glyph_height = glyph.height * (font_size / glyph.base_size)
+              
+              # グリフの描画位置を計算（ベースラインを考慮）
+              glyph_x = cursor_x + glyph.bearing_x * (font_size / glyph.base_size)
+              glyph_y = y - (glyph.height - glyph.bearing_y) * (font_size / glyph.base_size)
+              
+              # カーニング調整を適用（前の文字との間隔調整）
+              if @last_char && @font_cache.has_kerning?(font)
+                kerning_offset = @font_cache.get_kerning(@last_char, char, font)
+                glyph_x += kerning_offset * (font_size / glyph.base_size)
+              end
+              
+              # GPUにグリフ描画コマンドを送信
+              @gpu_context.draw_glyph(
+                glyph_x, glyph_y, glyph_width, glyph_height,
+                tex_coords, {r, g, b, a}
+              )
+              
+              # カーソル位置を進める
+              cursor_x += glyph.advance_x * (font_size / glyph.base_size)
+              @last_char = char
+            end
+          end
+          
+          # サブピクセルレンダリングの適用（ハードウェアアクセラレーション時）
+          if @enable_subpixel_rendering && font.size < 16
+            @gpu_context.apply_subpixel_filter(@clip_rect)
+          end
+          
+          Log.debug { "GPUテキスト描画: (#{x}, #{y}), '#{text}', フォント: #{font_css}, RGBA(#{r}, #{g}, #{b}, #{a})" }
+        else
+          # ソフトウェアレンダリングでのテキスト描画
+          # 整数座標に変換
+          ix = x.to_i
+          iy = y.to_i
+          
+          # フォント情報からグリフを取得
+          font_css = font.to_css_string
+          font_size = font.size
+          
+          # テキストの各文字に対してグリフをラスタライズして描画
+          cursor_x = ix
+          last_char = nil
+          
+          text.each_char do |char|
+            # グリフデータを取得
+            glyph = @font_cache.get_glyph(char, font)
+            
+            if glyph
+              # グリフのビットマップを取得
+              bitmap = glyph.bitmap
+              
+              # グリフの描画サイズを計算
+              glyph_width = glyph.width
+              glyph_height = glyph.height
               
               # カーニング調整を適用（前の文字との間隔調整）
               if last_char && @font_cache.has_kerning?(font)
@@ -4382,7 +5929,7 @@ module QuantumCore
                 
                 half_k = kernel_size // 2
                 (-half_k..half_k).each do |ky|
-                  (-half_k..half_k).each do |kx|
+                (-half_k..half_k).each do |kx|
                     nx = x + kx
                     ny = y + ky
                     

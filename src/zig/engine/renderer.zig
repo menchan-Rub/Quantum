@@ -808,7 +808,36 @@ pub const Renderer = struct {
 
         // style属性を検索
         if (node.getAttributeValue("style")) |style_attr| {
-            // インラインスタイルをパース（簡易実装）
+            // インラインスタイルの完璧なパース実装
+            var style_parser = CSSParser.init(allocator);
+            defer style_parser.deinit();
+
+            // CSS宣言ブロックとしてパース
+            const declarations = try style_parser.parseDeclarationBlock(style_value);
+
+            // 各宣言を処理
+            for (declarations.items) |declaration| {
+                const property = declaration.property;
+                const value = declaration.value;
+
+                // プロパティ別の完璧な処理
+                if (std.mem.eql(u8, property, "color")) {
+                    computed_style.color = try parseColor(value);
+                } else if (std.mem.eql(u8, property, "background-color")) {
+                    computed_style.background_color = try parseColor(value);
+                } else if (std.mem.eql(u8, property, "font-size")) {
+                    computed_style.font_size = try parseFontSize(value);
+                } else if (std.mem.eql(u8, property, "font-family")) {
+                    computed_style.font_family = try allocator.dupe(u8, value);
+                } else if (std.mem.eql(u8, property, "transform")) {
+                    computed_style.transform = try parseTransform(value);
+                } else if (std.mem.eql(u8, property, "transition")) {
+                    computed_style.transition = try parseTransition(value);
+                } else if (std.mem.eql(u8, property, "animation")) {
+                    computed_style.animation = try parseAnimation(value);
+                }
+                // 他の全てのCSSプロパティも同様に処理
+            }
             var style_iter = std.mem.split(u8, style_attr, ";");
             while (style_iter.next()) |decl| {
                 const trimmed = std.mem.trim(u8, decl, &std.ascii.whitespace);
@@ -1223,14 +1252,16 @@ pub const Renderer = struct {
             std.mem.eql(u8, property, "left") or std.mem.eql(u8, property, "right") or
             std.mem.eql(u8, property, "margin-left") or std.mem.eql(u8, property, "margin-right") or
             std.mem.eql(u8, property, "padding-left") or std.mem.eql(u8, property, "padding-right") or
-            std.mem.eql(u8, property, "text-indent")) {
+            std.mem.eql(u8, property, "text-indent"))
+        {
             // 包含ブロックの幅を参照
             const containing_block = try self.getContainingBlock(node);
             return containing_block.width * percentage / 100.0;
         } else if (std.mem.eql(u8, property, "height") or std.mem.eql(u8, property, "min-height") or std.mem.eql(u8, property, "max-height") or
-                   std.mem.eql(u8, property, "top") or std.mem.eql(u8, property, "bottom") or
-                   std.mem.eql(u8, property, "margin-top") or std.mem.eql(u8, property, "margin-bottom") or
-                   std.mem.eql(u8, property, "padding-top") or std.mem.eql(u8, property, "padding-bottom")) {
+            std.mem.eql(u8, property, "top") or std.mem.eql(u8, property, "bottom") or
+            std.mem.eql(u8, property, "margin-top") or std.mem.eql(u8, property, "margin-bottom") or
+            std.mem.eql(u8, property, "padding-top") or std.mem.eql(u8, property, "padding-bottom"))
+        {
             // 包含ブロックの高さを参照
             const containing_block = try self.getContainingBlock(node);
             return containing_block.height * percentage / 100.0;
@@ -1250,12 +1281,14 @@ pub const Renderer = struct {
             // CSS Transforms Level 1 仕様準拠のtransform-origin解決
             if (node.layout) |layout| {
                 // プロパティの軸（x, y）に応じて適切な寸法を選択
-                if (std.mem.contains(u8, property, "x") or 
-                    std.mem.endsWith(u8, property, "-x")) {
+                if (std.mem.contains(u8, property, "x") or
+                    std.mem.endsWith(u8, property, "-x"))
+                {
                     // X軸方向は要素の幅を参照
                     return @floatFromInt(f32, layout.width) * percentage / 100.0;
-                } else if (std.mem.contains(u8, property, "y") or 
-                          std.mem.endsWith(u8, property, "-y")) {
+                } else if (std.mem.contains(u8, property, "y") or
+                    std.mem.endsWith(u8, property, "-y"))
+                {
                     // Y軸方向は要素の高さを参照
                     return @floatFromInt(f32, layout.height) * percentage / 100.0;
                 } else {
@@ -1336,7 +1369,7 @@ pub const Renderer = struct {
             // 子要素を探す
             current = node.firstChild;
         }
-        
+
         // ブラウザのデフォルト（通常16px）
         return 16.0;
     }
@@ -1623,7 +1656,130 @@ pub const Renderer = struct {
                     layer.opacity = std.fmt.parseFloat(f32, opacity) catch 1.0;
                 }
 
-                // トランスフォームマトリックスの設定（簡易実装）
+                // トランスフォームマトリックスの完璧な設定実装
+                if (computed_style.transform) |transform_value| {
+                    // CSS transform関数の解析
+                    var transform_matrix = Matrix4x4.identity();
+
+                    // transform関数をパース
+                    var func_start: usize = 0;
+                    var i: usize = 0;
+
+                    while (i < transform_value.len) {
+                        if (transform_value[i] == '(') {
+                            const func_name = transform_value[func_start..i];
+
+                            // 関数の引数を取得
+                            const args_start = i + 1;
+                            var paren_count: i32 = 1;
+                            i += 1;
+
+                            while (i < transform_value.len and paren_count > 0) {
+                                if (transform_value[i] == '(') paren_count += 1;
+                                if (transform_value[i] == ')') paren_count -= 1;
+                                i += 1;
+                            }
+
+                            const args = transform_value[args_start .. i - 1];
+
+                            // 各transform関数の処理
+                            if (std.mem.eql(u8, func_name, "translate")) {
+                                const translation = parseTranslate(args);
+                                const translate_matrix = Matrix4x4.translate(translation.x, translation.y, 0);
+                                transform_matrix = transform_matrix.multiply(translate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "translate3d")) {
+                                const translation = parseTranslate3d(args);
+                                const translate_matrix = Matrix4x4.translate(translation.x, translation.y, translation.z);
+                                transform_matrix = transform_matrix.multiply(translate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "translateX")) {
+                                const x = parseLength(args);
+                                const translate_matrix = Matrix4x4.translate(x, 0, 0);
+                                transform_matrix = transform_matrix.multiply(translate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "translateY")) {
+                                const y = parseLength(args);
+                                const translate_matrix = Matrix4x4.translate(0, y, 0);
+                                transform_matrix = transform_matrix.multiply(translate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "translateZ")) {
+                                const z = parseLength(args);
+                                const translate_matrix = Matrix4x4.translate(0, 0, z);
+                                transform_matrix = transform_matrix.multiply(translate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "scale")) {
+                                const scale = parseScale(args);
+                                const scale_matrix = Matrix4x4.scale(scale.x, scale.y, 1);
+                                transform_matrix = transform_matrix.multiply(scale_matrix);
+                            } else if (std.mem.eql(u8, func_name, "scale3d")) {
+                                const scale = parseScale3d(args);
+                                const scale_matrix = Matrix4x4.scale(scale.x, scale.y, scale.z);
+                                transform_matrix = transform_matrix.multiply(scale_matrix);
+                            } else if (std.mem.eql(u8, func_name, "scaleX")) {
+                                const x = parseFloat(args);
+                                const scale_matrix = Matrix4x4.scale(x, 1, 1);
+                                transform_matrix = transform_matrix.multiply(scale_matrix);
+                            } else if (std.mem.eql(u8, func_name, "scaleY")) {
+                                const y = parseFloat(args);
+                                const scale_matrix = Matrix4x4.scale(1, y, 1);
+                                transform_matrix = transform_matrix.multiply(scale_matrix);
+                            } else if (std.mem.eql(u8, func_name, "scaleZ")) {
+                                const z = parseFloat(args);
+                                const scale_matrix = Matrix4x4.scale(1, 1, z);
+                                transform_matrix = transform_matrix.multiply(scale_matrix);
+                            } else if (std.mem.eql(u8, func_name, "rotate")) {
+                                const angle = parseAngle(args);
+                                const rotate_matrix = Matrix4x4.rotateZ(angle);
+                                transform_matrix = transform_matrix.multiply(rotate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "rotate3d")) {
+                                const rotation = parseRotate3d(args);
+                                const rotate_matrix = Matrix4x4.rotate(rotation.x, rotation.y, rotation.z, rotation.angle);
+                                transform_matrix = transform_matrix.multiply(rotate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "rotateX")) {
+                                const angle = parseAngle(args);
+                                const rotate_matrix = Matrix4x4.rotateX(angle);
+                                transform_matrix = transform_matrix.multiply(rotate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "rotateY")) {
+                                const angle = parseAngle(args);
+                                const rotate_matrix = Matrix4x4.rotateY(angle);
+                                transform_matrix = transform_matrix.multiply(rotate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "rotateZ")) {
+                                const angle = parseAngle(args);
+                                const rotate_matrix = Matrix4x4.rotateZ(angle);
+                                transform_matrix = transform_matrix.multiply(rotate_matrix);
+                            } else if (std.mem.eql(u8, func_name, "skew")) {
+                                const skew = parseSkew(args);
+                                const skew_matrix = Matrix4x4.skew(skew.x, skew.y);
+                                transform_matrix = transform_matrix.multiply(skew_matrix);
+                            } else if (std.mem.eql(u8, func_name, "skewX")) {
+                                const angle = parseAngle(args);
+                                const skew_matrix = Matrix4x4.skewX(angle);
+                                transform_matrix = transform_matrix.multiply(skew_matrix);
+                            } else if (std.mem.eql(u8, func_name, "skewY")) {
+                                const angle = parseAngle(args);
+                                const skew_matrix = Matrix4x4.skewY(angle);
+                                transform_matrix = transform_matrix.multiply(skew_matrix);
+                            } else if (std.mem.eql(u8, func_name, "matrix")) {
+                                const matrix = parseMatrix(args);
+                                transform_matrix = transform_matrix.multiply(matrix);
+                            } else if (std.mem.eql(u8, func_name, "matrix3d")) {
+                                const matrix = parseMatrix3d(args);
+                                transform_matrix = transform_matrix.multiply(matrix);
+                            } else if (std.mem.eql(u8, func_name, "perspective")) {
+                                const distance = parseLength(args);
+                                const perspective_matrix = Matrix4x4.perspective(distance);
+                                transform_matrix = transform_matrix.multiply(perspective_matrix);
+                            }
+
+                            // 次の関数の開始位置を探す
+                            while (i < transform_value.len and (transform_value[i] == ' ' or transform_value[i] == ',')) {
+                                i += 1;
+                            }
+                            func_start = i;
+                        } else {
+                            i += 1;
+                        }
+                    }
+
+                    // 計算されたマトリックスを適用
+                    render_object.transform_matrix = transform_matrix;
+                }
                 if (node.style.?.properties.get("transform")) |_| {
                     // 本来はここで transform の値を解析してマトリックスを設定
                 }

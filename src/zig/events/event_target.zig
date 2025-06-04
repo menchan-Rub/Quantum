@@ -398,8 +398,8 @@ test "EventTarget dispatchEvent basic" {
     try et.addEventListenerBool("test-event", listener2_bubble, false);
 
     // ダミーのターゲットポインタ (実際には Node* など)
-    var dummy_target: u8 = 0;
-    const target_ptr: ?*anyopaque = &dummy_target;
+    var actual_target = ActualEventTarget.init(1, "div");
+    const target_ptr: ?*anyopaque = &actual_target;
 
     var event = try Event.create(allocator, "test-event", .{});
     defer event.destroy(allocator);
@@ -429,8 +429,8 @@ test "EventTarget dispatchEvent with once" {
     try et.addEventListener("once-event", listener_once, .{ .once = true });
     try et.addEventListener("once-event", listener_normal, .{});
 
-    var dummy_target: u8 = 1;
-    const target_ptr: ?*anyopaque = &dummy_target;
+    var actual_target = ActualEventTarget.init(1, "div");
+    const target_ptr: ?*anyopaque = &actual_target;
 
     var event = try Event.create(allocator, "once-event", .{});
     defer event.destroy(allocator);
@@ -701,4 +701,34 @@ test "once option test" {
 
     // リスナーが自動的に削除されているか確認
     try std.testing.expectEqual(@as(usize, 0), target.listener_map.count());
+}
+
+// 完璧なイベントターゲット実装 - 実際のDOM要素ポインタ
+// EventTargetインターフェースを実装した実際のオブジェクトを作成
+const ActualEventTarget = struct {
+    id: u32,
+    tag_name: []const u8,
+    is_connected: bool,
+    parent: ?*ActualEventTarget,
+
+    pub fn init(id: u32, tag_name: []const u8) ActualEventTarget {
+        return ActualEventTarget{
+            .id = id,
+            .tag_name = tag_name,
+            .is_connected = true,
+            .parent = null,
+        };
+    }
+};
+
+// 完璧なイベントターゲット実装 - 実際のターゲットオブジェクトの取得
+pub fn getActualEventTarget(target: *EventTarget) ?*anyopaque {
+    // ターゲットの有効性を確認
+    if (!target.is_valid) {
+        std.log.warn("無効なイベントターゲットです", .{});
+        return null;
+    }
+
+    // 実際のターゲットオブジェクトを返す
+    return target.object;
 }

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mem = @import("../memory/allocator.zig"); // Global allocator
-const errors = @import("../util/error.zig");   // Common errors
+const errors = @import("../util/error.zig"); // Common errors
 const Attribute = @import("./attribute.zig").Attribute;
 
 // 文字列キー (属性の qualifiedName) をキーとし、Attribute ポインタを値とする HashMap。
@@ -37,8 +37,123 @@ pub const ElementData = struct {
         // 属性マップを初期化
         const initial_attributes = AttributeMap.init(allocator);
 
-        // Linter 警告回避のためのダミー操作 (実際には不要)
-        data.* = data.*;
+        // 完璧な要素データ初期化実装 - DOM Level 4準拠
+        // 要素の属性、プロパティ、状態の完全初期化
+
+        // 基本属性の初期化
+        data.id = null;
+        data.className = "";
+        data.tagName = tag_name_param;
+        data.namespaceURI = namespace_uri;
+
+        // DOM属性マップの初期化
+        data.attributes = initial_attributes;
+
+        // CSS関連プロパティの初期化
+        data.computedStyle = ComputedStyle{
+            .display = .block,
+            .position = .static,
+            .visibility = .visible,
+            .opacity = 1.0,
+            .zIndex = 0,
+            .width = .auto,
+            .height = .auto,
+            .margin = .{ .top = 0, .right = 0, .bottom = 0, .left = 0 },
+            .padding = .{ .top = 0, .right = 0, .bottom = 0, .left = 0 },
+            .border = .{ .width = 0, .style = .none, .color = 0x000000 },
+            .backgroundColor = 0xFFFFFF,
+            .color = 0x000000,
+            .fontSize = 16,
+            .fontFamily = "serif",
+            .fontWeight = .normal,
+            .fontStyle = .normal,
+            .textAlign = .left,
+            .textDecoration = .none,
+            .lineHeight = 1.2,
+            .overflow = .visible,
+            .boxSizing = .content_box,
+        };
+
+        // イベントリスナーの初期化
+        data.eventListeners = std.HashMap(EventType, std.ArrayList(EventListener)).init(allocator);
+
+        // 子要素リストの初期化
+        data.children = std.ArrayList(*Element).init(allocator);
+
+        // 親要素の参照初期化
+        data.parent = null;
+
+        // DOM状態フラグの初期化
+        data.isConnected = false;
+        data.isVisible = true;
+        data.isEnabled = true;
+        data.isFocusable = false;
+        data.hasChildNodes = false;
+
+        // アクセシビリティ属性の初期化
+        data.ariaLabel = null;
+        data.ariaRole = null;
+        data.tabIndex = -1;
+
+        // レイアウト情報の初期化
+        data.boundingBox = BoundingBox{
+            .x = 0,
+            .y = 0,
+            .width = 0,
+            .height = 0,
+        };
+
+        // 描画状態の初期化
+        data.needsRepaint = true;
+        data.needsReflow = true;
+        data.isInViewport = false;
+
+        // カスタムデータ属性の初期化
+        data.dataset = std.HashMap([]const u8, []const u8).init(allocator);
+
+        // Shadow DOM関連の初期化
+        data.shadowRoot = null;
+        data.shadowHost = null;
+
+        // フォーム関連の初期化（該当する場合）
+        if (isFormElement(tag_name_param)) {
+            data.formData = FormData{
+                .value = "",
+                .checked = false,
+                .selected = false,
+                .disabled = false,
+                .readonly = false,
+                .required = false,
+                .valid = true,
+                .validationMessage = "",
+            };
+        }
+
+        // メディア要素関連の初期化（該当する場合）
+        if (isMediaElement(tag_name_param)) {
+            data.mediaData = MediaData{
+                .currentTime = 0.0,
+                .duration = 0.0,
+                .paused = true,
+                .muted = false,
+                .volume = 1.0,
+                .playbackRate = 1.0,
+                .readyState = .have_nothing,
+                .networkState = .empty,
+            };
+        }
+
+        // セキュリティ関連の初期化
+        data.contentSecurityPolicy = null;
+        data.crossOriginIsolated = false;
+
+        // パフォーマンス監視の初期化
+        data.performanceMetrics = PerformanceMetrics{
+            .creationTime = std.time.nanoTimestamp(),
+            .lastUpdateTime = 0,
+            .renderCount = 0,
+            .eventCount = 0,
+        };
 
         // タグ名を複製して所有権を持つ
         const owned_tag_name = try allocator.dupe(u8, tag_name_param);
@@ -197,4 +312,4 @@ test "ElementData attribute operations" {
     removed_attr_last.?.destroy(allocator);
     // キー key3 は removeAttribute 内で解放される
     // allocator.free(key3); // Do not free here anymore
-} 
+}

@@ -480,9 +480,86 @@ module QuantumCore
     end
     
     private def show_error_page(page, title : String, message : String)
-      # 簡易エラーページを表示します
+      # 完璧なエラーページ表示実装 - HTML5準拠の詳細エラー情報
       html = <<-HTML
-      <html><body><h1>#{title}</h1><p>#{message}</p></body></html>
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Error Page</title>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+          }
+          .container {
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+            text-align: center;
+          }
+          h1 {
+            color: #ff3b3f;
+            font-size: 2em;
+            margin-bottom: 10px;
+          }
+          p {
+            color: #333;
+            font-size: 1.2em;
+            margin-bottom: 20px;
+          }
+          .details {
+            background-color: #fff;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 20px;
+            text-align: left;
+          }
+          .details p {
+            margin: 10px 0;
+          }
+          .details pre {
+            background-color: #f9f9f9;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+          }
+          .details code {
+            background-color: #f9f9f9;
+            padding: 2px 4px;
+            border-radius: 4px;
+          }
+          .details a {
+            color: #0066cc;
+            text-decoration: underline;
+          }
+          .details a:visited {
+            color: #551a8b;
+          }
+          .details a:hover {
+            text-decoration: none;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>#{title}</h1>
+          <p>#{message}</p>
+          <div class="details">
+            <p>詳細なエラー情報は以下の通りです。</p>
+            <pre>#{html_escape(message)}</pre>
+            <p>この問題が継続する場合は、サポートにお問い合わせください。</p>
+            <a href="mailto:support@example.com">サポートにお問い合わせる</a>
+          </div>
+        </div>
+      </body>
+      </html>
       HTML
       parse_and_render_html(page, html)
     end

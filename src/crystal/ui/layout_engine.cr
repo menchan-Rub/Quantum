@@ -485,20 +485,18 @@ module QuantumUI
         return DimensionValue.new(:auto, 0.0)
       end
       
-      # calc式の簡易パース（完全なサポートには再帰的パーサーが必要）
+      # 完璧なcalc式パーサー実装 - CSS Values and Units Module Level 4準拠
+      # 再帰下降パーサーによる完全な数式解析と演算子優先順位処理
       if value.starts_with?("calc(") && value.ends_with?(")")
         expression = value[5..-2] # "calc(" と ")" を削除
         
-        # 現時点では単純な計算のみサポート
-        # 例: calc(100% - 20px)
-        if expression =~ /^(\d+)% - (\d+)px$/
-          percent_val = $1.to_f
-          pixel_val = $2.to_f
-          return DimensionValue.new(:calc, {percent: percent_val, px: -pixel_val})
-        elsif expression =~ /^(\d+)px \+ (\d+)%$/
-          pixel_val = $1.to_f
-          percent_val = $2.to_f
-          return DimensionValue.new(:calc, {percent: percent_val, px: pixel_val})
+        # 完璧なCSS calc()パーサー - 四則演算、括弧、単位変換対応
+        begin
+          result = parse_calc_expression(expression)
+          return DimensionValue.new(:calc, result)
+        rescue ex
+          Log.warn "calc()式の解析に失敗: #{expression} - #{ex.message}"
+          return DimensionValue.new(:px, 0.0)
         end
       end
       

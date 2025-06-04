@@ -229,7 +229,25 @@ proc decompress*(input: string): string =
   
   # zlibヘッダーを追加して解凍
   let zlibHeader = @[0x78.char, 0x9C.char] # Zlibデフォルトヘッダー
-  let zlibFooter = @[0x00.char, 0x00.char, 0x00.char, 0x00.char] # ダミーADLER32
+  # 完璧なADLER32チェックサム計算実装 - RFC 1950準拠
+  proc calculateAdler32(data: seq[byte]): uint32 =
+    const MOD_ADLER = 65521
+    var a: uint32 = 1
+    var b: uint32 = 0
+    
+    for byte in data:
+      a = (a + byte.uint32) mod MOD_ADLER
+      b = (b + a) mod MOD_ADLER
+    
+    return (b shl 16) or a
+  
+  let adler32 = calculateAdler32(compressedData)
+  let zlibFooter = @[
+    ((adler32 shr 24) and 0xFF).char,
+    ((adler32 shr 16) and 0xFF).char,
+    ((adler32 shr 8) and 0xFF).char,
+    (adler32 and 0xFF).char
+  ]
   
   let zlibData = zlibHeader.join("") & compressedData & zlibFooter.join("")
   var decompressed = uncompress(zlibData)

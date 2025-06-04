@@ -473,14 +473,182 @@ proc defaultOptimizerConfig*(): OptimizerConfig =
   return config
 
 # 設定をJSONからロード
-proc loadFromJson*(jsonStr: string): OptimizerConfig =
+proc loadFromJson*(filename: string): OptimizerConfig =
+  ## JSON設定ファイルから最適化設定をロード
   try:
-    let jsonNode = parseJson(jsonStr)
-    # JSON解析と設定構造への変換（実装省略）
-    result = defaultOptimizerConfig()
+    let jsonContent = readFile(filename)
+    let jsonNode = parseJson(jsonContent)
+    
+    result = OptimizerConfig()
+    
+    # 基本設定
+    if jsonNode.hasKey("enabled"):
+      result.enabled = jsonNode["enabled"].getBool()
+    
+    if jsonNode.hasKey("profile"):
+      result.profile = parseEnum[OptimizationProfile](jsonNode["profile"].getStr())
+    
+    if jsonNode.hasKey("maxConcurrentConnections"):
+      result.maxConcurrentConnections = jsonNode["maxConcurrentConnections"].getInt()
+    
+    if jsonNode.hasKey("connectionTimeout"):
+      result.connectionTimeout = jsonNode["connectionTimeout"].getInt()
+    
+    if jsonNode.hasKey("readTimeout"):
+      result.readTimeout = jsonNode["readTimeout"].getInt()
+    
+    if jsonNode.hasKey("writeTimeout"):
+      result.writeTimeout = jsonNode["writeTimeout"].getInt()
+    
+    # HTTP/2設定
+    if jsonNode.hasKey("http2"):
+      let http2Node = jsonNode["http2"]
+      if http2Node.hasKey("enabled"):
+        result.http2Enabled = http2Node["enabled"].getBool()
+      if http2Node.hasKey("maxStreams"):
+        result.http2MaxStreams = http2Node["maxStreams"].getInt()
+      if http2Node.hasKey("windowSize"):
+        result.http2WindowSize = http2Node["windowSize"].getInt()
+      if http2Node.hasKey("headerTableSize"):
+        result.http2HeaderTableSize = http2Node["headerTableSize"].getInt()
+    
+    # HTTP/3設定
+    if jsonNode.hasKey("http3"):
+      let http3Node = jsonNode["http3"]
+      if http3Node.hasKey("enabled"):
+        result.http3Enabled = http3Node["enabled"].getBool()
+      if http3Node.hasKey("maxStreams"):
+        result.http3MaxStreams = http3Node["maxStreams"].getInt()
+      if http3Node.hasKey("initialMaxData"):
+        result.http3InitialMaxData = http3Node["initialMaxData"].getInt()
+      if http3Node.hasKey("initialMaxStreamData"):
+        result.http3InitialMaxStreamData = http3Node["initialMaxStreamData"].getInt()
+    
+    # QUIC設定
+    if jsonNode.hasKey("quic"):
+      let quicNode = jsonNode["quic"]
+      if quicNode.hasKey("enabled"):
+        result.quicEnabled = quicNode["enabled"].getBool()
+      if quicNode.hasKey("maxIdleTimeout"):
+        result.quicMaxIdleTimeout = quicNode["maxIdleTimeout"].getInt()
+      if quicNode.hasKey("maxPacketSize"):
+        result.quicMaxPacketSize = quicNode["maxPacketSize"].getInt()
+      if quicNode.hasKey("congestionControl"):
+        result.quicCongestionControl = parseEnum[CongestionControlAlgorithm](
+          quicNode["congestionControl"].getStr())
+    
+    # DNS設定
+    if jsonNode.hasKey("dns"):
+      let dnsNode = jsonNode["dns"]
+      if dnsNode.hasKey("cacheEnabled"):
+        result.dnsCacheEnabled = dnsNode["cacheEnabled"].getBool()
+      if dnsNode.hasKey("cacheSize"):
+        result.dnsCacheSize = dnsNode["cacheSize"].getInt()
+      if dnsNode.hasKey("cacheTtl"):
+        result.dnsCacheTtl = dnsNode["cacheTtl"].getInt()
+      if dnsNode.hasKey("servers") and dnsNode["servers"].kind == JArray:
+        result.dnsServers = @[]
+        for server in dnsNode["servers"]:
+          result.dnsServers.add(server.getStr())
+      if dnsNode.hasKey("dohEnabled"):
+        result.dohEnabled = dnsNode["dohEnabled"].getBool()
+      if dnsNode.hasKey("dohUrl"):
+        result.dohUrl = dnsNode["dohUrl"].getStr()
+    
+    # TLS設定
+    if jsonNode.hasKey("tls"):
+      let tlsNode = jsonNode["tls"]
+      if tlsNode.hasKey("version"):
+        result.tlsVersion = parseEnum[TlsVersion](tlsNode["version"].getStr())
+      if tlsNode.hasKey("cipherSuites") and tlsNode["cipherSuites"].kind == JArray:
+        result.tlsCipherSuites = @[]
+        for cipher in tlsNode["cipherSuites"]:
+          result.tlsCipherSuites.add(cipher.getStr())
+      if tlsNode.hasKey("sessionResumption"):
+        result.tlsSessionResumption = tlsNode["sessionResumption"].getBool()
+      if tlsNode.hasKey("ocspStapling"):
+        result.tlsOcspStapling = tlsNode["ocspStapling"].getBool()
+    
+    # 圧縮設定
+    if jsonNode.hasKey("compression"):
+      let compNode = jsonNode["compression"]
+      if compNode.hasKey("enabled"):
+        result.compressionEnabled = compNode["enabled"].getBool()
+      if compNode.hasKey("algorithms") and compNode["algorithms"].kind == JArray:
+        result.compressionAlgorithms = @[]
+        for algo in compNode["algorithms"]:
+          result.compressionAlgorithms.add(parseEnum[CompressionAlgorithm](algo.getStr()))
+      if compNode.hasKey("level"):
+        result.compressionLevel = compNode["level"].getInt()
+      if compNode.hasKey("minSize"):
+        result.compressionMinSize = compNode["minSize"].getInt()
+    
+    # キャッシュ設定
+    if jsonNode.hasKey("cache"):
+      let cacheNode = jsonNode["cache"]
+      if cacheNode.hasKey("enabled"):
+        result.cacheEnabled = cacheNode["enabled"].getBool()
+      if cacheNode.hasKey("maxSize"):
+        result.cacheMaxSize = cacheNode["maxSize"].getInt()
+      if cacheNode.hasKey("maxAge"):
+        result.cacheMaxAge = cacheNode["maxAge"].getInt()
+      if cacheNode.hasKey("strategy"):
+        result.cacheStrategy = parseEnum[CacheStrategy](cacheNode["strategy"].getStr())
+    
+    # プリフェッチ設定
+    if jsonNode.hasKey("prefetch"):
+      let prefetchNode = jsonNode["prefetch"]
+      if prefetchNode.hasKey("enabled"):
+        result.prefetchEnabled = prefetchNode["enabled"].getBool()
+      if prefetchNode.hasKey("maxConcurrent"):
+        result.prefetchMaxConcurrent = prefetchNode["maxConcurrent"].getInt()
+      if prefetchNode.hasKey("priority"):
+        result.prefetchPriority = parseEnum[PrefetchPriority](prefetchNode["priority"].getStr())
+      if prefetchNode.hasKey("heuristicsEnabled"):
+        result.prefetchHeuristicsEnabled = prefetchNode["heuristicsEnabled"].getBool()
+    
+    # 帯域幅制御設定
+    if jsonNode.hasKey("bandwidth"):
+      let bwNode = jsonNode["bandwidth"]
+      if bwNode.hasKey("limitEnabled"):
+        result.bandwidthLimitEnabled = bwNode["limitEnabled"].getBool()
+      if bwNode.hasKey("maxDownload"):
+        result.bandwidthMaxDownload = bwNode["maxDownload"].getInt()
+      if bwNode.hasKey("maxUpload"):
+        result.bandwidthMaxUpload = bwNode["maxUpload"].getInt()
+      if bwNode.hasKey("adaptiveEnabled"):
+        result.bandwidthAdaptiveEnabled = bwNode["adaptiveEnabled"].getBool()
+    
+    # プロキシ設定
+    if jsonNode.hasKey("proxy"):
+      let proxyNode = jsonNode["proxy"]
+      if proxyNode.hasKey("enabled"):
+        result.proxyEnabled = proxyNode["enabled"].getBool()
+      if proxyNode.hasKey("type"):
+        result.proxyType = parseEnum[ProxyType](proxyNode["type"].getStr())
+      if proxyNode.hasKey("host"):
+        result.proxyHost = proxyNode["host"].getStr()
+      if proxyNode.hasKey("port"):
+        result.proxyPort = proxyNode["port"].getInt()
+      if proxyNode.hasKey("username"):
+        result.proxyUsername = proxyNode["username"].getStr()
+      if proxyNode.hasKey("password"):
+        result.proxyPassword = proxyNode["password"].getStr()
+    
+    echo "Successfully loaded optimizer configuration from ", filename
+    
+  except JsonParsingError:
+    echo "JSON parsing error in ", filename, ": ", getCurrentExceptionMsg()
+    result = getDefaultConfig()
+  except IOError:
+    echo "Failed to read configuration file ", filename, ": ", getCurrentExceptionMsg()
+    result = getDefaultConfig()
+  except ValueError:
+    echo "Invalid configuration value in ", filename, ": ", getCurrentExceptionMsg()
+    result = getDefaultConfig()
   except:
-    echo "Failed to parse JSON. Using default configuration."
-    result = defaultOptimizerConfig()
+    echo "Unexpected error loading configuration: ", getCurrentExceptionMsg()
+    result = getDefaultConfig()
 
 # 設定をファイルからロード
 proc loadFromFile*(filePath: string = DEFAULT_CONFIG_FILE): OptimizerConfig =
@@ -497,8 +665,166 @@ proc loadFromFile*(filePath: string = DEFAULT_CONFIG_FILE): OptimizerConfig =
 
 # 設定をJSONに変換
 proc toJson*(config: OptimizerConfig): string =
-  # 設定をJSON形式に変換（実装省略）
-  result = "{}" # 仮の空JSON
+  ## 設定をJSON形式に完璧に変換
+  try:
+    var jsonNode = newJObject()
+    
+    # 基本設定
+    jsonNode["enabled"] = newJBool(config.enabled)
+    jsonNode["autoSwitching"] = newJBool(config.autoSwitching)
+    jsonNode["dynamicOptimization"] = newJBool(config.dynamicOptimization)
+    jsonNode["activeProfile"] = newJString(config.activeProfile)
+    jsonNode["switchingThreshold"] = newJFloat(config.switchingThreshold)
+    jsonNode["lastSwitchTime"] = newJInt(config.lastSwitchTime)
+    
+    # プロファイル設定
+    var profilesNode = newJObject()
+    for profileName, profile in config.profiles:
+      var profileNode = newJObject()
+      
+      # プロファイル基本情報
+      profileNode["name"] = newJString(profile.name)
+      profileNode["description"] = newJString(profile.description)
+      profileNode["priority"] = newJInt(profile.priority)
+      profileNode["bandwidthTarget"] = newJFloat(profile.bandwidthTarget)
+      profileNode["latencyTarget"] = newJFloat(profile.latencyTarget)
+      profileNode["lossTarget"] = newJFloat(profile.lossTarget)
+      
+      # HTTP/3設定
+      var http3Node = newJObject()
+      http3Node["enabled"] = newJBool(profile.http3Settings.enabled)
+      http3Node["enableQUIC"] = newJBool(profile.http3Settings.enableQUIC)
+      http3Node["enableQUICv2"] = newJBool(profile.http3Settings.enableQUICv2)
+      http3Node["enableEarlyData"] = newJBool(profile.http3Settings.enableEarlyData)
+      http3Node["multipathMode"] = newJString(profile.http3Settings.multipathMode)
+      http3Node["congestionControl"] = newJString(profile.http3Settings.congestionControl)
+      http3Node["enablePacing"] = newJBool(profile.http3Settings.enablePacing)
+      http3Node["enableSpinBit"] = newJBool(profile.http3Settings.enableSpinBit)
+      http3Node["initialRtt"] = newJFloat(profile.http3Settings.initialRtt)
+      http3Node["maxStreamsBidi"] = newJInt(profile.http3Settings.maxStreamsBidi)
+      http3Node["maxStreamsUni"] = newJInt(profile.http3Settings.maxStreamsUni)
+      http3Node["initialMaxData"] = newJInt(profile.http3Settings.initialMaxData)
+      http3Node["maxIdleTimeout"] = newJInt(profile.http3Settings.maxIdleTimeout)
+      http3Node["retransmissionFactor"] = newJFloat(profile.http3Settings.retransmissionFactor)
+      http3Node["datagramSupport"] = newJBool(profile.http3Settings.datagramSupport)
+      profileNode["http3Settings"] = http3Node
+      
+      # DNS設定
+      var dnsNode = newJObject()
+      dnsNode["cacheEnabled"] = newJBool(profile.dnsSettings.cacheEnabled)
+      dnsNode["cacheSize"] = newJInt(profile.dnsSettings.cacheSize)
+      dnsNode["cacheTtl"] = newJInt(profile.dnsSettings.cacheTtl)
+      var serversArray = newJArray()
+      for server in profile.dnsSettings.servers:
+        serversArray.add(newJString(server))
+      dnsNode["servers"] = serversArray
+      dnsNode["dohEnabled"] = newJBool(profile.dnsSettings.dohEnabled)
+      dnsNode["dohUrl"] = newJString(profile.dnsSettings.dohUrl)
+      dnsNode["dotEnabled"] = newJBool(profile.dnsSettings.dotEnabled)
+      dnsNode["dotHost"] = newJString(profile.dnsSettings.dotHost)
+      dnsNode["dotPort"] = newJInt(profile.dnsSettings.dotPort)
+      profileNode["dnsSettings"] = dnsNode
+      
+      # TLS設定
+      var tlsNode = newJObject()
+      tlsNode["version"] = newJString(profile.tlsSettings.version)
+      var cipherSuitesArray = newJArray()
+      for cipher in profile.tlsSettings.cipherSuites:
+        cipherSuitesArray.add(newJString(cipher))
+      tlsNode["cipherSuites"] = cipherSuitesArray
+      tlsNode["sessionResumption"] = newJBool(profile.tlsSettings.sessionResumption)
+      tlsNode["ocspStapling"] = newJBool(profile.tlsSettings.ocspStapling)
+      tlsNode["sni"] = newJBool(profile.tlsSettings.sni)
+      tlsNode["alpn"] = newJBool(profile.tlsSettings.alpn)
+      profileNode["tlsSettings"] = tlsNode
+      
+      # 圧縮設定
+      var compressionNode = newJObject()
+      compressionNode["enabled"] = newJBool(profile.compressionSettings.enabled)
+      var algorithmsArray = newJArray()
+      for algo in profile.compressionSettings.algorithms:
+        algorithmsArray.add(newJString(algo))
+      compressionNode["algorithms"] = algorithmsArray
+      compressionNode["level"] = newJInt(profile.compressionSettings.level)
+      compressionNode["minSize"] = newJInt(profile.compressionSettings.minSize)
+      compressionNode["brotliQuality"] = newJInt(profile.compressionSettings.brotliQuality)
+      compressionNode["zstdLevel"] = newJInt(profile.compressionSettings.zstdLevel)
+      profileNode["compressionSettings"] = compressionNode
+      
+      # キャッシュ設定
+      var cacheNode = newJObject()
+      cacheNode["enabled"] = newJBool(profile.cacheSettings.enabled)
+      cacheNode["maxSize"] = newJInt(profile.cacheSettings.maxSize)
+      cacheNode["maxAge"] = newJInt(profile.cacheSettings.maxAge)
+      cacheNode["strategy"] = newJString(profile.cacheSettings.strategy)
+      cacheNode["persistentEnabled"] = newJBool(profile.cacheSettings.persistentEnabled)
+      cacheNode["compressionEnabled"] = newJBool(profile.cacheSettings.compressionEnabled)
+      profileNode["cacheSettings"] = cacheNode
+      
+      # プリフェッチ設定
+      var prefetchNode = newJObject()
+      prefetchNode["enabled"] = newJBool(profile.prefetchSettings.enabled)
+      prefetchNode["maxConcurrent"] = newJInt(profile.prefetchSettings.maxConcurrent)
+      prefetchNode["priority"] = newJString(profile.prefetchSettings.priority)
+      prefetchNode["heuristicsEnabled"] = newJBool(profile.prefetchSettings.heuristicsEnabled)
+      prefetchNode["dnsEnabled"] = newJBool(profile.prefetchSettings.dnsEnabled)
+      prefetchNode["connectEnabled"] = newJBool(profile.prefetchSettings.connectEnabled)
+      profileNode["prefetchSettings"] = prefetchNode
+      
+      # 帯域幅制御設定
+      var bandwidthNode = newJObject()
+      bandwidthNode["limitEnabled"] = newJBool(profile.bandwidthSettings.limitEnabled)
+      bandwidthNode["maxDownload"] = newJInt(profile.bandwidthSettings.maxDownload)
+      bandwidthNode["maxUpload"] = newJInt(profile.bandwidthSettings.maxUpload)
+      bandwidthNode["adaptiveEnabled"] = newJBool(profile.bandwidthSettings.adaptiveEnabled)
+      bandwidthNode["burstAllowed"] = newJBool(profile.bandwidthSettings.burstAllowed)
+      bandwidthNode["burstSize"] = newJInt(profile.bandwidthSettings.burstSize)
+      profileNode["bandwidthSettings"] = bandwidthNode
+      
+      # プロキシ設定
+      var proxyNode = newJObject()
+      proxyNode["enabled"] = newJBool(profile.proxySettings.enabled)
+      proxyNode["type"] = newJString(profile.proxySettings.proxyType)
+      proxyNode["host"] = newJString(profile.proxySettings.host)
+      proxyNode["port"] = newJInt(profile.proxySettings.port)
+      proxyNode["username"] = newJString(profile.proxySettings.username)
+      proxyNode["password"] = newJString(profile.proxySettings.password)
+      proxyNode["bypassLocal"] = newJBool(profile.proxySettings.bypassLocal)
+      var bypassListArray = newJArray()
+      for bypass in profile.proxySettings.bypassList:
+        bypassListArray.add(newJString(bypass))
+      proxyNode["bypassList"] = bypassListArray
+      profileNode["proxySettings"] = proxyNode
+      
+      profilesNode[profileName] = profileNode
+    
+    jsonNode["profiles"] = profilesNode
+    
+    # 統計情報
+    var statsNode = newJObject()
+    statsNode["totalConnections"] = newJInt(config.stats.totalConnections)
+    statsNode["successfulConnections"] = newJInt(config.stats.successfulConnections)
+    statsNode["failedConnections"] = newJInt(config.stats.failedConnections)
+    statsNode["totalBytes"] = newJInt(config.stats.totalBytes)
+    statsNode["compressionRatio"] = newJFloat(config.stats.compressionRatio)
+    statsNode["cacheHitRate"] = newJFloat(config.stats.cacheHitRate)
+    statsNode["averageLatency"] = newJFloat(config.stats.averageLatency)
+    statsNode["profileSwitches"] = newJInt(config.stats.profileSwitches)
+    jsonNode["statistics"] = statsNode
+    
+    # メタデータ
+    var metaNode = newJObject()
+    metaNode["version"] = newJString("2.0")
+    metaNode["generatedAt"] = newJString($now())
+    metaNode["generator"] = newJString("Quantum Network Optimizer v2.0")
+    metaNode["format"] = newJString("quantum-optimizer-config")
+    jsonNode["metadata"] = metaNode
+    
+    result = pretty(jsonNode, 2)
+    
+  except:
+    echo "Error converting config to JSON: ", getCurrentExceptionMsg()
+    result = "{\"error\": \"Failed to serialize configuration\"}"
 
 # 設定をファイルに保存
 proc saveToFile*(config: OptimizerConfig, filePath: string = DEFAULT_CONFIG_FILE): bool =

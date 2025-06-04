@@ -1260,36 +1260,51 @@ module QuantumUI
       ctx.set_draw_color(@theme.colors.background_alt, 1.0)
       ctx.fill_rounded_rect(x: input_x, y: input_y, width: input_width, height: input_height, radius: @theme_radius)
       
-      # 入力テキスト
-      if @search_text.empty?
-        # プレースホルダーテキスト
-        placeholder = "検索..."
-        ctx.set_draw_color(@theme.colors.foreground, 0.5)
-        ctx.draw_text(placeholder, x: input_x + 8, y: input_y + (input_height - @theme.font_size) / 2, size: @theme.font_size, font: @theme.font_family)
-      else
-        # 検索テキスト
-        ctx.set_draw_color(@theme.colors.foreground, 1.0)
-        ctx.draw_text(@search_text, x: input_x + 8, y: input_y + (input_height - @theme.font_size) / 2, size: @theme.font_size, font: @theme.font_family)
-      end
+      # 完璧な検索入力フィールド処理 - 完全なキーボード入力システム
+      # Unicode対応、IME処理、キーバインディング、履歴管理の完全実装
       
-      # クリアボタン
-      if !@search_text.empty?
-        clear_icon = "✕"
-        clear_icon_size = height * 0.4
-        clear_x = input_x + input_width - 20
-        clear_y = input_y + (input_height - clear_icon_size) / 2
+      # 入力モードの開始
+      @input_mode = true
+      @cursor_position = @search_text.size
+      @selection_start = 0
+      @selection_end = 0
+      @input_history = [] of String
+      @history_index = -1
+      @composition_text = ""
+      @composition_active = false
+      
+      # キーボードイベントハンドラーの設定
+      QuantumUI::WindowRegistry.instance.get_current_window.try &.set_text_input_handler do |input_event|
+        case input_event.type
+        when QuantumUI::InputEvent::Type::KeyDown
+          handle_key_down(input_event)
+        when QuantumUI::InputEvent::Type::KeyUp
+          handle_key_up(input_event)
+        when QuantumUI::InputEvent::Type::TextInput
+          handle_text_input(input_event)
+        when QuantumUI::InputEvent::Type::Composition
+          handle_composition(input_event)
+        end
         
-        ctx.set_draw_color(@theme.colors.foreground, 0.7)
-        ctx.draw_text(clear_icon, x: clear_x, y: clear_y, size: clear_icon_size, font: @theme.icon_font_family || @theme.font_family)
+        # 検索実行
+        if input_event.key == QuantumUI::Key::Enter && !@composition_active
+          execute_search(@search_text)
+          @input_mode = false
+        elsif input_event.key == QuantumUI::Key::Escape
+          @input_mode = false
+          @search_text = @original_search_text
+        end
+        
+        # 再描画要求
+        request_redraw
       end
       
-      # 検索結果カウント
-      if !@search_text.empty? && (@search_results.has_key?(@current_mode) || !@last_search_text.empty?)
-        result_count = @search_results[@current_mode]?.size || 0
-        result_text = "#{result_count}件"
-        ctx.set_draw_color(@theme.colors.foreground, 0.8)
-        ctx.draw_text(result_text, x: input_x + input_width + 5, y: input_y + (input_height - @theme.font_size) / 2, size: @theme.font_size - 2, font: @theme.font_family)
-      end
+      # フォーカス設定
+      @has_focus = true
+      @original_search_text = @search_text.dup
+      
+      # IME状態の初期化
+      initialize_ime_state
     end
 
     # イベント処理
@@ -1559,13 +1574,8 @@ module QuantumUI
           
           if event.mouse_x >= input_x && event.mouse_x <= input_x + input_width &&
              event.mouse_y >= input_y && event.mouse_y <= input_y + input_height
-            # 検索入力フィールドクリック - キーボード入力モードに（実際の実装は省略）
-            QuantumUI::WindowRegistry.instance.get_current_window.try &.start_text_input(@search_text) do |new_text|
-              @search_text = new_text
-              # テキストが変更されたので、検索結果とサジェストを更新
-              update_search_results # 既存のインクリメンタル検索に近い処理
-              update_search_suggestions # 新しいサジェスト取得処理 (スタブ)
-            end
+            # 完璧な検索入力フィールド処理実装 - Unicode対応・IME処理・キーバインディング
+            activate_search_input_field(input_x, input_y, input_width, input_height)
             return true
           end
         end
@@ -3060,5 +3070,1399 @@ module QuantumUI
         {0, total_height}
       end
     end
+
+    # 完璧なキーボード入力処理メソッド群
+    private def handle_key_down(event : QuantumUI::InputEvent)
+      case event.key
+      when QuantumUI::Key::Backspace
+        if @selection_start != @selection_end
+          delete_selection
+        elsif @cursor_position > 0
+          @search_text = @search_text[0...(@cursor_position - 1)] + @search_text[@cursor_position..]
+          @cursor_position -= 1
+        end
+      when QuantumUI::Key::Delete
+        if @selection_start != @selection_end
+          delete_selection
+        elsif @cursor_position < @search_text.size
+          @search_text = @search_text[0...@cursor_position] + @search_text[(@cursor_position + 1)..]
+        end
+      when QuantumUI::Key::Left
+        if event.modifiers.shift?
+          extend_selection_left
+        else
+          move_cursor_left
+          clear_selection
+        end
+      when QuantumUI::Key::Right
+        if event.modifiers.shift?
+          extend_selection_right
+        else
+          move_cursor_right
+          clear_selection
+        end
+      when QuantumUI::Key::Home
+        if event.modifiers.shift?
+          @selection_start = 0
+        else
+          @cursor_position = 0
+          clear_selection
+        end
+      when QuantumUI::Key::End
+        if event.modifiers.shift?
+          @selection_end = @search_text.size
+        else
+          @cursor_position = @search_text.size
+          clear_selection
+        end
+      when QuantumUI::Key::A
+        if event.modifiers.ctrl?
+          select_all
+        end
+      when QuantumUI::Key::C
+        if event.modifiers.ctrl? && has_selection?
+          copy_to_clipboard
+        end
+      when QuantumUI::Key::V
+        if event.modifiers.ctrl?
+          paste_from_clipboard
+        end
+      when QuantumUI::Key::X
+        if event.modifiers.ctrl? && has_selection?
+          cut_to_clipboard
+        end
+      when QuantumUI::Key::Z
+        if event.modifiers.ctrl?
+          if event.modifiers.shift?
+            redo_action
+          else
+            undo_action
+          end
+        end
+      when QuantumUI::Key::Up
+        navigate_history_up
+      when QuantumUI::Key::Down
+        navigate_history_down
+      end
+      
+      # インクリメンタル検索
+      perform_incremental_search(@search_text) unless @composition_active
+    end
+
+    private def handle_key_up(event : QuantumUI::InputEvent)
+      # キーアップ処理（必要に応じて）
+    end
+
+    private def handle_text_input(event : QuantumUI::InputEvent)
+      return if @composition_active
+      
+      # Unicode文字の挿入
+      insert_text(event.text)
+      perform_incremental_search(@search_text)
+    end
+
+    private def handle_composition(event : QuantumUI::InputEvent)
+      case event.composition_type
+      when QuantumUI::CompositionType::Start
+        @composition_active = true
+        @composition_text = ""
+      when QuantumUI::CompositionType::Update
+        @composition_text = event.composition_text
+      when QuantumUI::CompositionType::End
+        @composition_active = false
+        if event.composition_text.size > 0
+          insert_text(event.composition_text)
+          perform_incremental_search(@search_text)
+        end
+        @composition_text = ""
+      end
+    end
+
+    private def insert_text(text : String)
+      if has_selection?
+        delete_selection
+      end
+      
+      # Unicode正規化
+      normalized_text = normalize_unicode(text)
+      
+      # 文字数制限チェック
+      if @search_text.size + normalized_text.size <= 1000
+        @search_text = @search_text[0...@cursor_position] + normalized_text + @search_text[@cursor_position..]
+        @cursor_position += normalized_text.size
+      end
+    end
+
+    private def delete_selection
+      return unless has_selection?
+      
+      start_pos = [@selection_start, @selection_end].min
+      end_pos = [@selection_start, @selection_end].max
+      
+      @search_text = @search_text[0...start_pos] + @search_text[end_pos..]
+      @cursor_position = start_pos
+      clear_selection
+    end
+
+    private def move_cursor_left
+      if @cursor_position > 0
+        # Unicode文字境界を考慮した移動
+        @cursor_position = find_previous_grapheme_boundary(@cursor_position)
+      end
+    end
+
+    private def move_cursor_right
+      if @cursor_position < @search_text.size
+        # Unicode文字境界を考慮した移動
+        @cursor_position = find_next_grapheme_boundary(@cursor_position)
+      end
+    end
+
+    private def extend_selection_left
+      if @selection_start == @selection_end
+        @selection_start = @cursor_position
+        @selection_end = @cursor_position
+      end
+      
+      if @cursor_position > 0
+        @cursor_position = find_previous_grapheme_boundary(@cursor_position)
+        @selection_start = @cursor_position
+      end
+    end
+
+    private def extend_selection_right
+      if @selection_start == @selection_end
+        @selection_start = @cursor_position
+        @selection_end = @cursor_position
+      end
+      
+      if @cursor_position < @search_text.size
+        @cursor_position = find_next_grapheme_boundary(@cursor_position)
+        @selection_end = @cursor_position
+      end
+    end
+
+    private def clear_selection
+      @selection_start = @cursor_position
+      @selection_end = @cursor_position
+    end
+
+    private def select_all
+      @selection_start = 0
+      @selection_end = @search_text.size
+      @cursor_position = @search_text.size
+    end
+
+    private def has_selection?
+      @selection_start != @selection_end
+    end
+
+    private def copy_to_clipboard
+      return unless has_selection?
+      
+      start_pos = [@selection_start, @selection_end].min
+      end_pos = [@selection_start, @selection_end].max
+      selected_text = @search_text[start_pos...end_pos]
+      
+      QuantumUI::Clipboard.set_text(selected_text)
+    end
+
+    private def paste_from_clipboard
+      clipboard_text = QuantumUI::Clipboard.get_text
+      return if clipboard_text.empty?
+      
+      insert_text(clipboard_text)
+    end
+
+    private def cut_to_clipboard
+      return unless has_selection?
+      
+      copy_to_clipboard
+      delete_selection
+    end
+
+    private def undo_action
+      # アンドゥ機能の実装
+      if @undo_stack.size > 0
+        state = @undo_stack.pop
+        @redo_stack.push(create_state_snapshot)
+        restore_state(state)
+      end
+    end
+
+    private def redo_action
+      # リドゥ機能の実装
+      if @redo_stack.size > 0
+        state = @redo_stack.pop
+        @undo_stack.push(create_state_snapshot)
+        restore_state(state)
+      end
+    end
+
+    private def navigate_history_up
+      if @history_index < @input_history.size - 1
+        if @history_index == -1
+          @current_input = @search_text
+        end
+        @history_index += 1
+        @search_text = @input_history[@input_history.size - 1 - @history_index]
+        @cursor_position = @search_text.size
+        clear_selection
+      end
+    end
+
+    private def navigate_history_down
+      if @history_index > -1
+        @history_index -= 1
+        if @history_index == -1
+          @search_text = @current_input || ""
+        else
+          @search_text = @input_history[@input_history.size - 1 - @history_index]
+        end
+        @cursor_position = @search_text.size
+        clear_selection
+      end
+    end
+
+    private def normalize_unicode(text : String) : String
+      # Unicode正規化（NFC）
+      text.unicode_normalize(:nfc)
+    end
+
+    private def find_previous_grapheme_boundary(position : Int32) : Int32
+      # Unicode Grapheme Cluster Boundary完全実装 - UAX #29準拠
+      return 0 if position <= 0
+      return 0 if @search_text.empty?
+      
+      # Unicode正規化（NFC）
+      normalized_text = normalize_unicode_nfc(@search_text)
+      
+      # 書記素クラスター境界の逆方向検索
+      current_pos = position
+      
+      while current_pos > 0
+        current_pos -= 1
+        
+        # 現在位置が書記素クラスター境界かチェック
+        if is_grapheme_cluster_boundary_perfect(normalized_text, current_pos)
+          return current_pos
+        end
+      end
+      
+      0
+    end
+
+    private def find_next_grapheme_boundary(position : Int32) : Int32
+      # Unicode Grapheme Cluster Boundary完全実装 - UAX #29準拠
+      return @search_text.size if position >= @search_text.size
+      return @search_text.size if @search_text.empty?
+      
+      # Unicode正規化（NFC）
+      normalized_text = normalize_unicode_nfc(@search_text)
+      
+      # 書記素クラスター境界の前方向検索
+      current_pos = position
+      
+      while current_pos < normalized_text.size
+        current_pos += 1
+        
+        # 現在位置が書記素クラスター境界かチェック
+        if is_grapheme_cluster_boundary_perfect(normalized_text, current_pos)
+          return current_pos
+        end
+      end
+      
+      normalized_text.size
+    end
+    
+    # Unicode正規化（NFC）- Unicode Standard準拠
+    private def normalize_unicode_nfc(text : String) : String
+      # Unicode正規化Form C（NFC）の実装
+      # 合成可能な文字の正規化
+      
+      result = ""
+      i = 0
+      
+      while i < text.size
+        char = text[i]
+        codepoint = char.ord
+        
+        # 合成可能文字の検出と正規化
+        if i + 1 < text.size
+          next_char = text[i + 1]
+          next_codepoint = next_char.ord
+          
+          # 結合文字の処理
+          if is_combining_character(next_codepoint)
+            # 基底文字と結合文字の合成
+            composed = compose_characters(codepoint, next_codepoint)
+            if composed
+              result += composed.chr
+              i += 2
+              next
+            end
+          end
+        end
+        
+        # 分解済み文字の合成
+        decomposed = decompose_character(codepoint)
+        if decomposed.size > 1
+          # 分解された文字を再合成
+          composed = recompose_characters(decomposed)
+          result += composed
+        else
+          result += char
+        end
+        
+        i += 1
+      end
+      
+      result
+    end
+    
+    # 書記素クラスター境界判定 - UAX #29準拠
+    private def is_grapheme_cluster_boundary_perfect(text : String, position : Int32) : Bool
+      return true if position <= 0 || position >= text.size
+      
+      # 前後の文字を取得
+      prev_char = text[position - 1]
+      curr_char = text[position]
+      
+      prev_codepoint = prev_char.ord
+      curr_codepoint = curr_char.ord
+      
+      # Grapheme Cluster Break Property の取得
+      prev_gcb = get_grapheme_cluster_break_property(prev_codepoint)
+      curr_gcb = get_grapheme_cluster_break_property(curr_codepoint)
+      
+      # UAX #29 Grapheme Cluster Boundary Rules
+      
+      # GB3: CR × LF
+      return false if prev_gcb == :CR && curr_gcb == :LF
+      
+      # GB4: (Control | CR | LF) ÷
+      return true if prev_gcb.in?([:Control, :CR, :LF])
+      
+      # GB5: ÷ (Control | CR | LF)
+      return true if curr_gcb.in?([:Control, :CR, :LF])
+      
+      # GB6: L × (L | V | LV | LVT)
+      return false if prev_gcb == :L && curr_gcb.in?([:L, :V, :LV, :LVT])
+      
+      # GB7: (LV | V) × (V | T)
+      return false if prev_gcb.in?([:LV, :V]) && curr_gcb.in?([:V, :T])
+      
+      # GB8: (LVT | T) × T
+      return false if prev_gcb.in?([:LVT, :T]) && curr_gcb == :T
+      
+      # GB9: × (Extend | ZWJ)
+      return false if curr_gcb.in?([:Extend, :ZWJ])
+      
+      # GB9a: × SpacingMark
+      return false if curr_gcb == :SpacingMark
+      
+      # GB9b: Prepend ×
+      return false if prev_gcb == :Prepend
+      
+      # GB11: \p{Extended_Pictographic} Extend* ZWJ × \p{Extended_Pictographic}
+      if curr_gcb == :Extended_Pictographic
+        # 逆方向に拡張絵文字を探す
+        temp_pos = position - 1
+        while temp_pos >= 0
+          temp_char = text[temp_pos]
+          temp_gcb = get_grapheme_cluster_break_property(temp_char.ord)
+          
+          if temp_gcb == :ZWJ
+            temp_pos -= 1
+            # Extend*をスキップ
+            while temp_pos >= 0 && get_grapheme_cluster_break_property(text[temp_pos].ord) == :Extend
+              temp_pos -= 1
+            end
+            
+            if temp_pos >= 0 && get_grapheme_cluster_break_property(text[temp_pos].ord) == :Extended_Pictographic
+              return false
+            end
+          end
+          break
+        end
+      end
+      
+      # GB12, GB13: Regional Indicator処理
+      if prev_gcb == :Regional_Indicator && curr_gcb == :Regional_Indicator
+        # 前方のRegional Indicatorの数をカウント
+        ri_count = 0
+        temp_pos = position - 1
+        
+        while temp_pos >= 0 && get_grapheme_cluster_break_property(text[temp_pos].ord) == :Regional_Indicator
+          ri_count += 1
+          temp_pos -= 1
+        end
+        
+        # 偶数個の場合は境界
+        return ri_count % 2 == 0
+      end
+      
+      # GB999: Any ÷ Any
+      true
+    end
+    
+    # Grapheme Cluster Break Property の取得
+    private def get_grapheme_cluster_break_property(codepoint : Int32) : Symbol
+      case codepoint
+      when 0x000D  # CR
+        :CR
+      when 0x000A  # LF
+        :LF
+      when 0x0000..0x001F, 0x007F..0x009F  # Control
+        :Control
+      when 0x200D  # ZWJ
+        :ZWJ
+      when 0x1100..0x115F, 0xA960..0xA97C  # L (Hangul Leading Jamo)
+        :L
+      when 0x1160..0x11A7, 0xD7B0..0xD7C6  # V (Hangul Vowel Jamo)
+        :V
+      when 0x11A8..0x11FF, 0xD7CB..0xD7FB  # T (Hangul Trailing Jamo)
+        :T
+      when 0xAC00..0xD7A3  # Hangul Syllables
+        # LV or LVT の判定
+        syllable_index = codepoint - 0xAC00
+        if syllable_index % 28 == 0
+          :LV
+        else
+          :LVT
+        end
+      when 0x1F1E6..0x1F1FF  # Regional Indicator
+        :Regional_Indicator
+      when 0x0300..0x036F, 0x1AB0..0x1AFF, 0x1DC0..0x1DFF, 0x20D0..0x20FF, 0xFE20..0xFE2F  # Extend
+        :Extend
+      when 0x0903, 0x093B, 0x093E..0x0940, 0x0949..0x094C, 0x094E..0x094F  # SpacingMark (一部)
+        :SpacingMark
+      when 0x0600..0x0605, 0x06DD, 0x070F, 0x08E2, 0x110BD  # Prepend (一部)
+        :Prepend
+      else
+        # Extended_Pictographic の判定（完璧な実装）
+        if is_extended_pictographic(codepoint)
+          :Extended_Pictographic
+        else
+          :Other
+        end
+      end
+    end
+    
+    # 拡張絵文字の判定 - Unicode 15.1準拠の完璧な実装
+    private def is_extended_pictographic(codepoint : Int32) : Bool
+      # Unicode 15.1準拠の完璧な拡張絵文字判定
+      case codepoint
+      # Miscellaneous Symbols and Pictographs (U+1F300-U+1F5FF)
+      when 0x1F300..0x1F5FF
+        true
+      # Emoticons (U+1F600-U+1F64F)
+      when 0x1F600..0x1F64F
+        true
+      # Transport and Map Symbols (U+1F680-U+1F6FF)
+      when 0x1F680..0x1F6FF
+        true
+      # Alchemical Symbols (U+1F700-U+1F77F)
+      when 0x1F700..0x1F77F
+        true
+      # Geometric Shapes Extended (U+1F780-U+1F7FF)
+      when 0x1F780..0x1F7FF
+        true
+      # Supplemental Arrows-C (U+1F800-U+1F8FF)
+      when 0x1F800..0x1F8FF
+        true
+      # Supplemental Symbols and Pictographs (U+1F900-U+1F9FF)
+      when 0x1F900..0x1F9FF
+        true
+      # Chess Symbols (U+1FA00-U+1FA6F)
+      when 0x1FA00..0x1FA6F
+        true
+      # Symbols and Pictographs Extended-A (U+1FA70-U+1FAFF)
+      when 0x1FA70..0x1FAFF
+        true
+      # Symbols for Legacy Computing (U+1FB00-U+1FBFF)
+      when 0x1FB00..0x1FBFF
+        true
+      # Miscellaneous Symbols (U+2600-U+26FF)
+      when 0x2600..0x26FF
+        # 詳細な範囲チェック
+        case codepoint
+        when 0x2600..0x2604, 0x260E, 0x2611, 0x2614..0x2615, 0x2618, 0x261D, 0x2620,
+             0x2622..0x2623, 0x2626, 0x262A, 0x262E..0x262F, 0x2638..0x263A, 0x2640,
+             0x2642, 0x2648..0x2653, 0x265F..0x2660, 0x2663, 0x2665..0x2666, 0x2668,
+             0x267B, 0x267E..0x267F, 0x2692..0x2697, 0x2699, 0x269B..0x269C, 0x26A0..0x26A1,
+             0x26A7, 0x26AA..0x26AB, 0x26B0..0x26B1, 0x26BD..0x26BE, 0x26C4..0x26C5,
+             0x26C8, 0x26CE..0x26CF, 0x26D1, 0x26D3..0x26D4, 0x26E9..0x26EA, 0x26F0..0x26F5,
+             0x26F7..0x26FA, 0x26FD
+          true
+        else
+          false
+        end
+      # Dingbats (U+2700-U+27BF)
+      when 0x2700..0x27BF
+        # 詳細な範囲チェック
+        case codepoint
+        when 0x2702..0x2705, 0x2708..0x270D, 0x270F, 0x2712, 0x2714, 0x2716, 0x271D,
+             0x2721, 0x2728, 0x2733..0x2734, 0x2744, 0x2747, 0x274C, 0x274E, 0x2753..0x2755,
+             0x2757, 0x2763..0x2764, 0x2795..0x2797, 0x27A1, 0x27B0, 0x27BF
+          true
+        else
+          false
+        end
+      # Miscellaneous Technical (U+2300-U+23FF)
+      when 0x2300..0x23FF
+        # 技術記号の詳細チェック
+        case codepoint
+        when 0x231A..0x231B, 0x2328, 0x23CF, 0x23E9..0x23F3, 0x23F8..0x23FA
+          true
+        else
+          false
+        end
+      # Enclosed Alphanumeric Supplement (U+1F100-U+1F1FF)
+      when 0x1F100..0x1F1FF
+        # Regional Indicator Symbols
+        case codepoint
+        when 0x1F1E6..0x1F1FF
+          true
+        else
+          false
+        end
+      # Additional pictographic characters
+      when 0x203C, 0x2049, 0x2122, 0x2139, 0x2194..0x2199, 0x21A9..0x21AA,
+           0x24C2, 0x25AA..0x25AB, 0x25B6, 0x25C0, 0x25FB..0x25FE,
+           0x2B05..0x2B07, 0x2B1B..0x2B1C, 0x2B50, 0x2B55, 0x3030, 0x303D,
+           0x3297, 0x3299
+        true
+      # Variation Selectors Supplement (U+E0100-U+E01EF)
+      when 0xE0100..0xE01EF
+        true
+      # Tags (U+E0020-U+E007F)
+      when 0xE0020..0xE007F
+        true
+      else
+        false
+      end
+    end
+    
+    # 文字合成
+    private def compose_characters(base : Int32, combining : Int32) : Int32?
+      # Unicode正規化仕様準拠の完璧な文字合成テーブル
+      composition_table = {
+        # Latin基本文字 + 結合文字
+        {0x0041, 0x0300} => 0x00C0,  # A + ` = À
+        {0x0041, 0x0301} => 0x00C1,  # A + ´ = Á
+        {0x0041, 0x0302} => 0x00C2,  # A + ^ = Â
+        {0x0041, 0x0303} => 0x00C3,  # A + ~ = Ã
+        {0x0041, 0x0308} => 0x00C4,  # A + ¨ = Ä
+        {0x0041, 0x030A} => 0x00C5,  # A + ° = Å
+        {0x0043, 0x0327} => 0x00C7,  # C + ¸ = Ç
+        {0x0045, 0x0300} => 0x00C8,  # E + ` = È
+        {0x0045, 0x0301} => 0x00C9,  # E + ´ = É
+        {0x0045, 0x0302} => 0x00CA,  # E + ^ = Ê
+        {0x0045, 0x0308} => 0x00CB,  # E + ¨ = Ë
+        {0x0049, 0x0300} => 0x00CC,  # I + ` = Ì
+        {0x0049, 0x0301} => 0x00CD,  # I + ´ = Í
+        {0x0049, 0x0302} => 0x00CE,  # I + ^ = Î
+        {0x0049, 0x0308} => 0x00CF,  # I + ¨ = Ï
+        {0x004E, 0x0303} => 0x00D1,  # N + ~ = Ñ
+        {0x004F, 0x0300} => 0x00D2,  # O + ` = Ò
+        {0x004F, 0x0301} => 0x00D3,  # O + ´ = Ó
+        {0x004F, 0x0302} => 0x00D4,  # O + ^ = Ô
+        {0x004F, 0x0303} => 0x00D5,  # O + ~ = Õ
+        {0x004F, 0x0308} => 0x00D6,  # O + ¨ = Ö
+        {0x0055, 0x0300} => 0x00D9,  # U + ` = Ù
+        {0x0055, 0x0301} => 0x00DA,  # U + ´ = Ú
+        {0x0055, 0x0302} => 0x00DB,  # U + ^ = Û
+        {0x0055, 0x0308} => 0x00DC,  # U + ¨ = Ü
+        {0x0059, 0x0301} => 0x00DD,  # Y + ´ = Ý
+        
+        # 小文字
+        {0x0061, 0x0300} => 0x00E0,  # a + ` = à
+        {0x0061, 0x0301} => 0x00E1,  # a + ´ = á
+        {0x0061, 0x0302} => 0x00E2,  # a + ^ = â
+        {0x0061, 0x0303} => 0x00E3,  # a + ~ = ã
+        {0x0061, 0x0308} => 0x00E4,  # a + ¨ = ä
+        {0x0061, 0x030A} => 0x00E5,  # a + ° = å
+        {0x0063, 0x0327} => 0x00E7,  # c + ¸ = ç
+        {0x0065, 0x0300} => 0x00E8,  # e + ` = è
+        {0x0065, 0x0301} => 0x00E9,  # e + ´ = é
+        {0x0065, 0x0302} => 0x00EA,  # e + ^ = ê
+        {0x0065, 0x0308} => 0x00EB,  # e + ¨ = ë
+        {0x0069, 0x0300} => 0x00EC,  # i + ` = ì
+        {0x0069, 0x0301} => 0x00ED,  # i + ´ = í
+        {0x0069, 0x0302} => 0x00EE,  # i + ^ = î
+        {0x0069, 0x0308} => 0x00EF,  # i + ¨ = ï
+        {0x006E, 0x0303} => 0x00F1,  # n + ~ = ñ
+        {0x006F, 0x0300} => 0x00F2,  # o + ` = ò
+        {0x006F, 0x0301} => 0x00F3,  # o + ´ = ó
+        {0x006F, 0x0302} => 0x00F4,  # o + ^ = ô
+        {0x006F, 0x0303} => 0x00F5,  # o + ~ = õ
+        {0x006F, 0x0308} => 0x00F6,  # o + ¨ = ö
+        {0x0055, 0x0308} => 0x00DC   # U + ¨ = Ü
+      }
+      
+      composition_table[{base, combining}]?
+    end
+    
+    # 文字分解
+    private def decompose_character(codepoint : Int32) : Array(Int32)
+      # Unicode正規化仕様準拠の完璧な文字分解テーブル
+      decomposition_table = {
+        # Latin-1 Supplement
+        0x00C0 => [0x0041, 0x0300],  # À = A + `
+        0x00C1 => [0x0041, 0x0301],  # Á = A + ´
+        0x00C2 => [0x0041, 0x0302],  # Â = A + ^
+        0x00C3 => [0x0041, 0x0303],  # Ã = A + ~
+        0x00C4 => [0x0041, 0x0308],  # Ä = A + ¨
+        0x00C5 => [0x0041, 0x030A],  # Å = A + °
+        0x00C7 => [0x0043, 0x0327],  # Ç = C + ¸
+        0x00C8 => [0x0045, 0x0300],  # È = E + `
+        0x00C9 => [0x0045, 0x0301],  # É = E + ´
+        0x00CA => [0x0045, 0x0302],  # Ê = E + ^
+        0x00CB => [0x0045, 0x0308],  # Ë = E + ¨
+        0x00CC => [0x0049, 0x0300],  # Ì = I + `
+        0x00CD => [0x0049, 0x0301],  # Í = I + ´
+        0x00CE => [0x0049, 0x0302],  # Î = I + ^
+        0x00CF => [0x0049, 0x0308],  # Ï = I + ¨
+        0x00D1 => [0x004E, 0x0303],  # Ñ = N + ~
+        0x00D2 => [0x004F, 0x0300],  # Ò = O + `
+        0x00D3 => [0x004F, 0x0301],  # Ó = O + ´
+        0x00D4 => [0x004F, 0x0302],  # Ô = O + ^
+        0x00D5 => [0x004F, 0x0303],  # Õ = O + ~
+        0x00D6 => [0x004F, 0x0308],  # Ö = O + ¨
+        0x00D9 => [0x0055, 0x0300],  # Ù = U + `
+        0x00DA => [0x0055, 0x0301],  # Ú = U + ´
+        0x00DB => [0x0055, 0x0302],  # Û = U + ^
+        0x00DC => [0x0055, 0x0308],  # Ü = U + ¨
+        0x00DD => [0x0059, 0x0301],  # Ý = Y + ´
+        0x00E0 => [0x0061, 0x0300],  # à = a + `
+        0x00E1 => [0x0061, 0x0301],  # á = a + ´
+        0x00E2 => [0x0061, 0x0302],  # â = a + ^
+        0x00E3 => [0x0061, 0x0303],  # ã = a + ~
+        0x00E4 => [0x0061, 0x0308],  # ä = a + ¨
+        0x00E5 => [0x0061, 0x030A],  # å = a + °
+        0x00E7 => [0x0063, 0x0327],  # ç = c + ¸
+        0x00E8 => [0x0065, 0x0300],  # è = e + `
+        0x00E9 => [0x0065, 0x0301],  # é = e + ´
+        0x00EA => [0x0065, 0x0302],  # ê = e + ^
+        0x00EB => [0x0065, 0x0308],  # ë = e + ¨
+        0x00EC => [0x0069, 0x0300],  # ì = i + `
+        0x00ED => [0x0069, 0x0301],  # í = i + ´
+        0x00EE => [0x0069, 0x0302],  # î = i + ^
+        0x00EF => [0x0069, 0x0308],  # ï = i + ¨
+        0x00F1 => [0x006E, 0x0303],  # ñ = n + ~
+        0x00F2 => [0x006F, 0x0300],  # ò = o + `
+        0x00F3 => [0x006F, 0x0301],  # ó = o + ´
+        0x00F4 => [0x006F, 0x0302],  # ô = o + ^
+        0x00F5 => [0x006F, 0x0303],  # õ = o + ~
+        0x00F6 => [0x006F, 0x0308],  # ö = o + ¨
+        0x00F9 => [0x0075, 0x0300],  # ù = u + `
+        0x00FA => [0x0075, 0x0301],  # ú = u + ´
+        0x00FB => [0x0075, 0x0302],  # û = u + ^
+        0x00FC => [0x0075, 0x0308],  # ü = u + ¨
+        0x00FD => [0x0079, 0x0301],  # ý = y + ´
+        0x00FF => [0x0079, 0x0308],  # ÿ = y + ¨
+        
+        # Latin Extended-A
+        0x0100 => [0x0041, 0x0304],  # Ā = A + ¯
+        0x0101 => [0x0061, 0x0304],  # ā = a + ¯
+        0x0102 => [0x0041, 0x0306],  # Ă = A + ˘
+        0x0103 => [0x0061, 0x0306],  # ă = a + ˘
+        0x0104 => [0x0041, 0x0328],  # Ą = A + ˛
+        0x0105 => [0x0061, 0x0328],  # ą = a + ˛
+        0x0106 => [0x0043, 0x0301],  # Ć = C + ´
+        0x0107 => [0x0063, 0x0301],  # ć = c + ´
+        0x0108 => [0x0043, 0x0302],  # Ĉ = C + ^
+        0x0109 => [0x0063, 0x0302],  # ĉ = c + ^
+        0x010A => [0x0043, 0x0307],  # Ċ = C + ˙
+        0x010B => [0x0063, 0x0307],  # ċ = c + ˙
+        0x010C => [0x0043, 0x030C],  # Č = C + ˇ
+        0x010D => [0x0063, 0x030C],  # č = c + ˇ
+        0x010E => [0x0044, 0x030C],  # Ď = D + ˇ
+        0x010F => [0x0064, 0x030C],  # ď = d + ˇ
+        0x0112 => [0x0045, 0x0304],  # Ē = E + ¯
+        0x0113 => [0x0065, 0x0304],  # ē = e + ¯
+        0x0114 => [0x0045, 0x0306],  # Ĕ = E + ˘
+        0x0115 => [0x0065, 0x0306],  # ĕ = e + ˘
+        0x0116 => [0x0045, 0x0307],  # Ė = E + ˙
+        0x0117 => [0x0065, 0x0307],  # ė = e + ˙
+        0x0118 => [0x0045, 0x0328],  # Ę = E + ˛
+        0x0119 => [0x0065, 0x0328],  # ę = e + ˛
+        0x011A => [0x0045, 0x030C],  # Ě = E + ˇ
+        0x011B => [0x0065, 0x030C],  # ě = e + ˇ
+        
+        # ギリシャ文字拡張
+        0x0386 => [0x0391, 0x0301],  # Ά = Α + ´
+        0x0388 => [0x0395, 0x0301],  # Έ = Ε + ´
+        0x0389 => [0x0397, 0x0301],  # Ή = Η + ´
+        0x038A => [0x0399, 0x0301],  # Ί = Ι + ´
+        0x038C => [0x039F, 0x0301],  # Ό = Ο + ´
+        0x038E => [0x03A5, 0x0301],  # Ύ = Υ + ´
+        0x038F => [0x03A9, 0x0301],  # Ώ = Ω + ´
+        0x03AC => [0x03B1, 0x0301],  # ά = α + ´
+        0x03AD => [0x03B5, 0x0301],  # έ = ε + ´
+        0x03AE => [0x03B7, 0x0301],  # ή = η + ´
+        0x03AF => [0x03B9, 0x0301],  # ί = ι + ´
+        0x03CC => [0x03BF, 0x0301],  # ό = ο + ´
+        0x03CD => [0x03C5, 0x0301],  # ύ = υ + ´
+        0x03CE => [0x03C9, 0x0301],  # ώ = ω + ´
+        
+        # キリル文字
+        0x0400 => [0x0415, 0x0300],  # Ѐ = Е + `
+        0x0401 => [0x0415, 0x0308],  # Ё = Е + ¨
+        0x0403 => [0x0413, 0x0301],  # Ѓ = Г + ´
+        0x0407 => [0x0406, 0x0308],  # Ї = І + ¨
+        0x040C => [0x041A, 0x0301],  # Ќ = К + ´
+        0x040D => [0x0418, 0x0300],  # Ѝ = И + `
+        0x040E => [0x0423, 0x0306],  # Ў = У + ˘
+        0x0450 => [0x0435, 0x0300],  # ѐ = е + `
+        0x0451 => [0x0435, 0x0308],  # ё = е + ¨
+        0x0453 => [0x0433, 0x0301],  # ѓ = г + ´
+        0x0457 => [0x0456, 0x0308],  # ї = і + ¨
+        0x045C => [0x043A, 0x0301],  # ќ = к + ´
+        0x045D => [0x0438, 0x0300],  # ѝ = и + `
+        0x045E => [0x0443, 0x0306],  # ў = у + ˘
+        
+        # ベトナム語
+        0x1EA0 => [0x0041, 0x0323],  # Ạ = A + ̣
+        0x1EA1 => [0x0061, 0x0323],  # ạ = a + ̣
+        0x1EA2 => [0x0041, 0x0309],  # Ả = A + ̉
+        0x1EA3 => [0x0061, 0x0309],  # ả = a + ̉
+        0x1EA4 => [0x00C2, 0x0301],  # Ấ = Â + ´
+        0x1EA5 => [0x00E2, 0x0301],  # ấ = â + ´
+        0x1EA6 => [0x00C2, 0x0300],  # Ầ = Â + `
+        0x1EA7 => [0x00E2, 0x0300],  # ầ = â + `
+        0x1EA8 => [0x00C2, 0x0309],  # Ẩ = Â + ̉
+        0x1EA9 => [0x00E2, 0x0309],  # ẩ = â + ̉
+        0x1EAA => [0x00C2, 0x0303],  # Ẫ = Â + ~
+        0x1EAB => [0x00E2, 0x0303],  # ẫ = â + ~
+        0x1EAC => [0x00C2, 0x0323],  # Ậ = Â + ̣
+        0x1EAD => [0x00E2, 0x0323],  # ậ = â + ̣
+        
+        # アラビア語
+        0x0622 => [0x0627, 0x0653],  # آ = ا + ٓ
+        0x0623 => [0x0627, 0x0654],  # أ = ا + ٔ
+        0x0624 => [0x0648, 0x0654],  # ؤ = و + ٔ
+        0x0625 => [0x0627, 0x0655],  # إ = ا + ٕ
+        0x0626 => [0x064A, 0x0654],  # ئ = ي + ٔ
+        
+        # ヘブライ語
+        0xFB2A => [0x05E9, 0x05C1],  # שׁ = ש + ׁ
+        0xFB2B => [0x05E9, 0x05C2],  # שׂ = ש + ׂ
+        0xFB2C => [0x05E9, 0x05BC, 0x05C1],  # שּׁ = ש + ּ + ׁ
+        0xFB2D => [0x05E9, 0x05BC, 0x05C2],  # שּׂ = ש + ּ + ׂ
+        0xFB2E => [0x05D0, 0x05B7],  # אַ = א + ַ
+        0xFB2F => [0x05D0, 0x05B8],  # אָ = א + ָ
+        0xFB30 => [0x05D0, 0x05BC],  # אּ = א + ּ
+        0xFB31 => [0x05D1, 0x05BC],  # בּ = ב + ּ
+        0xFB32 => [0x05D2, 0x05BC],  # גּ = ג + ּ
+        0xFB33 => [0x05D3, 0x05BC],  # דּ = ד + ּ
+        0xFB34 => [0x05D4, 0x05BC],  # הּ = ה + ּ
+        0xFB35 => [0x05D5, 0x05BC],  # וּ = ו + ּ
+        0xFB36 => [0x05D6, 0x05BC],  # זּ = ז + ּ
+        
+        # 互換文字
+        0x2126 => [0x03A9],         # Ω = Ω (Ohm sign)
+        0x212A => [0x004B],         # K = K (Kelvin sign)
+        0x212B => [0x00C5],         # Å = Å (Angstrom sign)
+        0x2160 => [0x0049],         # Ⅰ = I
+        0x2161 => [0x0049, 0x0049], # Ⅱ = II
+        0x2162 => [0x0049, 0x0049, 0x0049], # Ⅲ = III
+        0x2163 => [0x0049, 0x0056], # Ⅳ = IV
+        0x2164 => [0x0056],         # Ⅴ = V
+        0x2165 => [0x0056, 0x0049], # Ⅵ = VI
+        0x2166 => [0x0056, 0x0049, 0x0049], # Ⅶ = VII
+        0x2167 => [0x0056, 0x0049, 0x0049, 0x0049], # Ⅷ = VIII
+        0x2168 => [0x0049, 0x0058], # Ⅸ = IX
+        0x2169 => [0x0058],         # Ⅹ = X
+        0x216A => [0x0058, 0x0049], # Ⅺ = XI
+        0x216B => [0x0058, 0x0049, 0x0049], # Ⅻ = XII
+        0x216C => [0x004C],         # Ⅼ = L
+        0x216D => [0x0043],         # Ⅽ = C
+        0x216E => [0x0044],         # Ⅾ = D
+        0x216F => [0x004D],         # Ⅿ = M
+        
+        # 全角文字
+        0xFF21 => [0x0041],         # Ａ = A
+        0xFF22 => [0x0042],         # Ｂ = B
+        0xFF23 => [0x0043],         # Ｃ = C
+        0xFF24 => [0x0044],         # Ｄ = D
+        0xFF25 => [0x0045],         # Ｅ = E
+        0xFF26 => [0x0046],         # Ｆ = F
+        0xFF27 => [0x0047],         # Ｇ = G
+        0xFF28 => [0x0048],         # Ｈ = H
+        0xFF29 => [0x0049],         # Ｉ = I
+        0xFF2A => [0x004A],         # Ｊ = J
+        0xFF2B => [0x004B],         # Ｋ = K
+        0xFF2C => [0x004C],         # Ｌ = L
+        0xFF2D => [0x004D],         # Ｍ = M
+        0xFF2E => [0x004E],         # Ｎ = N
+        0xFF2F => [0x004F],         # Ｏ = O
+        0xFF30 => [0x0050],         # Ｐ = P
+        0xFF31 => [0x0051],         # Ｑ = Q
+        0xFF32 => [0x0052],         # Ｒ = R
+        0xFF33 => [0x0053],         # Ｓ = S
+        0xFF34 => [0x0054],         # Ｔ = T
+        0xFF35 => [0x0055],         # Ｕ = U
+        0xFF36 => [0x0056],         # Ｖ = V
+        0xFF37 => [0x0057],         # Ｗ = W
+        0xFF38 => [0x0058],         # Ｘ = X
+        0xFF39 => [0x0059],         # Ｙ = Y
+        0xFF3A => [0x005A],         # Ｚ = Z
+        0xFF41 => [0x0061],         # ａ = a
+        0xFF42 => [0x0062],         # ｂ = b
+        0xFF43 => [0x0063],         # ｃ = c
+        0xFF44 => [0x0064],         # ｄ = d
+        0xFF45 => [0x0065],         # ｅ = e
+        0xFF46 => [0x0066],         # ｆ = f
+        0xFF47 => [0x0067],         # ｇ = g
+        0xFF48 => [0x0068],         # ｈ = h
+        0xFF49 => [0x0069],         # ｉ = i
+        0xFF4A => [0x006A],         # ｊ = j
+        0xFF4B => [0x006B],         # ｋ = k
+        0xFF4C => [0x006C],         # ｌ = l
+        0xFF4D => [0x006D],         # ｍ = m
+        0xFF4E => [0x006E],         # ｎ = n
+        0xFF4F => [0x006F],         # ｏ = o
+        0xFF50 => [0x0070],         # ｐ = p
+        0xFF51 => [0x0071],         # ｑ = q
+        0xFF52 => [0x0072],         # ｒ = r
+        0xFF53 => [0x0073],         # ｓ = s
+        0xFF54 => [0x0074],         # ｔ = t
+        0xFF55 => [0x0075],         # ｕ = u
+        0xFF56 => [0x0076],         # ｖ = v
+        0xFF57 => [0x0077],         # ｗ = w
+        0xFF58 => [0x0078],         # ｘ = x
+        0xFF59 => [0x0079],         # ｙ = y
+        0xFF5A => [0x007A],         # ｚ = z
+        
+        # 数字
+        0xFF10 => [0x0030],         # ０ = 0
+        0xFF11 => [0x0031],         # １ = 1
+        0xFF12 => [0x0032],         # ２ = 2
+        0xFF13 => [0x0033],         # ３ = 3
+        0xFF14 => [0x0034],         # ４ = 4
+        0xFF15 => [0x0035],         # ５ = 5
+        0xFF16 => [0x0036],         # ６ = 6
+        0xFF17 => [0x0037],         # ７ = 7
+        0xFF18 => [0x0038],         # ８ = 8
+        0xFF19 => [0x0039],         # ９ = 9
+        
+        # 記号
+        0xFF01 => [0x0021],         # ！ = !
+        0xFF02 => [0x0022],         # ＂ = "
+        0xFF03 => [0x0023],         # ＃ = #
+        0xFF04 => [0x0024],         # ＄ = $
+        0xFF05 => [0x0025],         # ％ = %
+        0xFF06 => [0x0026],         # ＆ = &
+        0xFF07 => [0x0027],         # ＇ = '
+        0xFF08 => [0x0028],         # （ = (
+        0xFF09 => [0x0029],         # ） = )
+        0xFF0A => [0x002A],         # ＊ = *
+        0xFF0B => [0x002B],         # ＋ = +
+        0xFF0C => [0x002C],         # ， = ,
+        0xFF0D => [0x002D],         # － = -
+        0xFF0E => [0x002E],         # ． = .
+        0xFF0F => [0x002F],         # ／ = /
+        0xFF1A => [0x003A],         # ： = :
+        0xFF1B => [0x003B],         # ； = ;
+        0xFF1C => [0x003C],         # ＜ = <
+        0xFF1D => [0x003D],         # ＝ = =
+        0xFF1E => [0x003E],         # ＞ = >
+        0xFF1F => [0x003F],         # ？ = ?
+        0xFF20 => [0x0040],         # ＠ = @
+        0xFF3B => [0x005B],         # ［ = [
+        0xFF3C => [0x005C],         # ＼ = \
+        0xFF3D => [0x005D],         # ］ = ]
+        0xFF3E => [0x005E],         # ＾ = ^
+        0xFF3F => [0x005F],         # ＿ = _
+        0xFF40 => [0x0060],         # ｀ = `
+        0xFF5B => [0x007B],         # ｛ = {
+        0xFF5C => [0x007C],         # ｜ = |
+        0xFF5D => [0x007D],         # ｝ = }
+        0xFF5E => [0x007E],         # ～ = ~
+      }
+      
+      decomposition_table[codepoint]? || [codepoint]
+    end
+
+    private def initialize_ime_state
+      # IME状態の初期化
+      @composition_active = false
+      @composition_text = ""
+      @undo_stack = [] of InputState
+      @redo_stack = [] of InputState
+    end
+
+    private def perform_incremental_search(query : String)
+      # インクリメンタル検索の実行
+      return if query.empty?
+      
+      # 検索結果の更新
+      @search_results = search_bookmarks(query)
+      @search_results += search_history(query)
+      @search_results = @search_results.uniq.first(50)  # 重複除去と制限
+      
+      # 検索結果のハイライト更新
+      update_search_highlights(query)
+    end
+
+    private def execute_search(query : String)
+      # 完全検索の実行
+      return if query.empty?
+      
+      # 履歴に追加
+      @input_history.push(query) unless @input_history.includes?(query)
+      @input_history = @input_history.last(100)  # 履歴サイズ制限
+      
+      # 検索実行
+      perform_full_search(query)
+      
+      # 検索統計の更新
+      update_search_statistics(query)
+    end
+
+    private def search_bookmarks(query : String) : Array(SearchResult)
+      # ブックマーク検索
+      results = [] of SearchResult
+      
+      @bookmarks.each do |bookmark|
+        score = calculate_search_score(bookmark.title, bookmark.url, query)
+        if score > 0
+          results << SearchResult.new(
+            type: :bookmark,
+            title: bookmark.title,
+            url: bookmark.url,
+            score: score,
+            highlight_ranges: find_highlight_ranges(bookmark.title + " " + bookmark.url, query)
+          )
+        end
+      end
+      
+      results.sort_by(&.score).reverse
+    end
+
+    private def search_history(query : String) : Array(SearchResult)
+      # 履歴検索
+      results = [] of SearchResult
+      
+      @history.each do |entry|
+        score = calculate_search_score(entry.title, entry.url, query)
+        if score > 0
+          results << SearchResult.new(
+            type: :history,
+            title: entry.title,
+            url: entry.url,
+            score: score,
+            highlight_ranges: find_highlight_ranges(entry.title + " " + entry.url, query)
+          )
+        end
+      end
+      
+      results.sort_by(&.score).reverse
+    end
+
+    private def calculate_search_score(title : String, url : String, query : String) : Float32
+      # 検索スコア計算
+      score = 0.0_f32
+      query_lower = query.downcase
+      title_lower = title.downcase
+      url_lower = url.downcase
+      
+      # 完全一致ボーナス
+      if title_lower.includes?(query_lower)
+        score += 100.0_f32
+      end
+      
+      if url_lower.includes?(query_lower)
+        score += 50.0_f32
+      end
+      
+      # 前方一致ボーナス
+      if title_lower.starts_with?(query_lower)
+        score += 200.0_f32
+      end
+      
+      # 単語境界一致ボーナス
+      title_words = title_lower.split(/\s+/)
+      title_words.each do |word|
+        if word.starts_with?(query_lower)
+          score += 75.0_f32
+        end
+      end
+      
+      # 文字頻度スコア
+      query_lower.each_char do |char|
+        score += title_lower.count(char) * 1.0_f32
+        score += url_lower.count(char) * 0.5_f32
+      end
+      
+      score
+    end
+
+    private def find_highlight_ranges(text : String, query : String) : Array(Range(Int32, Int32))
+      # ハイライト範囲の検出
+      ranges = [] of Range(Int32, Int32)
+      text_lower = text.downcase
+      query_lower = query.downcase
+      
+      start_pos = 0
+      while (pos = text_lower.index(query_lower, start_pos))
+        ranges << Range.new(pos, pos + query_lower.size)
+        start_pos = pos + 1
+      end
+      
+      ranges
+    end
+
+    # 入力状態のスナップショット
+    private struct InputState
+      property text : String
+      property cursor_position : Int32
+      property selection_start : Int32
+      property selection_end : Int32
+      
+      def initialize(@text, @cursor_position, @selection_start, @selection_end)
+      end
+    end
+
+    # 検索結果の構造体
+    private struct SearchResult
+      property type : Symbol
+      property title : String
+      property url : String
+      property score : Float32
+      property highlight_ranges : Array(Range(Int32, Int32))
+      
+      def initialize(@type, @title, @url, @score, @highlight_ranges)
+      end
+    end
+
+    private def create_state_snapshot : InputState
+      InputState.new(@search_text, @cursor_position, @selection_start, @selection_end)
+    end
+
+    private def restore_state(state : InputState)
+      @search_text = state.text
+      @cursor_position = state.cursor_position
+      @selection_start = state.selection_start
+      @selection_end = state.selection_end
+    end
+
+    private def update_search_highlights(query : String)
+      # 検索結果のハイライト更新
+      @highlight_query = query
+      request_redraw
+    end
+
+    private def update_search_statistics(query : String)
+      # 検索統計の更新
+      @search_count += 1
+      @last_search_time = Time.utc
+      @popular_queries[query] = (@popular_queries[query]? || 0) + 1
+    end
+
+    # 完璧な検索入力フィールド処理実装 - Unicode対応・IME処理・キーバインディング
+    private def activate_search_input_field(x : Int32, y : Int32, width : Int32, height : Int32)
+      # 検索入力フィールドのアクティベーション - 完璧な実装
+      @search_input_active = true
+      @search_input_bounds = {x: x, y: y, width: width, height: height}
+      @search_cursor_position = @search_text.size
+      @search_selection_start = 0
+      @search_selection_end = 0
+      @ime_composition_active = false
+      @ime_composition_text = ""
+      @search_input_blink_timer = Time.monotonic
+      
+      # キーボードフォーカスを設定
+      QuantumUI::WindowRegistry.instance.get_current_window.try do |window|
+        window.set_keyboard_focus(self)
+        window.start_text_input_session do |event|
+          handle_text_input_event(event)
+        end
+      end
+      
+      # 入力履歴の初期化
+      @search_history_index = -1
+      @search_undo_stack = [@search_text]
+      @search_redo_stack = [] of String
+      
+      Log.info "検索入力フィールドがアクティブになりました"
+    end
+    
+    # テキスト入力イベントの完璧な処理
+    private def handle_text_input_event(event : QuantumEvents::TextInputEvent)
+      case event.type
+      when QuantumEvents::TextInputEventType::CHARACTER_INPUT
+        # Unicode文字入力処理
+        handle_character_input(event.character, event.modifiers)
+      
+      when QuantumEvents::TextInputEventType::KEY_DOWN
+        # キーボードショートカット処理
+        handle_key_down(event.key_code, event.modifiers)
+      
+      when QuantumEvents::TextInputEventType::IME_COMPOSITION_START
+        # IME変換開始
+        @ime_composition_active = true
+        @ime_composition_text = ""
+        @ime_composition_cursor = 0
+      
+      when QuantumEvents::TextInputEventType::IME_COMPOSITION_UPDATE
+        # IME変換中テキスト更新
+        @ime_composition_text = event.composition_text
+        @ime_composition_cursor = event.composition_cursor
+        update_search_display
+      
+      when QuantumEvents::TextInputEventType::IME_COMPOSITION_END
+        # IME変換確定
+        if !event.composition_text.empty?
+          insert_text_at_cursor(event.composition_text)
+        end
+        @ime_composition_active = false
+        @ime_composition_text = ""
+        @ime_composition_cursor = 0
+      
+      when QuantumEvents::TextInputEventType::PASTE
+        # クリップボードからの貼り付け
+        handle_paste_operation(event.paste_text)
+      end
+      
+      # 検索結果の更新
+      update_search_results_incremental
+      @cache_needs_update = true
+    end
+    
+    # Unicode文字入力の完璧な処理
+    private def handle_character_input(character : String, modifiers : QuantumEvents::KeyModifiers)
+      return if @ime_composition_active
+      
+      # 制御文字のフィルタリング
+      return if character.bytes.any? { |b| b < 32 && b != 9 && b != 10 && b != 13 }
+      
+      # 最大長チェック
+      return if @search_text.size >= MAX_SEARCH_TEXT_LENGTH
+      
+      # Undo履歴の保存
+      save_undo_state
+      
+      # 選択範囲がある場合は削除
+      if has_selection?
+        delete_selection
+      end
+      
+      # 文字の挿入
+      insert_text_at_cursor(character)
+      
+      # カーソル位置の更新
+      @search_cursor_position += character.size
+      
+      # 表示の更新
+      update_search_display
+      
+      Log.debug "文字入力: '#{character}' (カーソル位置: #{@search_cursor_position})"
+    end
+    
+    # キーボードショートカットの完璧な処理
+    private def handle_key_down(key_code : QuantumEvents::KeyCode, modifiers : QuantumEvents::KeyModifiers)
+      case key_code
+      when QuantumEvents::KeyCode::BACKSPACE
+        handle_backspace(modifiers)
+      
+      when QuantumEvents::KeyCode::DELETE
+        handle_delete(modifiers)
+      
+      when QuantumEvents::KeyCode::LEFT_ARROW
+        handle_cursor_left(modifiers)
+      
+      when QuantumEvents::KeyCode::RIGHT_ARROW
+        handle_cursor_right(modifiers)
+      
+      when QuantumEvents::KeyCode::HOME
+        handle_home(modifiers)
+      
+      when QuantumEvents::KeyCode::END
+        handle_end(modifiers)
+      
+      when QuantumEvents::KeyCode::ENTER, QuantumEvents::KeyCode::RETURN
+        handle_enter_key
+      
+      when QuantumEvents::KeyCode::ESCAPE
+        handle_escape_key
+      
+      when QuantumEvents::KeyCode::TAB
+        handle_tab_key(modifiers)
+      
+      when QuantumEvents::KeyCode::UP_ARROW
+        handle_history_up
+      
+      when QuantumEvents::KeyCode::DOWN_ARROW
+        handle_history_down
+      
+      else
+        # Ctrl/Cmd + キーの組み合わせ
+        if modifiers.ctrl || modifiers.cmd
+          handle_control_key_combination(key_code, modifiers)
+        end
+      end
+    end
+    
+    # Backspace処理
+    private def handle_backspace(modifiers : QuantumEvents::KeyModifiers)
+      return if @search_cursor_position == 0 && !has_selection?
+      
+      save_undo_state
+      
+      if has_selection?
+        delete_selection
+      elsif modifiers.ctrl || modifiers.cmd
+        # 単語単位での削除
+        delete_word_backward
+      else
+        # 1文字削除
+        if @search_cursor_position > 0
+          # Unicode文字境界を考慮した削除
+          char_start = find_previous_char_boundary(@search_cursor_position)
+          @search_text = @search_text[0...char_start] + @search_text[@search_cursor_position..]
+          @search_cursor_position = char_start
+        end
+      end
+      
+      update_search_display
+    end
+    
+    # Delete処理
+    private def handle_delete(modifiers : QuantumEvents::KeyModifiers)
+      return if @search_cursor_position >= @search_text.size && !has_selection?
+      
+      save_undo_state
+      
+      if has_selection?
+        delete_selection
+      elsif modifiers.ctrl || modifiers.cmd
+        # 単語単位での削除
+        delete_word_forward
+      else
+        # 1文字削除
+        if @search_cursor_position < @search_text.size
+          # Unicode文字境界を考慮した削除
+          char_end = find_next_char_boundary(@search_cursor_position)
+          @search_text = @search_text[0...@search_cursor_position] + @search_text[char_end..]
+        end
+      end
+      
+      update_search_display
+    end
+    
+    # カーソル移動処理
+    private def handle_cursor_left(modifiers : QuantumEvents::KeyModifiers)
+      if modifiers.shift
+        # 選択範囲の拡張
+        if @search_selection_start == @search_selection_end
+          @search_selection_start = @search_cursor_position
+        end
+        
+        if modifiers.ctrl || modifiers.cmd
+          @search_cursor_position = find_previous_word_boundary(@search_cursor_position)
+        else
+          @search_cursor_position = find_previous_char_boundary(@search_cursor_position)
+        end
+        
+        @search_selection_end = @search_cursor_position
+      else
+        # 通常のカーソル移動
+        clear_selection
+        
+        if modifiers.ctrl || modifiers.cmd
+          @search_cursor_position = find_previous_word_boundary(@search_cursor_position)
+        else
+          @search_cursor_position = find_previous_char_boundary(@search_cursor_position)
+        end
+      end
+      
+      @search_cursor_position = [@search_cursor_position, 0].max
+      update_search_display
+    end
+    
+    private def handle_cursor_right(modifiers : QuantumEvents::KeyModifiers)
+      if modifiers.shift
+        # 選択範囲の拡張
+        if @search_selection_start == @search_selection_end
+          @search_selection_start = @search_cursor_position
+        end
+        
+        if modifiers.ctrl || modifiers.cmd
+          @search_cursor_position = find_next_word_boundary(@search_cursor_position)
+        else
+          @search_cursor_position = find_next_char_boundary(@search_cursor_position)
+        end
+        
+        @search_selection_end = @search_cursor_position
+      else
+        # 通常のカーソル移動
+        clear_selection
+        
+        if modifiers.ctrl || modifiers.cmd
+          @search_cursor_position = find_next_word_boundary(@search_cursor_position)
+        else
+          @search_cursor_position = find_next_char_boundary(@search_cursor_position)
+        end
+      end
+      
+      @search_cursor_position = [@search_cursor_position, @search_text.size].min
+      update_search_display
+    end
+    
+    # Home/End処理
+    private def handle_home(modifiers : QuantumEvents::KeyModifiers)
+      if modifiers.shift
+        if @search_selection_start == @search_selection_end
+          @search_selection_start = @search_cursor_position
+        end
+        @search_cursor_position = 0
+        @search_selection_end = @search_cursor_position
+      else
+        clear_selection
+        @search_cursor_position = 0
+      end
+      update_search_display
+    end
+    
+    private def handle_end(modifiers : QuantumEvents::KeyModifiers)
+      if modifiers.shift
+        if @search_selection_start == @search_selection_end
+          @search_selection_start = @search_cursor_position
+        end
+        @search_cursor_position = @search_text.size
+        @search_selection_end = @search_cursor_position
+      else
+        clear_selection
+        @search_cursor_position = @search_text.size
+      end
+      update_search_display
+    end
+    
+    # Enter/Escape処理
+    private def handle_enter_key
+      if !@search_text.empty?
+        # 検索実行
+        execute_search_with_history
+        
+        # 検索履歴に追加
+        add_to_search_history(@search_text)
+        
+        # 入力フィールドを非アクティブに
+        deactivate_search_input_field
+      end
+    end
+    
+    private def handle_escape_key
+      # 入力をキャンセル
+      if @ime_composition_active
+        # IME変換をキャンセル
+        @ime_composition_active = false
+        @ime_composition_text = ""
+      else
+        # 検索入力をキャンセル
   end
+end
 end

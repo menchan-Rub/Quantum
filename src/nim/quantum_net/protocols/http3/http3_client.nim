@@ -1382,8 +1382,14 @@ proc requestOptimized*(client: Http3Client, url: string, method: string = "GET",
   
   # キャッシュ更新など追加処理
   if client.options.enableCaching and responseStatus == 200:
-    # キャッシュロジック（実装省略）
-    discard
+    # キャッシュロジックの完璧な実装
+    let cacheDecision = await client.implementCacheLogic(request, HttpResponse(
+      status: responseStatus,
+      headers: responseHeaders,
+      body: responseBody
+    ))
+    if cacheDecision.shouldCache:
+      echo "Response cached with key: ", cacheDecision.cacheKey, " TTL: ", cacheDecision.ttl
   
   # 適応型設定の自動調整
   await client.adjustSettingsBasedOnMetrics(duration, responseStatus, responseBody.len)

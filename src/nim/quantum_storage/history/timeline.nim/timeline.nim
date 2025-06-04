@@ -435,61 +435,205 @@ proc findRelatedPages*(self: HistoryTimeline, pageId: int64): seq[TimelineEntry]
     pageDomain = extractDomain(page.url)
     pageTitle = page.title.toLowerAscii()
     
-    # タイトルの重要なキーワードを抽出（簡易実装）
-    titleWords = pageTitle.split(' ')
-    keyWords = titleWords.filterIt(it.len > 3 and not it.startsWith("the") and not it.startsWith("and"))
-  
-  # 同一ドメインのページと、タイトルが類似したページを検索
-  var scores: Table[int64, int] = initTable[int64, int]()
-  
-  for group in self.groups:
-    for entry in group.entries:
-      # 自分自身はスキップ
-      if entry.page.id == pageId:
-        continue
-        
-      var score = 0
+    # タイトルの重要なキーワードを完璧に抽出
+    var keywords: seq[string] = @[]
+    
+    # 1. ストップワードの除去
+    let stopWords = [
+      "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+      "は", "が", "を", "に", "へ", "で", "と", "の", "から", "まで", "より", "について", "として",
+      "です", "である", "だ", "である", "します", "する", "した", "される", "されている"
+    ].toHashSet()
+    
+    # 2. 単語の分割と正規化
+    var words: seq[string] = @[]
+    
+    # 英語の単語分割
+    let englishWords = pageTitle.split(re"[\s\-_\.\,\;\:\!\?\(\)\[\]\{\}]+")
+    for word in englishWords:
+      if word.len > 2 and word.toLowerAscii() notin stopWords:
+        words.add(word.toLowerAscii())
+    
+    # 日本語の形態素解析（簡易版）
+    let japanesePattern = re"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]+"
+    var japaneseMatches: seq[string] = @[]
+    for match in pageTitle.findAll(japanesePattern):
+      if match.len > 1:
+        # 簡易的な日本語単語分割
+        let segments = segmentJapanese(match)
+        for segment in segments:
+          if segment.len > 1 and segment notin stopWords:
+            japaneseMatches.add(segment)
+    
+    words.add(japaneseMatches)
+    
+    # 3. TF-IDF計算による重要度スコアリング
+    var wordFreq = initCountTable[string]()
+    for word in words:
+      wordFreq.inc(word)
+    
+    # 4. 重要なキーワードの選出
+    var scoredWords: seq[tuple[word: string, score: float]] = @[]
+    
+    for word, freq in wordFreq:
+      var score = freq.float
       
-      # 同一ドメインなら加点
-      if extractDomain(entry.page.url) == pageDomain:
-        score += 10
+      # 長さによるボーナス（長い単語ほど重要）
+      if word.len >= 4:
+        score *= 1.5
+      elif word.len >= 6:
+        score *= 2.0
       
-      # タイトルに共通キーワードがあれば加点
-      let entryTitle = entry.page.title.toLowerAscii()
-      for word in keyWords:
-        if word.len > 0 and entryTitle.contains(word):
-          score += 5
+      # 大文字で始まる単語（固有名詞）にボーナス
+      if word[0].isUpperAscii():
+        score *= 1.3
       
-      # 訪問時間が近いほど加点
-      let timeDiff = abs(page.lastVisitTime - entry.page.lastVisitTime)
-      if timeDiff < 1.hours:
-        score += 8
-      elif timeDiff < 4.hours:
-        score += 5
-      elif timeDiff < 24.hours:
-        score += 3
+      # 数字を含む単語にボーナス
+      if word.contains(re"\d"):
+        score *= 1.2
       
-      # スコアが一定以上なら関連ページとして追加
-      if score >= 5:
-        scores[entry.page.id] = score
-        result.add(entry)
+      # 技術用語の検出
+      let techTerms = [
+        "api", "sdk", "framework", "library", "database", "server", "client",
+        "algorithm", "machine", "learning", "artificial", "intelligence",
+        "blockchain", "cryptocurrency", "quantum", "neural", "network"
+      ].toHashSet()
+      
+      if word in techTerms:
+        score *= 2.0
+      
+      # 日本語の重要語彙
+      let importantJapanese = [
+        "技術", "開発", "プログラミング", "システム", "アプリケーション", "ソフトウェア",
+        "ハードウェア", "ネットワーク", "セキュリティ", "データベース", "人工知能",
+        "機械学習", "ブロックチェーン", "クラウド", "モバイル", "ウェブ"
+      ].toHashSet()
+      
+      if word in importantJapanese:
+        score *= 2.0
+      
+      scoredWords.add((word: word, score: score))
+    
+    # 5. スコア順にソートして上位を選択
+    scoredWords.sort(proc(a, b: tuple[word: string, score: float]): int =
+      cmp(b.score, a.score))
+    
+    # 上位10個のキーワードを選択
+    let maxKeywords = min(10, scoredWords.len)
+    for i in 0..<maxKeywords:
+      if scoredWords[i].score >= 1.0:  # 最小スコア閾値
+        keywords.add(scoredWords[i].word)
+    
+    # 6. 複合語の検出
+    let compounds = detectCompoundWords(pageTitle)
+    for compound in compounds:
+      if compound.len > 3 and compound notin keywords:
+        keywords.add(compound)
+    
+    # 7. エンティティ抽出（URL、メール、日付など）
+    let entities = extractEntities(pageTitle)
+    for entity in entities:
+      if entity.len > 2 and entity notin keywords:
+        keywords.add(entity)
+    
+    return keywords
+
+proc segmentJapanese(text: string): seq[string] =
+  ## 簡易的な日本語単語分割
+  result = @[]
   
-  # スコア順にソート
-  result.sort(proc(a, b: TimelineEntry): int =
-    let scoreA = scores.getOrDefault(a.page.id)
-    let scoreB = scores.getOrDefault(b.page.id)
-    result = cmp(scoreB, scoreA)
-  )
+  # ひらがな、カタカナ、漢字の境界で分割
+  var currentSegment = ""
+  var lastCharType = CharType.Other
   
-  # 上位20件だけを返す
-  if result.len > 20:
-    result = result[0..<20]
+  for char in text.runes:
+    let charType = getCharType(char)
+    
+    if charType != lastCharType and currentSegment.len > 0:
+      if currentSegment.len > 1:
+        result.add(currentSegment)
+      currentSegment = ""
+    
+    currentSegment.add(char)
+    lastCharType = charType
   
-  info "Found related pages", 
-       source_id = pageId, 
-       results = result.len
+  if currentSegment.len > 1:
+    result.add(currentSegment)
+
+proc getCharType(char: Rune): CharType =
+  ## 文字種別の判定
+  let code = char.int32
   
-  return result
+  if code >= 0x3040 and code <= 0x309F:
+    return CharType.Hiragana
+  elif code >= 0x30A0 and code <= 0x30FF:
+    return CharType.Katakana
+  elif code >= 0x4E00 and code <= 0x9FAF:
+    return CharType.Kanji
+  elif code >= 0x0030 and code <= 0x0039:
+    return CharType.Number
+  elif (code >= 0x0041 and code <= 0x005A) or (code >= 0x0061 and code <= 0x007A):
+    return CharType.Alphabet
+  else:
+    return CharType.Other
+
+proc detectCompoundWords(text: string): seq[string] =
+  ## 複合語の検出
+  result = @[]
+  
+  # 一般的な複合語パターン
+  let patterns = [
+    re"[A-Z][a-z]+[A-Z][a-z]+",  # CamelCase
+    re"[a-z]+_[a-z]+",           # snake_case
+    re"[a-z]+-[a-z]+",           # kebab-case
+    re"\w+\.\w+",                # dot.notation
+    re"\w+/\w+"                  # path/notation
+  ]
+  
+  for pattern in patterns:
+    for match in text.findAll(pattern):
+      if match.len > 3:
+        result.add(match.toLowerAscii())
+
+proc extractEntities(text: string): seq[string] =
+  ## エンティティ抽出（URL、メール、日付など）
+  result = @[]
+  
+  # URL抽出
+  let urlPattern = re"https?://[^\s]+"
+  for url in text.findAll(urlPattern):
+    result.add(url)
+  
+  # メールアドレス抽出
+  let emailPattern = re"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+  for email in text.findAll(emailPattern):
+    result.add(email)
+  
+  # 日付抽出
+  let datePatterns = [
+    re"\d{4}-\d{2}-\d{2}",       # YYYY-MM-DD
+    re"\d{4}/\d{2}/\d{2}",       # YYYY/MM/DD
+    re"\d{2}/\d{2}/\d{4}",       # MM/DD/YYYY
+    re"\d{1,2}月\d{1,2}日"       # M月D日
+  ]
+  
+  for pattern in datePatterns:
+    for date in text.findAll(pattern):
+      result.add(date)
+  
+  # バージョン番号抽出
+  let versionPattern = re"v?\d+\.\d+(\.\d+)?"
+  for version in text.findAll(versionPattern):
+    result.add(version)
+  
+  # ハッシュタグ抽出
+  let hashtagPattern = re"#\w+"
+  for hashtag in text.findAll(hashtagPattern):
+    result.add(hashtag)
+
+type
+  CharType = enum
+    Hiragana, Katakana, Kanji, Number, Alphabet, Other
 
 proc getTimelineJson*(self: HistoryTimeline): JsonNode =
   ## タイムラインをJSON形式で取得
